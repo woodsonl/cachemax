@@ -1,7 +1,7 @@
 [project]
-name = "cache-max"
+name = "cache-maxing"
 version = "0.1.0"
-description = "Universal cache-maximizing inference proxy: normalize prompts so prefix caches hit, with prefix-affinity routing and hit-rate/cost observability"
+description = "Universal cache-maxingimizing inference proxy: normalize prompts so prefix caches hit, with prefix-affinity routing and hit-rate/cost observability"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,7 +17,7 @@ dev = [
 ]
 
 [project.scripts]
-cache-max = "cache_max.main:main"
+cache-maxing = "cache_maxing.main:main"
 
 [build-system]
 requires = ["hatchling"]
