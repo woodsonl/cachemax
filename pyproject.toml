@@ -1,0 +1,27 @@
+[project]
+name = "cache-max"
+version = "0.1.0"
+description = "Universal cache-maximizing inference proxy: normalize prompts so prefix caches hit, with prefix-affinity routing and hit-rate/cost observability"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[project.scripts]
+cache-max = "cache_max.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
