@@ -165,11 +165,24 @@ pub struct DashboardState {
     /// Headline hit rate (formatted).
     pub hit_rate: String,
     pub provenance: String,
+    /// Anthropic's write/read split, when the session exposes one (secondary to
+    /// the binding hit rate). `None` for providers that report no write count.
+    pub write_split: Option<WriteSplit>,
     /// The cold→warm transition always shown beside the hero.
     pub transition: Transition,
     pub turns: Vec<TurnRow>,
     pub cumulative: CumulativeRow,
     pub tape: Vec<TapeRow>,
+}
+
+/// Anthropic's cache economics, shown beside the binding hit rate:
+/// `cache_creation` (write premium) vs `cache_read` (read discount), plus the
+/// derived `read/(read+creation)` share.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteSplit {
+    pub written: String,
+    pub read: String,
+    pub derived: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,6 +258,25 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
 
     let tape = records.iter().map(tape_row).collect();
 
+    // Anthropic's write/read split, when the provider exposes writes. Derived
+    // rate = read / (read + creation), cumulative over complete turns.
+    let written_sum: u64 = counted.iter().map(|r| r.cache_written_tokens).sum();
+    let read_sum: u64 = counted.iter().map(|r| r.cached_tokens).sum();
+    let write_split = if written_sum > 0 {
+        let total = read_sum + written_sum;
+        Some(WriteSplit {
+            written: format!("{} tk", format_tokens(written_sum)),
+            read: format!("{} tk", format_tokens(read_sum)),
+            derived: format_pct(if total == 0 {
+                None
+            } else {
+                Some(read_sum as f64 / total as f64)
+            }),
+        })
+    } else {
+        None
+    };
+
     DashboardState {
         backend,
         live,
@@ -265,6 +297,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
             Some(cached_sum as f64 / history_sum as f64)
         }),
         provenance: source_tag(source).to_string(),
+        write_split,
         transition,
         turns,
         cumulative,

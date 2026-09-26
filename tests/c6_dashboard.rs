@@ -368,3 +368,26 @@ fn provenance_is_the_dominant_source_not_the_first_record() {
         "the majority source wins"
     );
 }
+
+#[test]
+fn anthropic_write_split_is_surfaced_beside_the_binding_rate() {
+    // Decision 12: the derived read/(read+creation) shows beside the split.
+    let mut r1 = rec(1, 900, 2000);
+    r1.cache_written_tokens = 300;
+    let mut r2 = rec(2, 800, 2100);
+    r2.cache_written_tokens = 0;
+    let v = dashboard::view(&[r1, r2], true, 1);
+    let split = v.write_split.expect("a write count exposes the split");
+    assert_eq!(split.written, "300 tk");
+    assert_eq!(split.read, "1,700 tk");
+    // read/(read+creation) = 1700/(1700+300) = 85%
+    assert_eq!(split.derived, "85%");
+    // the binding hit rate is unchanged by the split
+    assert_eq!(v.hit_rate, "41%");
+}
+
+#[test]
+fn no_write_count_means_no_split_row() {
+    let v = dashboard::view(&[rec(1, 1000, 2000)], true, 1);
+    assert!(v.write_split.is_none(), "OpenAI reports no writes");
+}

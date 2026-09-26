@@ -110,6 +110,7 @@
       <div class="row"><span style="color:var(--faint)">resent history</span><span class="v" style="color:var(--faint)" id="t-resent">—</span></div>
       <div class="row"><span>cached</span><span class="v" id="t-cached">—</span></div>
       <div class="row"><span>reuse</span><span class="v" id="t-reuse">—</span></div>
+      <div class="row" id="t-split-row" style="display:none"><span>write / read</span><span class="v" id="t-split">—</span></div>
     </div>
   </div>
 
@@ -195,6 +196,15 @@
     document.getElementById("t-resent").textContent = state.transition.resent_history;
     document.getElementById("t-cached").textContent = state.transition.cached;
     document.getElementById("t-reuse").textContent = state.transition.reuse;
+    var splitRow = document.getElementById("t-split-row");
+    if(state.write_split){
+      splitRow.style.display = "";
+      document.getElementById("t-split").textContent =
+        state.write_split.written + " / " + state.write_split.read +
+        " · " + state.write_split.derived;
+    } else {
+      splitRow.style.display = "none";
+    }
     document.getElementById("session-tag").textContent =
       "Complete records only · " + state.incomplete_count + " incomplete excluded";
     document.getElementById("foot-live").textContent = state.live ? "● live" : "idle";
