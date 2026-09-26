@@ -49,7 +49,7 @@ One normalized record type, five adapters. `--backend` selects; default `openai`
 
 | Adapter | Cache signal | Verification |
 |---|---|---|
-| **openai** (cloud, primary) | `usage.prompt_tokens_details.cached_tokens` | Provider-reported. No independent ground truth; labeled. |
+| **openai** (cloud, primary) | `usage.prompt_tokens_details.cached_tokens` | Provider-reported. No independent ground truth; labeled. Also covers OpenRouter via `base_url = https://openrouter.ai/api/v1` (OpenAI-compatible). |
 | **anthropic** (cloud, primary) | `usage.cache_read_input_tokens` + `cache_creation_input_tokens` (write/read split) | Provider-reported. Write/read tracked separately. |
 | **llama.cpp** (local) | `/slots` cached-token counts, prompt echo / `tokens_evaluated`, slot `chat_format`/`generation_prompt` | Token-space ground truth (±5%, this is the only engine where token-space matching itself is verified). |
 | **vLLM** (local) | `/metrics` token counters, delta-sampled per request | Record fidelity (±5% at session-aggregate; fallback to log-line parsing if noisy). |
@@ -69,7 +69,7 @@ Cloud cache behavior is provider-reported and cannot be independently verified (
 - **llama.cpp (ground truth):** one scripted multi-turn conversation produces a record whose session-cumulative hit-rate matches `/slots` within ±5%, per-turn counts compared individually. Includes a cleared-cache control run to separate measured hits from reuse potential.
 - **vLLM (record fidelity):** cached-token figures agree with `/metrics` within ±5% at session-aggregate, single-client serialized run. If delta-sampling is too noisy, restate to log-line parsing; ±5% bar unchanged.
 - **mlx-lm:** TTFT warm turns ≥2x faster than comparable-length cold turns on ≥90% of warm turns; no hit-rate number.
-- **OpenAI:** the proxy reports `cached_tokens` from the response usage and computes hit-rate + cost consistently; record matches provider usage exactly (it is the provider's own number).
+- **OpenAI:** the proxy reports `cached_tokens` from the response usage and computes hit-rate + cost consistently; record matches provider usage exactly (it is the provider's own number). OpenRouter uses the same adapter via `base_url`.
 - **Anthropic:** the proxy reports cache read/creation tokens and the write/read split; cost reflects the premium/discount; figures match the provider usage exactly.
 - **Dashboard:** live curve visible during a real session, both a cloud run and a local run.
 - **Cloud cost gate:** on a replayed real trace, ≥30% reduction in billed-at-full-rate input tokens (deferred until repair; the measurement core proves the measurement, not the reduction).
@@ -128,7 +128,7 @@ Local binary binding loopback by default; no auth (single user, no multi-user su
 ### Core
 
 - [ ] **C1 — proxy core.** axum/tokio SSE passthrough, concurrent tokenization, record builder, normalized record type. Files: `src/proxy.rs`, `src/record.rs`. Verify: byte-match fixture (stream == record, reassembled by concatenation); 50K-token prompt TTFT regression; incomplete-record unit test.
-- [ ] **C2 — cloud adapters.** openai (`cached_tokens`) and anthropic (read/creation split). Files: `src/adapters/openai.rs`, `src/adapters/anthropic.rs`. Verify: record matches provider usage exactly on a live run; cost math reflects published rates.
+- [ ] **C2 — cloud adapters.** openai (`cached_tokens`; covers OpenAI and OpenRouter via `base_url`) and anthropic (read/creation split). Files: `src/adapters/openai.rs`, `src/adapters/anthropic.rs`. Verify: record matches provider usage exactly on a live run; cost math reflects published rates.
 - [ ] **C3 — local adapters.** llama.cpp (ground truth), vLLM (metrics), mlx-lm (discrimination only). Files: `src/adapters/llamacpp.rs`, `src/adapters/vllm.rs`, `src/adapters/mlxlm.rs`. Verify: ±5% llama.cpp criterion; mocked-adapter CI suite passes engineless.
 - [ ] **C4 — sessions + aggregation.** prefix-continuity store, fork resolution, atomic aggregate. Files: `src/sessions.rs`. Verify: interleaved-requests atomicity test (real interleave, tokio); fork tie-break fixture; collision log test.
 - [ ] **C5 — latency budget CI.** warm-pinned median-of-N proxy-vs-direct TTFT + micro-profile. Files: `tests/` + CI workflow. Verify: >5 ms p95 fails on injected delay; passes on clean tree.
@@ -139,7 +139,7 @@ Local binary binding loopback by default; no auth (single user, no multi-user su
 ### Getting started (T0 contract)
 
 - [ ] **D1 — README + docs.** Install command, first command, dashboard URL, cost-capable client snippet. Files: `README.md`. Verify: the sequence runs end to end; no stale proxy-vision text; typo fixed.
-- [ ] **D2 — one named agent config.** Point a real agent at the proxy (OpenAI `base_url` swap, model passed through, dummy `api_key` accepted-and-ignored if required) with one worked example. Files: `README.md`. Verify: the named agent completes a multi-turn conversation through the proxy.
+- [ ] **D2 — one named agent config.** Point a real agent at the proxy (OpenAI `base_url` swap — works for OpenAI, Anthropic, or OpenRouter — model passed through, dummy `api_key` accepted-and-ignored if required) with one worked example. Files: `README.md`. Verify: the named agent completes a multi-turn conversation through the proxy.
 - [ ] **D3 — error contract.** Problem + cause + fix + docs link for: upstream unreachable, no cache signal, key rejected, tokenizer unavailable. Files: `src/main.rs`, `docs/troubleshooting.md`. Verify: each path emits the four parts; no raw panic by default.
 - [ ] **D4 — docs structure.** `README.md` (getting started), `docs/troubleshooting.md`, `docs/how-measurement-works.md` (record schema, formula in plain words, what provider-reported means, write/read split). Verify: `provider_reported` and the Anthropic split explained; troubleshooting does not invite sharing content-bearing logs.
 
