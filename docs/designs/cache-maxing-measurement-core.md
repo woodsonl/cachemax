@@ -49,11 +49,11 @@ One normalized record type, five adapters. `--backend` selects; default `openai`
 
 | Adapter | Cache signal | Verification |
 |---|---|---|
-| **openai** (cloud, primary) | `usage.prompt_tokens_details.cached_tokens` | Provider-reported. Also covers OpenRouter via `base_url = https://openrouter.ai/api/v1` (OpenAI-compatible). |
+| **openai** (cloud, primary) | `usage.prompt_tokens_details.cached_tokens` | Provider-reported. Also covers OpenRouter by pointing the adapter's provider endpoint at `https://openrouter.ai/api/v1` (OpenAI-compatible; set via `--upstream-url`). |
 | **anthropic** (cloud, primary) | `usage.cache_read_input_tokens` + `cache_creation_input_tokens` (write/read split) | Provider-reported. Write/read tracked separately. |
 | **llama.cpp** (local) | `/slots` cached-token counts, prompt echo / `tokens_evaluated`, slot `chat_format`/`generation_prompt` | Token-space ground truth (±5%, this is the only engine where token-space matching itself is verified). |
 | **vLLM** (local) | `/metrics` token counters, delta-sampled per request | Record fidelity (±5% at session-aggregate; fallback to log-line parsing if noisy). |
-| **mlx-lm** (local) | none exposed | TTFT warm/cold discrimination only. No hit-rate number. |
+| **mlx-lm** (local, macOS/Apple Silicon only) | none exposed | TTFT warm/cold discrimination only. No hit-rate number. Requires the Python sidecar; unavailable on Linux/Windows. |
 
 Anthropic uses a different cache model, not a hit count: `cache_creation_input_tokens` are tokens written to cache (billed at a premium) and `cache_read_input_tokens` are served from cache (billed at a discount). The dashboard shows the write/read split and the cost, not a single percentage.
 
@@ -68,8 +68,8 @@ Cloud figures carry the compact `provider_reported` label.
 
 - **llama.cpp (ground truth):** one scripted multi-turn conversation produces a record whose session-cumulative hit-rate matches `/slots` within ±5%, per-turn counts compared individually. Includes a cleared-cache control run to separate measured hits from reuse potential.
 - **vLLM (record fidelity):** cached-token figures agree with `/metrics` within ±5% at session-aggregate, single-client serialized run. If delta-sampling is too noisy, restate to log-line parsing; ±5% bar unchanged.
-- **mlx-lm:** TTFT warm turns ≥2x faster than comparable-length cold turns on ≥90% of warm turns; no hit-rate number.
-- **OpenAI:** the proxy reports `cached_tokens` from the response usage and computes hit-rate + cost consistently; record matches provider usage exactly (it is the provider's own number). OpenRouter uses the same adapter via `base_url`.
+- **mlx-lm (macOS/Apple Silicon only):** TTFT warm turns ≥2x faster than comparable-length cold turns on ≥90% of warm turns; no hit-rate number. Skipped on Linux/Windows, where the engine cannot run.
+- **OpenAI:** the proxy reports `cached_tokens` from the response usage and computes hit-rate + cost consistently; record matches provider usage exactly (it is the provider's own number). OpenRouter uses the same adapter with the provider endpoint set to its URL.
 - **Anthropic:** the proxy reports cache read/creation tokens and the write/read split; cost reflects the premium/discount; figures match the provider usage exactly.
 - **Dashboard:** live curve visible during a real session, both a cloud run and a local run.
 - **Cloud cost gate:** on a replayed real trace, ≥30% reduction in billed-at-full-rate input tokens (deferred until repair; the measurement core proves the measurement, not the reduction).
@@ -141,7 +141,7 @@ The dashboard must prove it is alive before it proves it saves money. A user who
 | 1 | Runs install + first command, opens the dashboard URL | Curious, impatient | D1 (install, first command, URL); empty state names the next action |
 | 2 | Points an agent at the proxy (`base_url` swap) | Doubt: "did I point it right?" | D2 (named agent config); status strip shows `● live` on first request |
 | 3 | Sends turn 0 (cold) | "Is it even working?" | Hero + session row appear within one turn; `cold` cell visible |
-| 4 | Sends turn 1 (first warm turn) | Relief: "there it is" | Hit rate + cached/resent + `provider_reported` land; tape shows HIT |
+| 4 | Sends turn 1 (first warm turn) | Relief: "there it is" | Hit rate + cached/resent + the mode's source label (`provider_reported` cloud, `engine_measured` local) land; tape shows HIT |
 | 5 | Reads the session-cumulative row | "So that is what cache reuse is worth" | Cumulative hit rate + cost saved in the hero (cloud weighting) |
 | 6 | Watches a longer agentic session (long system prompt, tools) | Trust builds | Per-turn rows compare individually; incomplete/miss markers stay honest |
 
@@ -160,7 +160,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 ### Core
 
 - [ ] **C1 — proxy core.** axum/tokio SSE passthrough, concurrent tokenization, record builder, normalized record type. Files: `src/proxy.rs`, `src/record.rs`. Verify: byte-match fixture (stream == record, reassembled by concatenation); 50K-token prompt TTFT regression; incomplete-record unit test.
-- [ ] **C2 — cloud adapters.** openai (`cached_tokens`; covers OpenAI and OpenRouter via `base_url`) and anthropic (read/creation split). Files: `src/adapters/openai.rs`, `src/adapters/anthropic.rs`. Verify: record matches provider usage exactly on a live run; cost math reflects published rates.
+- [ ] **C2 — cloud adapters.** openai (`cached_tokens`; covers OpenAI and OpenRouter by setting the provider endpoint to its URL) and anthropic (read/creation split). Files: `src/adapters/openai.rs`, `src/adapters/anthropic.rs`. Verify: record matches provider usage exactly on a live run; cost math reflects published rates.
 - [ ] **C3 — local adapters.** llama.cpp (ground truth), vLLM (metrics), mlx-lm (discrimination only). Files: `src/adapters/llamacpp.rs`, `src/adapters/vllm.rs`, `src/adapters/mlxlm.rs`. Verify: ±5% llama.cpp criterion; mocked-adapter CI suite passes engineless.
 - [ ] **C4 — sessions + aggregation.** prefix-continuity store, fork resolution, atomic aggregate. Files: `src/sessions.rs`. Verify: interleaved-requests atomicity test (real interleave, tokio); fork tie-break fixture; collision log test.
 - [ ] **C5 — latency budget CI.** warm-pinned median-of-N proxy-vs-direct TTFT + micro-profile. Files: `tests/` + CI workflow. Verify: >5 ms p95 fails on injected delay; passes on clean tree.
@@ -174,13 +174,13 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
   > Responsive + a11y contract: minimum supported viewport 1024px; below 1024px the session view and tape stack vertically with the hero staying full-width (no nav to collapse). Keyboard: session rows and tape cells are focusable, `export` is keyboard-reachable, focus ring always visible. Contrast ≥4.5:1 on body text. All figures use tabular numerals. The tape is legible with color removed (glyph rule, above). Any interactive control has a ≥44px target.
   > Theme: light **and** dark, following the OS `prefers-color-scheme`. Both palettes come from DESIGN.md CSS variables; no hard-coded colors.
 - [ ] **C7 — observability.** JSONL export (metrics-only by default) + structured finalize logs. Files: `src/export.rs`. Verify: export matches dashboard numbers; logs grep-able without bodies.
-- [ ] **C8 — CLI.** `serve`, `--backend`, `--upstream-url`, `--check`, `export`, `--verbose` (metadata only), engine/precision flags. Files: `src/main.rs`. Verify: `--check` fails loudly on unreachable upstream; `--help` lists everything; defaults work with zero flags.
+- [ ] **C8 — CLI.** `serve`, `--backend`, `--upstream-url` (provider endpoint; OpenRouter sets it to `https://openrouter.ai/api/v1`), `--check`, `export`, `--verbose` (metadata only), engine/precision flags. Files: `src/main.rs`. Verify: `--check` fails loudly on unreachable upstream; `--help` lists everything; defaults work with zero flags.
 
 ### Getting started (T0 contract)
 
 - [ ] **D1 — README + docs.** Install command, first command, dashboard URL, cost-capable client snippet. Files: `README.md`. Verify: the sequence runs end to end; no stale proxy-vision text; typo fixed.
 - [ ] **D2 — one named agent config.** Point a real agent at the proxy (OpenAI `base_url` swap, which works for OpenAI, Anthropic, or OpenRouter; model passed through; dummy `api_key` accepted and ignored if required) with one worked example. Files: `README.md`. Verify: the named agent completes a multi-turn conversation through the proxy.
-- [ ] **D3 — error contract.** Problem + cause + fix + docs link for: upstream unreachable, no cache signal, key rejected, tokenizer unavailable. Files: `src/main.rs`, `docs/troubleshooting.md`. Verify: each path emits the four parts; no raw panic by default.
+- [ ] **D3 — error contract.** Problem + cause + fix + docs link for every failure the spec can produce: upstream unreachable, no cache signal, key rejected, tokenizer unavailable, oversized prompt, engine timeout, tokenizer version mismatch. Files: `src/main.rs`, `docs/troubleshooting.md`. Verify: each path emits the four parts; no raw panic by default.
 - [ ] **D4 — docs structure.** `README.md` (getting started), `docs/troubleshooting.md`, `docs/how-measurement-works.md` (record schema, formula in plain words, what provider-reported means, write/read split). Verify: `provider_reported` and the Anthropic split explained; troubleshooting does not invite sharing content-bearing logs.
 
 ### Later (post-T0)
@@ -224,7 +224,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
 - [ ] **T3 (P2, human: ~30min / CC: ~5min)** — dashboard — make the cloud journey's "is it alive" signal land on turn 0 and the cost payoff on turn 1
   - Surfaced by: Pass 3 (Journey 2/10): no emotional arc; first-turn liveness unaddressed
   - Files: `src/dashboard.rs`
-  - Verify: cold turn (t0) shows activity within one turn; first warm turn (t1) shows hit rate + `provider_reported`
+  - Verify: cold turn (t0) shows activity within one turn; first warm turn (t1) shows hit rate + the mode's source label (`provider_reported` cloud, `engine_measured` local)
 - [ ] **T4 (P1, human: ~1h / CC: ~10min)** — dashboard — responsive + a11y contract (1024px floor, stack below, keyboard, contrast, tabular numerals, 44px targets, light/dark via `prefers-color-scheme`)
   - Surfaced by: Pass 6 (Responsive 2/10): no viewport/a11y spec
   - Files: `src/dashboard.rs`

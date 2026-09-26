@@ -8,7 +8,7 @@ colors:
   surface-raised: "#f2eee7"
   text: "#1d1c18"
   text-muted: "#5c5749"
-  text-faint: "#8a8578"
+  text-faint: "#6a6557"
   accent: "#c47a12"
   accent-resent: "#8a5a3c"
   line: "#cbc5b8"
@@ -17,7 +17,7 @@ colors:
 typography:
   display:
     fontFamily: Archivo
-    fontWeight: 700
+    fontWeight: 600
     fontSize: 1.375rem
     letterSpacing: -0.01em
   body:
@@ -30,7 +30,7 @@ typography:
     letterSpacing: 0.08em
   mono:
     fontFamily: JetBrains Mono
-    fontSize: 0.875rem
+    fontSize: 0.84375rem
     fontFeature: tnum
 rounded:
   sm: 2px
@@ -97,11 +97,11 @@ Amber (`accent`) marks verified cache-served data and nothing else: the hit rate
 ## Typography
 
 Display and body draw from a working-sans world; data draws from notation.
-- **Display: Archivo 700.** Used for the product name and section headings only. A grotesque built for signage, which reads as machined rather than editorial.
-- **Body/UI: Source Sans 3 400/600.** Labels, sentences, and controls. On the Operate surface this is the sanctioned readable UI face, so no legibility tax is paid for novelty.
+- **Display: Archivo 700 / 600.** Used for the product name (700) and section headings (600) only. A grotesque built for signage, which reads as machined rather than editorial.
+- **Body/UI: Source Sans 3 400.** Labels, sentences, and controls. On the Operate surface this is the sanctioned readable UI face, so no legibility tax is paid for novelty.
 - **Mono: JetBrains Mono 400/500/700** for every number, table cell, tape glyph, and `—`. `font-variant-numeric: tabular-nums` always, so columns never shift.
 
-All three load from Google Fonts and subset to WOFF2 for offline use in the embedded binary. The scale is small and deliberate: page display 22px, body 16px, table 13.5px, label 11px. Levels differ by more than a weight.
+All three load from Google Fonts and subset to WOFF2 for offline use in the embedded binary. The scale is small and deliberate: page display 22px, body 16px, table/mono 13.5px (0.84375rem), label 11px. The hero value is the one oversized exception at 72px (4.5rem) mono 700, tabular. Levels differ by more than a weight.
 
 ## Layout
 
