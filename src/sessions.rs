@@ -48,6 +48,18 @@ pub struct Collision {
     pub incoming_len: usize,
 }
 
+/// Cap on the retained collision log. The log is diagnostic, not a ledger; a
+/// client that diverges every turn would otherwise grow it without bound.
+const COLLISION_LOG_CAP: usize = 256;
+
+/// Append to `log`, keeping only the most recent [`COLLISION_LOG_CAP`] entries.
+fn push_bounded(log: &mut Vec<Collision>, c: Collision) {
+    if log.len() == COLLISION_LOG_CAP {
+        log.remove(0);
+    }
+    log.push(c);
+}
+
 #[derive(Default)]
 pub struct SessionStore {
     sessions: HashMap<u64, Session>,
@@ -123,16 +135,25 @@ impl SessionStore {
             .map(|s| (s.id, shared_prefix_len(&s.prefix_hashes, prefix_hashes)));
 
         if let Some((id, shared)) = breaking {
+            let session_len = self.sessions[&id].prefix_hashes.len();
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.last_active = tick;
+                // Re-base the session onto the divergent branch. This turn is
+                // still a break (measured as a miss), but the branch becomes the
+                // session's prefix, so its *next* turn is a continuation rather
+                // than another break. Without this a client that switches topic
+                // once is flagged as breaking on every later turn.
+                s.prefix_hashes = prefix_hashes.to_vec();
             }
-            let session_len = self.sessions[&id].prefix_hashes.len();
-            self.collision_log.push(Collision {
-                session_id: id,
-                shared_prefix_len: shared,
-                session_len,
-                incoming_len: prefix_hashes.len(),
-            });
+            push_bounded(
+                &mut self.collision_log,
+                Collision {
+                    session_id: id,
+                    shared_prefix_len: shared,
+                    session_len,
+                    incoming_len: prefix_hashes.len(),
+                },
+            );
             return Resolution {
                 session_id: id,
                 continued: false,
@@ -277,15 +298,41 @@ mod tests {
     fn longest_matching_prefix_wins_on_fork() {
         let mut store = SessionStore::new();
         let a = store.resolve(&[1, 2, 3]);
-        // [1,7] shares only [1] with [1,2,3] -> break, stays in a.
+        // [1,7] shares only [1] with [1,2,3] -> break, stays in a and re-bases.
         let b = store.resolve(&[1, 7]);
         assert_eq!(b.session_id, a.session_id);
         assert!(b.broke_prefix);
 
-        // A request extending [1,2,3] continues session a.
-        let matched = store.resolve(&[1, 2, 3, 5]);
+        // After the re-base, a request extending the new branch continues it.
+        let matched = store.resolve(&[1, 7, 8]);
         assert_eq!(matched.session_id, a.session_id);
         assert!(matched.continued);
+        assert!(!matched.broke_prefix);
+    }
+
+    #[test]
+    fn divergent_branch_is_absorbed_after_one_break() {
+        // A client that switches topic once must be measured as a single break,
+        // then as a continuation — not as breaking forever.
+        let mut store = SessionStore::new();
+        let a = store.resolve(&[1, 2, 3]);
+        let br = store.resolve(&[1, 2, 9]);
+        assert!(br.broke_prefix);
+        let next = store.resolve(&[1, 2, 9, 10]);
+        assert_eq!(next.session_id, a.session_id);
+        assert!(next.continued, "the divergent branch is a continuation");
+        assert!(!next.broke_prefix);
+    }
+
+    #[test]
+    fn collision_log_is_bounded() {
+        // A client diverging every turn must not grow the log without bound.
+        let mut store = SessionStore::new();
+        store.resolve(&[1, 2, 3]);
+        for i in 0..(COLLISION_LOG_CAP * 2) {
+            store.resolve(&[1, 2, 10_000 + i as u64]);
+        }
+        assert_eq!(store.collision_log().len(), COLLISION_LOG_CAP);
     }
 
     #[test]
