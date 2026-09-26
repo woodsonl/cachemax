@@ -166,12 +166,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .upstream_url
                 .clone()
                 .ok_or_else(Fault::upstream_required)?;
-            tracing::info!(
-                backend = %cli.backend,
-                upstream = %upstream,
-                bind = %cli.bind,
-                "cachemax listening",
-            );
             dispatch_serve(&cli.backend, tokenizer, rates, upstream, &cli.bind).await
         }
         Command::Check => {

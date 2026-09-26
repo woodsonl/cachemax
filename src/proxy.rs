@@ -290,6 +290,8 @@ pub async fn serve<A: Adapter + 'static>(
     upstream_url: String,
     bind: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = adapter.name();
+    let tokenizer_label = tokenizer.label().to_string();
     let state = Arc::new(AppState {
         adapter: Arc::new(adapter),
         tokenizer,
@@ -306,7 +308,12 @@ pub async fn serve<A: Adapter + 'static>(
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(addr = %listener.local_addr()?, "cachemax listening");
+    tracing::info!(
+        addr = %listener.local_addr()?,
+        backend,
+        tokenizer = %tokenizer_label,
+        "cachemax listening"
+    );
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
