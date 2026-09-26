@@ -58,16 +58,14 @@ pub fn plan_request(
     let session_id = resolution.session_id;
     let session = store.session(session_id);
     let turn = session.map(|s| s.records.len() as u32).unwrap_or(0);
-    // History is the span prior turns established. On a cold turn (no prior
-    // records) there is none, so the denominator is 0 — never this request's
-    // own messages. The shared prefix only counts once the session has history.
-    let resent_history_tokens = if turn == 0 {
+    // Binding denominator = the re-sent history: system + all prior user,
+    // assistant, and tool messages, excluding this turn's new content. This
+    // turn's new content is the final message, so history is every message
+    // before it. Turn 0 is cold and has no history.
+    let resent_history_tokens = if turn == 0 || messages.len() <= 1 {
         0
     } else {
-        let shared = session
-            .map(|s| shared_prefix_len(&s.prefix_hashes, &hashes))
-            .unwrap_or(0);
-        tokenizer.count_messages(&messages[..shared.min(messages.len())]) as u64
+        tokenizer.count_messages(&messages[..messages.len() - 1]) as u64
     };
 
     RequestPlan {
@@ -75,11 +73,6 @@ pub fn plan_request(
         turn,
         resent_history_tokens,
     }
-}
-
-/// Length of the longest common prefix of two hash sequences.
-fn shared_prefix_len(a: &[u64], b: &[u64]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 /// The raw observed figures for one turn, before cost is applied.
@@ -285,12 +278,73 @@ pub async fn serve<A: Adapter + 'static>(
 }
 
 /// The proxy's axum router. Shared by [`serve`] and integration tests so both
-/// exercise one construction path.
+/// exercise one construction path. The dashboard (`/`) and its data endpoints
+/// live on the same server as the API.
 pub fn router<A: Adapter + 'static>(state: Arc<AppState<A>>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(handle_chat::<A>))
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/", axum::routing::get(serve_dashboard))
+        .route("/api/state", axum::routing::get(dashboard_state::<A>))
+        .route("/api/export", axum::routing::get(export_session::<A>))
         .with_state(state)
+}
+
+/// Serve the embedded single-file dashboard.
+async fn serve_dashboard() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(crate::dashboard::DASHBOARD_HTML))
+        .unwrap()
+}
+
+/// The live dashboard snapshot: the most recently active session's view.
+async fn dashboard_state<A: Adapter + 'static>(State(state): State<Arc<AppState<A>>>) -> Response {
+    let (records, session_count, live) = {
+        let guard = state.sessions.0.lock().unwrap();
+        let live = guard
+            .most_recent()
+            .map(|s| !s.records.is_empty())
+            .unwrap_or(false);
+        let records = guard
+            .most_recent()
+            .map(|s| s.records.clone())
+            .unwrap_or_default();
+        (records, guard.len(), live)
+    };
+    let view = crate::dashboard::view(&records, live, session_count);
+    match serde_json::to_vec(&view) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Export the most recently active session as metrics-only JSONL.
+async fn export_session<A: Adapter + 'static>(State(state): State<Arc<AppState<A>>>) -> Response {
+    let (records, id) = {
+        let guard = state.sessions.0.lock().unwrap();
+        match guard.most_recent() {
+            Some(s) => (s.records.clone(), s.id),
+            None => (Vec::new(), 0),
+        }
+    };
+    match crate::export::to_jsonl(&records) {
+        Ok(jsonl) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/x-ndjson")
+            .header(
+                "content-disposition",
+                format!("attachment; filename=\"cachemax-{id}.jsonl\""),
+            )
+            .body(Body::from(jsonl))
+            .unwrap(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// The request handler: plan, forward, stream through, observe, finalize.
@@ -555,6 +609,43 @@ mod tests {
         assert_eq!(r.cached_tokens, 900);
         assert_eq!(r.cache_written_tokens, 300, "creation split recorded");
         assert!(r.cost_saved_usd.is_some(), "anthropic rates known");
+    }
+
+    #[test]
+    fn denominator_grows_with_each_turn() {
+        // Regression: the re-sent history must grow as the conversation does
+        // (system + prior messages), not stay pinned at the first request's
+        // span. Turn t's history is every message before the final one.
+        let tokenizer = Tokenizer::default_encoder().unwrap();
+        let store = Arc::new(SharedSessions::new());
+        let mut histories = Vec::new();
+        let mut convo: Vec<Message> = vec![msg("system", "You are a helpful assistant.")];
+        for turn in 0..4 {
+            convo.push(msg("user", &format!("Question number {turn} please")));
+            // resolve/append so turn indexing advances
+            let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &convo);
+            let r = build_record(
+                &p,
+                Observation {
+                    billed_input_tokens: 10,
+                    ..Default::default()
+                },
+                "gpt-4o",
+                &Rates::builtin(),
+                SourceLabel::ProviderReported,
+                true,
+            );
+            histories.push(p.resent_history_tokens);
+            store.0.lock().unwrap().append(r);
+            convo.push(msg("assistant", &format!("Answer number {turn} here")));
+        }
+        assert_eq!(histories[0], 0, "turn 0 is cold");
+        // Each subsequent turn's history strictly grows.
+        for w in histories.windows(2) {
+            if w[0] != 0 {
+                assert!(w[1] > w[0], "history must grow: {:?}", histories);
+            }
+        }
     }
 
     #[test]

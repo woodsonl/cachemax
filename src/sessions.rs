@@ -101,6 +101,12 @@ impl SessionStore {
         if let Some(id) = extending {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.last_active = tick;
+                // A conversation only grows: absorb the longer prefix so the
+                // next turn's continuity is measured against the full history
+                // seen so far, not just the first request's messages.
+                if prefix_hashes.len() > s.prefix_hashes.len() {
+                    s.prefix_hashes = prefix_hashes.to_vec();
+                }
             }
             return Resolution {
                 session_id: id,
@@ -172,6 +178,20 @@ impl SessionStore {
     /// Look up a session by id.
     pub fn session(&self, id: u64) -> Option<&Session> {
         self.sessions.get(&id)
+    }
+
+    /// The most recently active session, if any.
+    pub fn most_recent(&self) -> Option<&Session> {
+        self.sessions.values().max_by_key(|s| s.last_active)
+    }
+
+    /// Number of tracked sessions.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
     }
 }
 

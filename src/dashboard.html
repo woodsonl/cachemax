@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cachemax — dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=Source+Sans+3:wght@400&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    color-scheme: light dark;
+    --bg:#e9e4db; --surface:#e0dad0; --raised:#f2eee7;
+    --text:#1d1c18; --muted:#5c5749; --faint:#6a6557;
+    --accent:#c47a12; --accent-text:#8f5300; --line:#cbc5b8; --line-strong:#8f8a7d;
+    --resent:#8a5a3c;
+    /* motion tokens (DESIGN.md) */
+    --micro:80ms; --short:180ms; --medium:280ms;
+    --fd:'Archivo',sans-serif; --fb:'Source Sans 3',sans-serif; --fm:'JetBrains Mono',monospace;
+    --rule:1px; --gap:20px; --radius:2px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#16181a; --surface:#1e2124; --raised:#24282b;
+      --text:#ece8de; --muted:#9a968b; --faint:#8a8578;
+      --accent:#e0a23c; --accent-text:#e0a23c; --line:#33373a; --line-strong:#4a4f53;
+      --resent:#cf8f5f;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--fb);font-size:16px;line-height:1.5}
+  .page{max-width:1240px;margin:0 auto;padding:32px}
+  .status{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:var(--rule) solid var(--line-strong);font-family:var(--fm);font-size:13px;letter-spacing:.04em;text-transform:uppercase}
+  .status .name{font-family:var(--fd);font-weight:700;font-size:18px;letter-spacing:0;text-transform:none}
+  .status .dot{width:9px;height:9px;background:var(--accent);display:inline-block;border-radius:9999px}
+  .status .dot.idle{background:var(--faint)}
+  .status .right{margin-left:auto;display:flex;gap:18px;color:var(--muted);align-items:center}
+  .hero{display:grid;grid-template-columns:2fr 1fr;gap:var(--gap);padding:28px 0;border-bottom:var(--rule) solid var(--line-strong)}
+  .hero .kicker{font-family:var(--fm);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .hero .big{font-family:var(--fm);font-weight:700;font-size:72px;line-height:1;font-variant-numeric:tabular-nums;margin:8px 0}
+  .hero .sub{font-family:var(--fm);font-size:14px;color:var(--muted)}
+  .hero .prov{display:inline-block;margin-top:10px;font-family:var(--fm);font-size:11px;letter-spacing:.06em;border:var(--rule) solid var(--line-strong);padding:3px 7px;color:var(--muted);text-transform:uppercase}
+  .hero .facts{display:flex;flex-direction:column;justify-content:flex-end;gap:10px;font-family:var(--fm);font-size:14px}
+  .hero .facts .row{display:flex;justify-content:space-between;border-bottom:var(--rule) solid var(--line);padding-bottom:6px}
+  .hero .facts .v{font-variant-numeric:tabular-nums}
+  .work{display:grid;grid-template-columns:42fr 58fr;gap:24px;padding:24px 0}
+  h2{font-family:var(--fd);font-weight:600;font-size:22px;margin:0 0 12px}
+  table{width:100%;border-collapse:collapse;font-family:var(--fm);font-size:13.5px;font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:8px 10px;border-bottom:var(--rule) solid var(--line)}
+  th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500}
+  td.num,th.num{text-align:right}
+  tr.cum td{border-top:var(--rule) solid var(--line-strong);font-weight:700}
+  tr.cold td{color:var(--faint)}
+  tr.new td, .row.new .cells{animation:arrive var(--short) ease-out both}
+  @keyframes arrive{from{background:color-mix(in srgb,var(--accent) 18%,transparent)}to{background:transparent}}
+  @media (prefers-reduced-motion:reduce){tr.new td,.row.new .cells{animation:none}}
+  .tape{font-family:var(--fm);font-size:14px}
+  .tape .row{display:grid;grid-template-columns:52px 1fr;gap:12px;align-items:center;padding:6px 0}
+  .tape .row .t{color:var(--muted);font-size:12px}
+  .tape .cells{letter-spacing:2px}
+  .hit{color:var(--accent-text)} .resent{color:var(--resent)} .cold{color:var(--faint)} .miss{color:var(--text)} .break{color:var(--muted)} .incomplete{color:var(--faint)}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-family:var(--fm);font-size:11.5px;color:var(--muted);letter-spacing:.03em}
+  .legend b{color:var(--text);font-weight:500}
+  .empty{color:var(--muted);font-family:var(--fb)}
+  .banner{border:var(--rule) solid var(--line-strong);background:var(--raised);padding:10px 14px;margin:0 0 16px;font-family:var(--fm);font-size:13px}
+  .foot{display:flex;gap:18px;align-items:center;padding:12px 0;border-top:var(--rule) solid var(--line-strong);font-family:var(--fm);font-size:12px;color:var(--muted)}
+  .foot .right{margin-left:auto;display:flex;gap:16px}
+  .tag{font-family:var(--fm);font-size:11px;color:var(--muted);margin-top:6px}
+  /* control: keyboard-reachable, 44px target, never amber-filled */
+  .control{font-family:var(--fb);font-size:14px;color:var(--text);background:none;border:none;
+    border-bottom:var(--rule) solid var(--line-strong);padding:12px 6px;min-height:44px;min-width:44px;cursor:pointer}
+  .control:hover{color:var(--text)}
+  .control:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .row-focusable:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media (max-width:1024px){.hero{grid-template-columns:1fr}.work{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="status">
+    <span class="name">cachemax</span>
+    <span><span class="dot" id="dot"></span> <span id="live">connecting…</span></span>
+    <span style="color:var(--muted)" id="live-sub"></span>
+    <span class="right">
+      <span id="tape-mode">tape: hash</span>
+      <span id="incomplete">0 incomplete</span>
+      <button class="control" id="export" type="button">export</button>
+    </span>
+  </div>
+
+  <div class="banner" id="banner" style="display:none"></div>
+
+  <div class="hero">
+    <div>
+      <div class="kicker" id="hero-kicker">Cloud · cost consequence</div>
+      <div class="big" id="hero-value">—</div>
+      <div class="sub" id="hero-sub">saved this session · cold turn onward</div>
+      <div class="prov" id="hero-prov">—</div>
+      <div class="facts" style="margin-top:22px">
+        <div class="row"><span>billed input</span><span class="v" id="f-billed">—</span></div>
+        <div class="row"><span>cache-served</span><span class="v" id="f-cached">—</span></div>
+        <div class="row"><span>hit rate</span><span class="v" id="f-hit" style="color:var(--accent-text)">—</span></div>
+      </div>
+    </div>
+    <div class="facts">
+      <div class="kicker">Transition</div>
+      <div class="row"><span style="color:var(--faint)">resent history</span><span class="v" style="color:var(--faint)" id="t-resent">—</span></div>
+      <div class="row"><span>cached</span><span class="v" id="t-cached">—</span></div>
+      <div class="row"><span>reuse</span><span class="v" id="t-reuse">—</span></div>
+    </div>
+  </div>
+
+  <div class="work">
+    <section>
+      <h2>Session</h2>
+      <table>
+        <thead><tr><th>turn</th><th class="num">hit</th><th class="num">cached / resent&nbsp;history</th><th class="num">cost</th></tr></thead>
+        <tbody id="turns"></tbody>
+      </table>
+      <div class="tag" id="session-tag"></div>
+    </section>
+    <section>
+      <h2>Prefix tape <span style="font-family:var(--fm);font-size:12px;color:var(--muted)" id="tape-label">· hash-level</span></h2>
+      <div class="tape" id="tape"></div>
+      <div class="legend">
+        <span><b>█</b> hit</span><span><b>▓</b> resent</span><span><b>░</b> cold</span>
+        <span><b>┊</b> break</span><span><b>▚</b> miss</span><span><b>?</b> incomplete</span>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot">
+    <span id="foot-live">● live</span><span>— = unexposed</span>
+    <span class="right"><span>theme: system (both)</span><span id="foot-url"></span></span>
+  </div>
+</div>
+
+<script>
+(function(){
+  var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?"};
+  var lastTurnCount = -1;
+
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];}); }
+
+  function renderTape(rows){
+    var host = document.getElementById("tape");
+    if(!rows.length){ host.innerHTML = '<div class="row"><span class="t">·</span><span class="cells cold">·</span></div>'; return; }
+    host.innerHTML = rows.map(function(r){
+      var newcls = (r.turn === lastTurnCount) ? " new" : "";
+      var cells = r.cells.map(function(s){ return '<span class="'+s+'">'+GLYPH[s]+'</span>'; }).join("");
+      return '<div class="row'+newcls+'" tabindex="0"><span class="t">t'+r.turn+'</span><span class="cells">'+cells+'</span></div>';
+    }).join("");
+  }
+
+  function renderTurns(state){
+    var host = document.getElementById("turns");
+    var html = state.turns.map(function(t){
+      var cls = t.cold ? "cold" : (t.incomplete ? "inc" : ((t.turn===lastTurnCount)?"new":""));
+      var mark = t.incomplete ? '<span class="mark">?</span>' : esc(t.hit);
+      return '<tr class="'+cls+'" tabindex="0"><td>'+t.turn+'</td><td class="num">'+mark+
+        '</td><td class="num">'+esc(t.cached_over_history)+'</td><td class="num">'+esc(t.cost)+'</td></tr>';
+    }).join("");
+    html += '<tr class="cum"><td>cum</td><td class="num">'+esc(state.cumulative.hit)+
+      '</td><td class="num">'+esc(state.cumulative.cached_over_history)+'</td><td class="num">'+esc(state.cumulative.cost)+'</td></tr>';
+    host.innerHTML = html;
+  }
+
+  function render(state){
+    var cloud = state.backend === "cloud";
+    document.getElementById("dot").className = "dot" + (state.live ? "" : " idle");
+    document.getElementById("live").textContent = state.live ? "● live" : "idle";
+    document.getElementById("live-sub").textContent = state.live ? "receiving requests" : "";
+    document.getElementById("tape-mode").textContent = "tape: " + state.tape_mode;
+    document.getElementById("incomplete").textContent = state.incomplete_count + " incomplete";
+    document.getElementById("tape-label").textContent = "· " + state.tape_mode + "-level";
+    document.getElementById("hero-kicker").textContent = cloud ? "Cloud · cost consequence" : "Local · speed consequence";
+    document.getElementById("hero-value").textContent = cloud ? state.cost_saved : state.transition.reuse;
+    document.getElementById("hero-sub").textContent = cloud ? "saved this session · cold turn onward" : "reuse on the last warm turn";
+    document.getElementById("hero-prov").textContent = state.provenance;
+    document.getElementById("f-billed").textContent = state.billed_input;
+    document.getElementById("f-cached").textContent = state.cache_served;
+    document.getElementById("f-hit").textContent = state.hit_rate;
+    document.getElementById("t-resent").textContent = state.transition.resent_history;
+    document.getElementById("t-cached").textContent = state.transition.cached;
+    document.getElementById("t-reuse").textContent = state.transition.reuse;
+    document.getElementById("session-tag").textContent =
+      "Complete records only · " + state.incomplete_count + " incomplete excluded";
+    document.getElementById("foot-live").textContent = state.live ? "● live" : "idle";
+    document.getElementById("foot-url").textContent = location.host;
+
+    var empty = !state.turns.length;
+    document.getElementById("banner").style.display = empty ? "" : "none";
+    if(empty){
+      document.getElementById("banner").textContent =
+        "No session yet. Point your app or agent at " + location.origin + " and send a request.";
+    }
+
+    renderTurns(state);
+    renderTape(state.tape);
+    lastTurnCount = state.turns.length ? state.turns[state.turns.length-1].turn : -1;
+  }
+
+  async function poll(){
+    try{
+      var r = await fetch("/api/state", {cache:"no-store"});
+      if(!r.ok) throw new Error(r.status);
+      render(await r.json());
+    }catch(e){
+      document.getElementById("live").textContent = "connecting…";
+      document.getElementById("dot").className = "dot idle";
+    }
+  }
+
+  document.getElementById("export").addEventListener("click", function(){
+    location.href = "/api/export";
+  });
+
+  poll();
+  setInterval(poll, 500);
+})();
+</script>
+</body>
+</html>
