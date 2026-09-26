@@ -45,9 +45,21 @@ def _measure(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> None:
+def _resolve_argv(argv: list[str]) -> list[str]:
+    """Insert a default `serve` when no subcommand is given.
+
+    Bare invocation (no subcommand) serves, matching the proxy's expectation.
+    Leading flags like `--port 9000` also route to serve; an explicit
+    subcommand or `--help` is left untouched.
+    """
+    if not argv or argv[0] not in {"serve", "measure", "-h", "--help"}:
+        return ["serve", *argv]
+    return argv
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cachemax-sidecar")
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--backend", choices=["mlx", "fake"], default="mlx")
@@ -68,10 +80,12 @@ def main(argv: list[str] | None = None) -> None:
     add_common(measure)
     measure.set_defaults(func=_measure)
 
-    args = parser.parse_args(argv)
-    if not getattr(args, "command", None):
-        # Bare invocation serves, matching the proxy's expectation.
-        args = parser.parse_args(["serve", *(argv or [])])
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = _resolve_argv(list(sys.argv[1:] if argv is None else argv))
+    args = _build_parser().parse_args(argv)
     sys.exit(args.func(args))
 
 

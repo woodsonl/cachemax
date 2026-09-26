@@ -20,7 +20,7 @@ dev = [
 # Real mlx-lm inference (macOS / Apple Silicon only). Install with:
 #   uv sync --project sidecar --extra mlx
 mlx = [
-    "mlx-lm>=0.31.0; platform_system == 'Darwin'",
+    "mlx-lm>=0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]
