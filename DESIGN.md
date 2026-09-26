@@ -44,6 +44,10 @@ spacing:
   lg: 24px
   xl: 32px
   2xl: 48px
+motion:
+  micro: 80ms
+  short: 180ms
+  medium: 280ms
 components:
   status-strip:
     borderColor: "{colors.line-strong}"
@@ -57,10 +61,9 @@ components:
   data-table-row:
     borderColor: "{colors.line}"
     textColor: "{colors.text}"
-  tape-hit:
-    textColor: "{colors.accent}"
-  tape-resent:
-    textColor: "{colors.accent-resent}"
+  tape-cell:
+    fontFamily: "{typography.mono.fontFamily}"
+    textColor: "{colors.text}"
   control:
     borderColor: "{colors.line-strong}"
     textColor: "{colors.text}"
