@@ -87,6 +87,14 @@ impl Fault {
             docs: "rates-file",
         }
     }
+    fn bind_unavailable(bind: &str, cause: String) -> Self {
+        Fault {
+            problem: "address unavailable",
+            cause: format!("could not bind {bind}: {cause}"),
+            fix: "another process may hold the port; pass a different --bind, e.g. --bind 127.0.0.1:8788",
+            docs: "address-unavailable",
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -191,14 +199,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Export { out } => {
             let base = format!("http://{}", cli.bind);
+            let jsonl = fetch_export(&base).await?;
             let path = match out {
                 Some(p) => p,
                 None => {
-                    let id = fetch_current_session_id(&base).await.unwrap_or(0);
+                    // Name the file after the session actually exported. Faulting
+                    // to id 0 would silently write `cachemax-0.jsonl` (and clobber
+                    // a prior one) when the session id is unknown.
+                    let id = first_session_id(&jsonl).ok_or_else(|| Fault {
+                        problem: "nothing to export",
+                        cause: "the proxy has no finalized requests yet".into(),
+                        fix: "send a request through the proxy, then export; or pass --out to choose a path",
+                        docs: "no-running-proxy",
+                    })?;
                     export::default_path(id)
                 }
             };
-            let jsonl = fetch_export(&base).await?;
             std::fs::write(&path, jsonl)?;
             println!("wrote {path}");
             Ok(())
@@ -206,7 +222,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Build the adapter for `--backend` and run the proxy with it.
+/// Build the adapter for `--backend` and run the proxy with it. The listener is
+/// bound here so a bad/unavailable address surfaces as the D3 error contract
+/// rather than a raw OS error.
 async fn dispatch_serve(
     backend: &str,
     tokenizer: Tokenizer,
@@ -215,6 +233,9 @@ async fn dispatch_serve(
     bind: &str,
     inject_usage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| Fault::bind_unavailable(bind, e.to_string()))?;
     match backend {
         "openai" => {
             proxy::serve(
@@ -222,7 +243,7 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 upstream,
-                bind,
+                listener,
                 inject_usage,
             )
             .await
@@ -233,7 +254,7 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 upstream,
-                bind,
+                listener,
                 inject_usage,
             )
             .await
@@ -244,13 +265,33 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 upstream,
-                bind,
+                listener,
                 inject_usage,
             )
             .await
         }
-        "vllm" => proxy::serve(VllmAdapter, tokenizer, rates, upstream, bind, inject_usage).await,
-        "mlxlm" => proxy::serve(MlxLmAdapter, tokenizer, rates, upstream, bind, inject_usage).await,
+        "vllm" => {
+            proxy::serve(
+                VllmAdapter,
+                tokenizer,
+                rates,
+                upstream,
+                listener,
+                inject_usage,
+            )
+            .await
+        }
+        "mlxlm" => {
+            proxy::serve(
+                MlxLmAdapter,
+                tokenizer,
+                rates,
+                upstream,
+                listener,
+                inject_usage,
+            )
+            .await
+        }
         other => Err(Fault::unknown_backend(other).into()),
     }
 }
@@ -309,12 +350,28 @@ async fn fetch_export(base: &str) -> Result<String, Box<dyn std::error::Error>> 
     Ok(resp.text().await?)
 }
 
-async fn fetch_current_session_id(base: &str) -> Option<u64> {
-    let url = format!("{base}/api/state");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+/// The session id of the first record in an exported JSONL body, if any.
+fn first_session_id(jsonl: &str) -> Option<u64> {
+    let line = jsonl.lines().find(|l| !l.trim().is_empty())?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
     v.get("session_id").and_then(|n| n.as_u64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_session_id_reads_the_first_record() {
+        let jsonl = "{\"session_id\":7,\"turn\":0}\n{\"session_id\":7,\"turn\":1}\n";
+        assert_eq!(first_session_id(jsonl), Some(7));
+    }
+
+    #[test]
+    fn first_session_id_is_none_for_empty_export() {
+        // Empty (no records): the caller must surface that as a fault, not
+        // silently write `cachemax-0.jsonl`.
+        assert_eq!(first_session_id(""), None);
+        assert_eq!(first_session_id("\n  \n"), None);
+    }
 }

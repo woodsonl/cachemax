@@ -32,8 +32,9 @@ One record per request. Nothing about message content is in it — metrics only:
 | `cache_written_tokens` | Prefix tokens written to cache this turn (Anthropic only; 0 elsewhere). |
 | `resent_history_tokens` | The binding denominator: system + all prior messages, excluding this turn's new content. |
 | `billed_input_tokens` | Billed input tokens for the turn. |
-| `cost_usd` | Cost at the provider's published rate, if the model is known. |
-| `cost_saved_usd` | The no-cache counterfactual minus the actual cost, if rates are known. |
+| `broke_prefix` | `true` when this turn's prompt diverged from the tracked session's prefix (a prefix break). |
+| `cost_usd` | Cost at the provider's published rate, if the model is known. `null` for an incomplete turn. |
+| `cost_saved_usd` | The no-cache counterfactual minus the actual cost, if rates are known. `null` for an incomplete turn. |
 
 ## The hit-rate formula
 
