@@ -110,9 +110,22 @@ pub fn provenance(records: &[Record]) -> SourceLabel {
     counts
         .iter()
         .filter(|(_, n)| *n > 0)
-        .max_by_key(|(_, n)| *n)
+        // On a count tie, prefer a source that actually exposes cache truth
+        // (provider-reported over engine-measured over none), so a single
+        // field-less turn cannot drag a cloud session to `no_cache_truth`.
+        .max_by_key(|(s, n)| (*n, source_rank(*s)))
         .map(|(s, _)| *s)
         .unwrap_or(SourceLabel::NoCacheTruth)
+}
+
+/// Tie-break priority: higher wins. Cloud (provider-reported) is the most
+/// specific provenance; `no_cache_truth` is the least.
+fn source_rank(s: SourceLabel) -> u8 {
+    match s {
+        SourceLabel::ProviderReported => 2,
+        SourceLabel::EngineMeasured => 1,
+        SourceLabel::NoCacheTruth => 0,
+    }
 }
 
 /// One row of the session table.
@@ -202,11 +215,16 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         .count();
 
     // Complete turns (turn ≥ 1) drive the numbers; turn 0 and incomplete are
-    // shown in the table but excluded from the formula.
-    let complete: Vec<&Record> = records
-        .iter()
-        .filter(|r| r.status == Status::Complete && r.turn >= 1)
-        .collect();
+    // shown in the table but excluded from the formula. Turns with no cache
+    // truth or a zero denominator contribute nothing (matching
+    // `record::cumulative_hit_rate`), so the hero cannot be inflated by them.
+    let contributes = |r: &&Record| {
+        r.status == Status::Complete
+            && r.turn >= 1
+            && r.resent_history_tokens > 0
+            && r.source != SourceLabel::NoCacheTruth
+    };
+    let complete: Vec<&Record> = records.iter().filter(contributes).collect();
 
     let cached_sum: u64 = complete.iter().map(|r| r.cached_tokens).sum();
     let history_sum: u64 = complete.iter().map(|r| r.resent_history_tokens).sum();
@@ -401,6 +419,38 @@ mod tests {
     fn unexposed_renders_as_dash_never_zero() {
         assert_eq!(format_pct(None), "—");
         assert_eq!(format_usd(None), "—");
+    }
+
+    #[test]
+    fn mlxlm_no_cache_truth_shows_dash_not_zero_percent() {
+        // mlx-lm exposes no cache truth; its rate must be `—`, never a measured
+        // `0%` (spec: unexposed fields render `—`).
+        let mut r = rec(1, 0, 1550);
+        r.source = SourceLabel::NoCacheTruth;
+        assert_eq!(r.hit_rate(), None);
+        assert_eq!(format_pct(r.hit_rate()), "—");
+        assert_eq!(hero_hit_rate(&[r.clone()]), "—");
+        assert_eq!(turn_row(&r).hit, "—");
+    }
+
+    #[test]
+    fn zero_denominator_turn_does_not_inflate_the_cumulative() {
+        // A complete turn with no re-sent history must contribute nothing to
+        // the session rate (was: added cached to numerator over a 0 denominator).
+        let rs = vec![rec(1, 100, 1000), rec(2, 900, 0)];
+        assert_eq!(hero_hit_rate(&rs), format_pct(Some(0.1)));
+        assert_eq!(hero_hit_rate(&rs), format_pct(cumulative_hit_rate(&rs)));
+    }
+
+    #[test]
+    fn provenance_tie_prefers_cache_truth_over_no_cache_truth() {
+        // One field-less turn + one provider turn must not tag a cloud session
+        // as local.
+        let mut blank = rec(1, 0, 100);
+        blank.source = SourceLabel::NoCacheTruth;
+        let reported = rec(2, 50, 100);
+        let rs = vec![blank, reported];
+        assert_eq!(provenance(&rs), SourceLabel::ProviderReported);
     }
 
     #[test]

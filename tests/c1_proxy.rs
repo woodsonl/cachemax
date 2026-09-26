@@ -94,6 +94,7 @@ async fn boot_proxy(upstream: String) -> String {
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
         client: reqwest::Client::new(),
+        inject_usage: true,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -356,6 +357,7 @@ async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: format!("http://{addr}"),
         client: reqwest::Client::new(),
+        inject_usage: true,
     });
     let sessions = state.sessions.clone();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
