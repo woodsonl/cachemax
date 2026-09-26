@@ -25,7 +25,7 @@ One record per request. Nothing about message content is in it — metrics only:
 |---|---|
 | `session_id` | Which conversation this request belongs to. |
 | `turn` | Turn index within the session. Turn 0 is cold. |
-| `status` | `complete` or `incomplete` (the stream ended early). |
+| `status` | `complete` or `incomplete` (the stream ended early, or the upstream answered non-2xx). |
 | `source` | Where the cache figure came from: `provider_reported`, `engine_measured`, or `no_cache_truth`. |
 | `ttft_ms` | Time to first token. |
 | `cached_tokens` | Prefix tokens the provider/engine reports it served from cache. |

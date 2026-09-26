@@ -59,6 +59,10 @@ pub fn plan_request(
     let resolution = store.resolve(&hashes);
     let session_id = resolution.session_id;
     let session = store.session(session_id);
+    // Turn index = records finalized so far. Appends happen when a stream ends,
+    // so genuinely concurrent requests sharing one prefix can plan the same
+    // turn. Aggregate integrity is unaffected (appends stay atomic); turn
+    // numbering is advisory and single-client sequential in practice.
     let turn = session.map(|s| s.records.len() as u32).unwrap_or(0);
     // Binding denominator = the re-sent history: system + all prior user,
     // assistant, and tool messages, excluding this turn's new content. This
