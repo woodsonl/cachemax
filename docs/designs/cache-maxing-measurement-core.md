@@ -115,6 +115,35 @@ Edge cases: empty messages → `—` (zero denominator, not 0); oversized prompt
 - Distribution: `cargo install cache-maxing`, release binaries, `cargo binstall`. Dashboard is a single HTML file embedded in the binary.
 - Tests: `cargo test` for the core (unit + integration + latency system test), engineless via trait mocks; pytest for the sidecar's contract tests. CI: macOS + Linux + Windows.
 
+## Dashboard interaction states
+
+What the user SEES per surface, per state. Empty states carry warmth and the one next action, never "No data."
+
+| Surface | Loading | Empty | Error | Success | Partial |
+|---|---|---|---|---|---|
+| Hero band | Skeleton bar + "connecting to upstream…" | "No session yet — point your app or agent at this proxy and send a request." + the proxy URL to copy | Upstream unreachable: red status line with cause + fix (mirrors the D3 error contract); hero shows `—` | Live numbers updating per turn | `incomplete` request: hero keeps last good value, badge `⚠ 1 incomplete` |
+| Session view | Table shell, 3 placeholder rows | One ghost row with the `—` convention | Table frozen at last good row + error banner | Per-turn rows append as turns complete | Incomplete turn row shows `M` + `⚠`, excluded from cumulative |
+| Prefix tape | Empty tape with legend | Tape shows a single `·` cold cell; caption "waiting for turn 1" | Tape dims, error banner over it | Per-turn cells fill left-to-right | Break cell `✂`, incomplete cell `⚠` |
+| Status bar | "connecting…" | "idle" | "upstream error" + docs link | "● live" | "+N incomplete" |
+| Whole dashboard | — | — | — | — | **metrics reset banner** after proxy restart (state is ephemeral by design); **session break** (not a splice) when the engine restarts mid-session |
+
+`—` (not `0`) is the universal unexposed-value token. `provider_reported` and `no_cache_truth` are labeled inline wherever the figure appears.
+
+## User journey (cloud-primary)
+
+The dashboard's first job is to prove it is ALIVE before it proves it is saving money. A user who cannot tell the proxy is working will not wait for the cost number.
+
+| Step | User does | User feels | Plan specifies |
+|---|---|---|---|
+| 1 | Runs install + first command, opens the dashboard URL | Curious, impatient | D1 (install, first command, URL); empty state names the next action |
+| 2 | Points an agent at the proxy (`base_url` swap) | Mild doubt: "did I point it right?" | D2 (named agent config); status bar shows `● live` on first request |
+| 3 | Sends turn 1 (cold) | "Is it even working?" | Hero + session row appear within one turn; `cold` cell visible; nothing is fake |
+| 4 | Sends turn 2 (warm) | Relief: "there it is" | Hit rate + cached/resent + `provider_reported` land; tape shows HIT |
+| 5 | Reads the session-cumulative row | "So that is what cache reuse is worth" | Cumulative hit rate + cost saved in the hero (cloud weighting) |
+| 6 | Watches a longer agentic session (long system prompt, tools) | Trust builds re: correctness and framing | Per-turn rows compare individually; incomplete/miss markers honest |
+
+Local path reuses steps 1-4-5 with the hero weighted to TTFT collapse instead of cost.
+
 ## Latency budget method
 
 The CI test measures proxy-vs-direct first-token timing, warm-pinned, median-of-N, p95 gate. A micro-profile breaks the hot path into stages (serde, tokenize, hash, session lookup, forward) so any budget verdict names the culprit. Failures at >5 ms p95 on an injected delay.
@@ -132,7 +161,15 @@ Local binary binding loopback by default; no auth (single user, no multi-user su
 - [ ] **C3 — local adapters.** llama.cpp (ground truth), vLLM (metrics), mlx-lm (discrimination only). Files: `src/adapters/llamacpp.rs`, `src/adapters/vllm.rs`, `src/adapters/mlxlm.rs`. Verify: ±5% llama.cpp criterion; mocked-adapter CI suite passes engineless.
 - [ ] **C4 — sessions + aggregation.** prefix-continuity store, fork resolution, atomic aggregate. Files: `src/sessions.rs`. Verify: interleaved-requests atomicity test (real interleave, tokio); fork tie-break fixture; collision log test.
 - [ ] **C5 — latency budget CI.** warm-pinned median-of-N proxy-vs-direct TTFT + micro-profile. Files: `tests/` + CI workflow. Verify: >5 ms p95 fails on injected delay; passes on clean tree.
-- [ ] **C6 — dashboard.** single-file, hero surface per backend (cost on cloud, TTFT on local), hit rate, prefix tape, session view. Files: `src/dashboard.rs`. Verify: state-map rows each render; tape legible without color (glyph, not just green/red); no fake detail in hash-level mode.
+- [ ] **C6 — dashboard.** single-file, single-screen, no navigation. Primary workspace is one composition, hero-first:
+  1. **Hero band (top, weights by backend):** cloud shows cost saved (`billed input`, `cache-served`, hit rate labeled `provider_reported`); local shows TTFT cold→warm with the speedup factor.
+  2. **Session view (left):** per-turn table (turn, hit, cached/resent, cost) plus cumulative row.
+  3. **Prefix tape (right):** per-turn prefix map (hit / resent / cold / break / miss / incomplete) with a legend.
+  4. **Status bar (bottom):** live indicator, tape mode (hash-level / byte-level), export, incomplete count.
+  Files: `src/dashboard.rs`. Verify: state-map rows each render; tape legible without color (glyph, not just green/red); no fake detail in hash-level mode; every color/type/space value comes from DESIGN.md tokens (blocked until DESIGN.md exists).
+  > Visual language deferred: run `/design-consultation` to create `DESIGN.md` before the dashboard is styled. Until then C6 is functional only — no ad-hoc palette, type scale, or layout beyond the hierarchy above. When DESIGN.md lands, its tokens override.
+  > Responsive + a11y contract: minimum supported viewport 1024px; below 1024px the session view and tape stack vertically with the hero staying full-width (no nav to collapse). Keyboard: session rows and tape cells are focusable, `export` is keyboard-reachable, focus ring always visible. Contrast ≥4.5:1 on body text. All figures use tabular numerals. The tape is legible with color removed (glyph rule, above). Any interactive control has a ≥44px target.
+  > Theme: light **and** dark, following the OS `prefers-color-scheme`. Both palettes come from DESIGN.md CSS variables; no hard-coded colors.
 - [ ] **C7 — observability.** JSONL export (metrics-only by default) + structured finalize logs. Files: `src/export.rs`. Verify: export matches dashboard numbers; logs grep-able without bodies.
 - [ ] **C8 — CLI.** `serve`, `--backend`, `--upstream-url`, `--check`, `export`, `--verbose` (metadata only), engine/precision flags. Files: `src/main.rs`. Verify: `--check` fails loudly on unreachable upstream; `--help` lists everything; defaults work with zero flags.
 
@@ -163,3 +200,46 @@ Local binary binding loopback by default; no auth (single user, no multi-user su
 - vLLM: poll `/metrics` per request or scrape continuously — attribution granularity differs.
 - Tape from the proxy's own token stream (portable) or engine ground truth where available (accurate). Default: engine truth when available, labeled otherwise.
 - Binary name: `cache-maxing` vs shorter `cache-max` CLI. Decide before first release.
+
+## Implementation Tasks (design review)
+
+Synthesized from the design review's findings. Each task derives from a specific
+finding above. Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T1 (P1, human: ~1h / CC: ~10min)** — dashboard — build the hero-first single-screen layout (hero band, session view, prefix tape, status bar)
+  - Surfaced by: Pass 1 (Info Arch 3/10) — no hierarchy or layout specified
+  - Files: `src/dashboard.rs`
+  - Verify: all four regions render; no navigation; hero weights by backend
+- [ ] **T2 (P1, human: ~1h / CC: ~10min)** — dashboard — implement the interaction state table (loading/empty/error/success/partial) for every surface
+  - Surfaced by: Pass 2 (States 2/10) — no loading/empty/error states; reset banner and session break undrawn
+  - Files: `src/dashboard.rs`
+  - Verify: each state in the table renders; `—` never `0`; reset banner + session break appear
+- [ ] **T3 (P2, human: ~30min / CC: ~5min)** — dashboard — make the cloud journey's "is it alive" signal land on turn 1 and the cost payoff on turn 2
+  - Surfaced by: Pass 3 (Journey 2/10) — no emotional arc; first-turn liveness unaddressed
+  - Files: `src/dashboard.rs`
+  - Verify: cold turn shows activity within one turn; warm turn shows hit rate + `provider_reported`
+- [ ] **T4 (P1, human: ~1h / CC: ~10min)** — dashboard — responsive + a11y contract (1024px floor, stack below, keyboard, contrast, tabular numerals, 44px targets, light/dark via `prefers-color-scheme`)
+  - Surfaced by: Pass 6 (Responsive 2/10) — no viewport/a11y spec
+  - Files: `src/dashboard.rs`
+  - Verify: keyboard-only walkthrough; contrast check; both themes render
+- [ ] **T5 (P1, human: ~2h / CC: ~20min)** — design system — create `DESIGN.md` via `/design-consultation`
+  - Surfaced by: Pass 4+5 (AI Slop 4/10, Design Sys 2/10) — no DESIGN.md; visual language deferred by owner
+  - Files: `DESIGN.md`, `src/dashboard.rs`
+  - Verify: every dashboard color/type/space value references a DESIGN.md token
+
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | HOLD SCOPE, 0 critical gaps |
+| Outside Review | codex (`/plan-ceo-review`) | Independent 2nd opinion | 1 | completed | 7 findings adopted |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | issues_open | 14 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 1 | issues_open | score: 2/10 → 7/10, 6 decisions |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 1 | issues_open | score: 3/10 → 6.5/10, TTHW: >10min → 2-5min |
+
+- **OUTSIDE COVERAGE:** codex, plan-review (CEO phase), completed, 7 findings adopted. No outside voice ran for the design or DX phases.
+- **CROSS-MODEL:** native CEO/eng/design/DX reviews plus one completed codex outside voice; overlap on the codex plan-review findings (all 7 adopted). No distinct-model inference beyond recorded provider.
+- **VERDICT:** CEO + ENG CLEARED — ready to implement. Design review found UI specification gaps (dashboard had no layout/states/a11y); fixes approved and applied. Design review required before dashboard styling is called design-complete.
+- **UNRESOLVED DECISIONS:**
+  - Visual language / `DESIGN.md` — deferred by owner to `/design-consultation`. C6 styling is blocked until DESIGN.md exists (task T5).
