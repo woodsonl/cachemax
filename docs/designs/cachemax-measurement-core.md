@@ -111,9 +111,10 @@ Edge cases: empty messages → `—` (zero denominator, not 0); oversized prompt
 
 ## Stack
 
-- **Core: Rust** (axum/tokio, hyper unbuffered SSE, reqwest, HF `tokenizers` crate when a local tokenizer is needed). Live at the repo root (`Cargo.toml`, `src/*.rs`). Single binary, cross-platform (macOS Intel/AS, Linux x86_64/aarch64, Windows MSVC).
+- **Core: Rust** (axum/tokio, hyper unbuffered SSE, reqwest, `tiktoken-rs` for token-prefix hashing). Live at the repo root (`Cargo.toml`, `src/*.rs`). Single binary, cross-platform (macOS Intel/AS, Linux x86_64/aarch64, Windows MSVC).
+- **Prefix hashing is token-level from the start.** `tiktoken-rs` embeds the vocabulary, so no external asset ships. Default encoding is `cl100k_base` (the OpenAI-family lingua franca); `--tokenizer <name|path>` overrides (`o200k_base`, `p50k_base`, or a model name via `bpe_for_model`).
 - **Local mlx-lm precision path: Python sidecar** (subprocess, off the hot path). Lives under `sidecar/`. Never imported by the core.
-- **No tokenizer and no Python are required to run and show a curve.** Only the tape's prefix hashing always runs (it needs the bundled tokenizer); token counting on the cloud path stays provider-reported, never locally re-derived. Tokenizers and the sidecar are opt-in precision layers.
+- **No user-supplied tokenizer and no Python are required to run and show a curve.** The bundled tokenizer always drives the tape's prefix hashing; token counting on the cloud path stays provider-reported, never locally re-derived. The sidecar is an opt-in precision layer.
 - Repo scaffolding (uv project under `sidecar/`) remains only for the Python sidecar and dev tooling.
 - Distribution: `cargo install cachemax`, release binaries, `cargo binstall`. The dashboard is a single HTML file embedded in the binary.
 - Tests: `cargo test` for the core (unit + integration + latency system test), engineless via trait mocks; pytest for the sidecar's contract tests. CI: macOS + Linux + Windows.
@@ -200,7 +201,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 - Repo scaffolding: uv project under `sidecar/`, FastAPI skeleton, placeholder CLI, 1 passing test. Repurposed for the sidecar and dev tooling; the core is new Rust at the repo root.
 - llamacpp-stats-dashboard (MIT): patterns borrowed (read1() streaming, caps-field display, pre-warm TTFT testing).
 - LMCache: per-request hit-rate attribute pattern, token-level counters, blake3 hashing option.
-- Rust ecosystem: axum/hyper SSE, reqwest, HF `tokenizers`.
+- Rust ecosystem: axum/hyper SSE, reqwest, `tiktoken-rs` (token-prefix hashing).
 
 ## Open questions
 

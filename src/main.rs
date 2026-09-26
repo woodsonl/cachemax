@@ -14,6 +14,7 @@ mod export;
 mod proxy;
 mod record;
 mod sessions;
+mod tokenize;
 
 use clap::{Parser, Subcommand};
 
