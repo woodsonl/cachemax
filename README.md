@@ -10,7 +10,7 @@ It measures first. It does not repair yet.
   OpenAI, Anthropic, or OpenRouter. See how much prompt-cache reuse you get and
   what it costs.
 - **Local (minority):** run llama.cpp, mlx-lm, or vLLM and watch TTFT collapse
-  as the cache warms.
+  as the cache warms. (mlx-lm is macOS/Apple Silicon only.)
 
 Both are first-class targets.
 

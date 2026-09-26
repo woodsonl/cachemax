@@ -127,10 +127,10 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 ## Components
 
 - **status-strip:** uppercase mono labels in `text-muted`; the live dot in `accent`. Hover none (not interactive). Focus none.
-- **hero-value:** mono 700, tabular, `text` color for facts; `text-faint` for the past value in a transition. Never colored.
+- **hero-value:** mono 700, tabular, `text` color for facts; `text-faint` for the past value in a transition. Never in `accent` or any signal color.
 - **provenance-tag:** 1px `line-strong` border, mono 11px `text-muted`, uppercase. Used for `provider_reported`, `engine_measured`, and `no_cache_truth`.
 - **data-table-row:** bottom border `line`; cold rows in `text-faint`; the cumulative row gets a `line-strong` top border and weight 700. Hover raises the row to `surface`. Focus-visible adds an `accent` outline.
-- **tape-cell:** monospace glyph, color by state (hit `accent`, resent `accent-resent`, cold `text-faint`, miss `text`, break `text-muted`), always distinguishable with color removed by glyph shape.
+- **tape-cell:** monospace glyph, color by state (hit `accent`, resent `accent-resent`, cold `text-faint`, miss `text`, break `text-muted`, incomplete `text-faint`), always distinguishable with color removed by glyph shape (incomplete is marked by its own glyph, never conflated with cold).
 - **control** (tape-mode toggle, export): body face 14px, `text` color, no fill; 1px `line-strong` underline or border only. Hover darkens the label to `text`. Focus-visible draws an `accent` outline at 2px offset. Minimum 44x44px target even when the label is smaller. Never amber-filled.
 
 ## Do's and Don'ts
