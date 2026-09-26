@@ -234,6 +234,8 @@ pub struct StreamObserver {
     /// tail eviction. Usage can arrive early (Anthropic `message_start`) while
     /// large content follows, so it must not be lost to the tail cap.
     usage_doc: Option<Vec<u8>>,
+    /// Byte offset up to which `tail` has already been scanned for usage.
+    scanned: usize,
     /// Cap the retained copy; the tail is a fallback for content-free streams.
     cap: usize,
 }
@@ -246,6 +248,7 @@ impl StreamObserver {
             saw_first_byte: false,
             tail: Vec::new(),
             usage_doc: None,
+            scanned: 0,
             cap: 64 * 1024,
         }
     }
@@ -261,11 +264,18 @@ impl StreamObserver {
         if self.tail.len() > self.cap {
             let drop = self.tail.len() - self.cap;
             self.tail.drain(..drop);
+            self.scanned = self.scanned.saturating_sub(drop);
         }
-        // Capture any usage-bearing event now, before it can be evicted. Parse
-        // the accumulated tail so events split across chunks are seen whole.
-        if has_usage_or_cache_in(&self.tail) {
+        // Capture any usage-bearing event as it passes, before tail eviction can
+        // drop it. Scan only the newly appended bytes (plus a small overlap for
+        // events split across chunk boundaries), not the whole growing tail.
+        let scan_from = self.scanned.saturating_sub(256).min(self.tail.len());
+        let fresh = &self.tail[scan_from..];
+        if has_usage_or_cache_in(fresh) {
+            self.scanned = self.tail.len();
             self.usage_doc = Some(last_json_event(&self.tail));
+        } else {
+            self.scanned = self.tail.len();
         }
     }
 
