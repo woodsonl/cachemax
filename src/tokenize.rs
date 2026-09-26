@@ -69,16 +69,23 @@ impl Tokenizer {
     /// Hash a message list into a prefix-hash sequence. Each element is the
     /// hash of the token stream of all messages up to and including index `i`,
     /// so two requests share a prefix iff their hash sequences share one.
+    ///
+    /// Incremental: one running hasher is extended per message and snapshotted,
+    /// so the whole thing is O(total tokens), not O(n²) over the conversation.
     pub fn prefix_hashes(&self, messages: &[Message]) -> Vec<u64> {
         use std::hash::{Hash, Hasher};
-        let mut running = Vec::new();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let mut hashes = Vec::with_capacity(messages.len());
         for m in messages {
-            running.extend(self.bpe.encode_with_special_tokens(&m.role));
-            running.extend(self.bpe.encode_with_special_tokens(&m.text));
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            running.hash(&mut h);
-            hashes.push(h.finish());
+            // Feed this message's tokens into the single running hasher.
+            for tok in self.bpe.encode_with_special_tokens(&m.role) {
+                tok.hash(&mut hasher);
+            }
+            for tok in self.bpe.encode_with_special_tokens(&m.text) {
+                tok.hash(&mut hasher);
+            }
+            // The running hasher's state after message i is the prefix hash.
+            hashes.push(hasher.finish());
         }
         hashes
     }
@@ -144,8 +151,14 @@ mod tests {
 
     #[test]
     fn resolve_named_encodings() {
-        assert_eq!(Tokenizer::resolve("o200k_base").unwrap().label(), "o200k_base");
-        assert_eq!(Tokenizer::resolve("p50k_base").unwrap().label(), "p50k_base");
+        assert_eq!(
+            Tokenizer::resolve("o200k_base").unwrap().label(),
+            "o200k_base"
+        );
+        assert_eq!(
+            Tokenizer::resolve("p50k_base").unwrap().label(),
+            "p50k_base"
+        );
     }
 
     #[test]
@@ -155,9 +168,6 @@ mod tests {
         let t = Tokenizer::default_encoder().unwrap();
         assert_eq!(t.count("hello world"), 2);
         assert_eq!(t.count(""), 0);
-        assert_eq!(
-            t.count("The quick brown fox jumps over the lazy dog."),
-            10
-        );
+        assert_eq!(t.count("The quick brown fox jumps over the lazy dog."), 10);
     }
 }

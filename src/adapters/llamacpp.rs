@@ -84,7 +84,8 @@ mod tests {
 
     #[test]
     fn reads_oai_usage_cached_tokens_as_last_resort() {
-        let body = br#"{"usage":{"prompt_tokens":240,"prompt_tokens_details":{"cached_tokens":236}}}"#;
+        let body =
+            br#"{"usage":{"prompt_tokens":240,"prompt_tokens_details":{"cached_tokens":236}}}"#;
         assert_eq!(LlamaCppAdapter::tokens_cached(body), Some(236));
     }
 

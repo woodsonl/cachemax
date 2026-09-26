@@ -69,7 +69,8 @@ mod tests {
 
     #[test]
     fn openai_reads_cached_tokens_dotted_path() {
-        let body = br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
+        let body =
+            br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
         let sig = openai::OpenAiAdapter.cache_signal(body);
         assert_eq!(sig.cached_tokens, 1455);
         assert_eq!(sig.source, Some(SourceLabel::ProviderReported));
@@ -77,7 +78,8 @@ mod tests {
 
     #[test]
     fn anthropic_reads_read_and_creation_split() {
-        let body = br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
+        let body =
+            br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
         let sig = anthropic::AnthropicAdapter.cache_signal(body);
         assert_eq!(sig.cached_tokens, 900);
         assert_eq!(sig.source, Some(SourceLabel::ProviderReported));

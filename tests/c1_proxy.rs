@@ -137,7 +137,10 @@ async fn ttft_is_not_total_time() {
 
     // First byte arrives after ~40ms (one upstream gap), well under the 80ms a
     // full-response buffer would cost.
-    assert!(ttft < Duration::from_millis(70), "TTFT {ttft:?} suggests buffering");
+    assert!(
+        ttft < Duration::from_millis(70),
+        "TTFT {ttft:?} suggests buffering"
+    );
     assert!(!first.is_empty());
 }
 
@@ -163,7 +166,9 @@ async fn incomplete_upstream_stream_is_recorded_incomplete() {
     );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let u = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(l, app).await.unwrap();
+    });
 
     let proxy_url = boot_proxy(format!("http://{u}")).await;
     let resp = reqwest::Client::new()

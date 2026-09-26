@@ -313,7 +313,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
     };
 
     // Forward first. The request body is passed through untouched.
-    let url = format!("{}/v1/chat/completions", state.upstream_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/chat/completions",
+        state.upstream_url.trim_end_matches('/')
+    );
     let upstream = match state
         .client
         .post(&url)
@@ -380,7 +383,10 @@ fn messages_from(body: &[u8]) -> Option<Vec<Message>> {
     for m in arr {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let text = flatten_content(m.get("content"));
-        out.push(Message { role: role.to_string(), text });
+        out.push(Message {
+            role: role.to_string(),
+            text,
+        });
     }
     Some(out)
 }
@@ -412,13 +418,23 @@ mod tests {
     use crate::adapters::openai::OpenAiAdapter;
 
     fn msg(role: &str, text: &str) -> Message {
-        Message { role: role.into(), text: text.into() }
+        Message {
+            role: role.into(),
+            text: text.into(),
+        }
     }
 
     #[test]
     fn a_dropped_stream_finalizes_incomplete() {
-        let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 1550 };
-        let obs = Observation { ttft_ms: Some(120.0), ..Default::default() };
+        let plan = RequestPlan {
+            session_id: 1,
+            turn: 1,
+            resent_history_tokens: 1550,
+        };
+        let obs = Observation {
+            ttft_ms: Some(120.0),
+            ..Default::default()
+        };
         let r = build_record(
             &plan,
             obs,
@@ -451,7 +467,11 @@ mod tests {
 
     #[test]
     fn observer_finalizes_cached_and_billed_from_the_tail() {
-        let plan = RequestPlan { session_id: 7, turn: 2, resent_history_tokens: 1810 };
+        let plan = RequestPlan {
+            session_id: 7,
+            turn: 2,
+            resent_history_tokens: 1810,
+        };
         let mut o = StreamObserver::new();
         o.on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
         o.on_chunk(
@@ -486,7 +506,11 @@ mod tests {
         // Simulate the finalized turn 0 so the next request sees turn 1.
         let r = build_record(
             &p0,
-            Observation { ttft_ms: Some(100.0), billed_input_tokens: 10, ..Default::default() },
+            Observation {
+                ttft_ms: Some(100.0),
+                billed_input_tokens: 10,
+                ..Default::default()
+            },
             "gpt-4o",
             &Rates::builtin(),
             SourceLabel::ProviderReported,
@@ -512,12 +536,22 @@ mod tests {
     #[test]
     fn anthropic_write_split_lands_in_the_record() {
         use crate::adapters::anthropic::AnthropicAdapter;
-        let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 2000 };
+        let plan = RequestPlan {
+            session_id: 1,
+            turn: 1,
+            resent_history_tokens: 2000,
+        };
         let mut o = StreamObserver::new();
         o.on_chunk(
             b"data: {\"usage\":{\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":300,\"input_tokens\":2100}}\n\n",
         );
-        let r = o.finalize(&plan, &AnthropicAdapter, "claude-3-5-sonnet", &Rates::builtin(), true);
+        let r = o.finalize(
+            &plan,
+            &AnthropicAdapter,
+            "claude-3-5-sonnet",
+            &Rates::builtin(),
+            true,
+        );
         assert_eq!(r.cached_tokens, 900);
         assert_eq!(r.cache_written_tokens, 300, "creation split recorded");
         assert!(r.cost_saved_usd.is_some(), "anthropic rates known");

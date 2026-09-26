@@ -102,7 +102,11 @@ impl SessionStore {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.last_active = tick;
             }
-            return Resolution { session_id: id, continued: true, broke_prefix: false };
+            return Resolution {
+                session_id: id,
+                continued: true,
+                broke_prefix: false,
+            };
         }
 
         // 2. Break: shares a non-empty prefix but diverges.
@@ -129,7 +133,11 @@ impl SessionStore {
                 session_len,
                 incoming_len: prefix_hashes.len(),
             });
-            return Resolution { session_id: id, continued: false, broke_prefix: true };
+            return Resolution {
+                session_id: id,
+                continued: false,
+                broke_prefix: true,
+            };
         }
 
         // 3. New session.
@@ -144,7 +152,11 @@ impl SessionStore {
                 last_active: tick,
             },
         );
-        Resolution { session_id: id, continued: false, broke_prefix: false }
+        Resolution {
+            session_id: id,
+            continued: false,
+            broke_prefix: false,
+        }
     }
 
     /// Append a finalized record. The lock guard is released before returning.
@@ -222,7 +234,7 @@ mod tests {
         // Seed a real fork: start [1,2,3], then force a second session by making
         // the second request share nothing with the first, then align them.
         let s1 = store.resolve(&[1, 2, 3]).session_id; // session 1
-        // Touch session 1 last; now an incoming that ties must pick session 1.
+                                                       // Touch session 1 last; now an incoming that ties must pick session 1.
         store.append(Record {
             session_id: s1,
             turn: 0,

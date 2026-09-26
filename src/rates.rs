@@ -135,7 +135,13 @@ impl Rates {
     /// cached cost. `history_tokens` is the binding denominator; `cached_tokens`
     /// the portion served from cache; `written_tokens` the portion written to
     /// cache this turn (Anthropic; 0 elsewhere).
-    pub fn cost_saved(&self, model: &str, cached_tokens: u64, history_tokens: u64, written_tokens: u64) -> Option<f64> {
+    pub fn cost_saved(
+        &self,
+        model: &str,
+        cached_tokens: u64,
+        history_tokens: u64,
+        written_tokens: u64,
+    ) -> Option<f64> {
         let rate = self.lookup(model)?;
         let full = rate.input_cost(history_tokens);
         let actual_cached = rate.cached_cost(cached_tokens.min(history_tokens));
@@ -160,7 +166,10 @@ mod tests {
     #[test]
     fn longest_prefix_wins() {
         let r = Rates::builtin();
-        assert_eq!(r.lookup("gpt-4o-mini-2024-07-18").unwrap().input_per_mtok, 0.15);
+        assert_eq!(
+            r.lookup("gpt-4o-mini-2024-07-18").unwrap().input_per_mtok,
+            0.15
+        );
         assert_eq!(r.lookup("gpt-4o-2024-08-06").unwrap().input_per_mtok, 2.50);
         assert!(r.lookup("unknown-model").is_none());
     }

@@ -63,7 +63,11 @@ async fn concurrent_appends_lose_nothing() {
     let mut total = 0;
     for &id in &ids {
         let s = guard.session(id).unwrap();
-        assert_eq!(s.records.len(), PER_TASK as usize, "session {id} lost appends");
+        assert_eq!(
+            s.records.len(),
+            PER_TASK as usize,
+            "session {id} lost appends"
+        );
         total += s.records.len();
     }
     assert_eq!(total, TASKS as usize * PER_TASK as usize);

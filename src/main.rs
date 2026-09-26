@@ -12,7 +12,11 @@ use cachemax::export;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cachemax", version, about = "Measure prompt-cache reuse in front of an LLM")]
+#[command(
+    name = "cachemax",
+    version,
+    about = "Measure prompt-cache reuse in front of an LLM"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -67,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .upstream_url
                 .as_deref()
                 .unwrap_or("(unset — provide --upstream-url)");
-            Err(format!("cachemax --check: upstream {url} not reachable (not implemented yet)").into())
+            Err(
+                format!("cachemax --check: upstream {url} not reachable (not implemented yet)")
+                    .into(),
+            )
         }
         Command::Export { session } => {
             let path = export::default_path(session);

@@ -42,7 +42,10 @@ impl PromCounters {
             };
             // `rest` is the value (optionally preceded by {labels}); take the
             // last whitespace-separated token as the number.
-            let Some(value) = rest.split_whitespace().last().and_then(|v| v.parse::<f64>().ok())
+            let Some(value) = rest
+                .split_whitespace()
+                .last()
+                .and_then(|v| v.parse::<f64>().ok())
             else {
                 continue;
             };
@@ -144,24 +147,37 @@ vllm:num_requests_running{model_name="llama",engine="0"} 3.0
     #[test]
     fn delta_between_samples_is_one_requests_contribution() {
         let before = PromCounters::parse(SAMPLE);
-        let after = PromCounters::parse(
-            &SAMPLE.replace("1000.0", "1250.0").replace("640.0", "940.0"),
-        );
+        let after =
+            PromCounters::parse(&SAMPLE.replace("1000.0", "1250.0").replace("640.0", "940.0"));
         assert_eq!(PromCounters::delta_hits(before, after), 300);
         assert_eq!(PromCounters::delta_queries(before, after), 250);
     }
 
     #[test]
     fn delta_falls_back_to_prompt_cached_when_hits_flat() {
-        let before = PromCounters { queries: 0, hits: 100, prompt_cached: 100 };
-        let after = PromCounters { queries: 0, hits: 100, prompt_cached: 350 };
+        let before = PromCounters {
+            queries: 0,
+            hits: 100,
+            prompt_cached: 100,
+        };
+        let after = PromCounters {
+            queries: 0,
+            hits: 100,
+            prompt_cached: 350,
+        };
         assert_eq!(PromCounters::delta_hits(before, after), 250);
     }
 
     #[test]
     fn counter_reset_saturates_rather_than_underflows() {
-        let before = PromCounters { hits: 500, ..Default::default() };
-        let after = PromCounters { hits: 10, ..Default::default() };
+        let before = PromCounters {
+            hits: 500,
+            ..Default::default()
+        };
+        let after = PromCounters {
+            hits: 10,
+            ..Default::default()
+        };
         assert_eq!(PromCounters::delta_hits(before, after), 0);
     }
 

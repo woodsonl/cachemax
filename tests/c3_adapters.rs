@@ -16,7 +16,8 @@ use cachemax::record::SourceLabel;
 
 #[test]
 fn openai_observe_carries_provider_numbers() {
-    let body = br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
+    let body =
+        br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
     let (cached, written, source) = observe(&OpenAiAdapter, body);
     assert_eq!((cached, written), (1455, 0));
     assert_eq!(source, SourceLabel::ProviderReported);
@@ -40,8 +41,10 @@ fn llamacpp_observe_is_engine_measured_ground_truth() {
 
 #[test]
 fn vllm_delta_is_engine_measured() {
-    let before = PromCounters::parse("vllm:prefix_cache_hits 1000.0\nvllm:prefix_cache_queries 1500.0\n");
-    let after = PromCounters::parse("vllm:prefix_cache_hits 1455.0\nvllm:prefix_cache_queries 2000.0\n");
+    let before =
+        PromCounters::parse("vllm:prefix_cache_hits 1000.0\nvllm:prefix_cache_queries 1500.0\n");
+    let after =
+        PromCounters::parse("vllm:prefix_cache_hits 1455.0\nvllm:prefix_cache_queries 2000.0\n");
     let delta = PromCounters::delta_hits(before, after);
     let body = format!(r#"{{"cached_tokens":{delta}}}"#);
     let (cached, _written, source) = observe(&VllmAdapter, body.as_bytes());
@@ -58,8 +61,13 @@ fn mlxlm_observe_is_no_cache_truth() {
 
 #[test]
 fn observed_figure_survives_into_the_record() {
-    let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 2000 };
-    let body = br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
+    let plan = RequestPlan {
+        session_id: 1,
+        turn: 1,
+        resent_history_tokens: 2000,
+    };
+    let body =
+        br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
     let (cached, written, source) = observe(&OpenAiAdapter, body);
     let obs = Observation {
         ttft_ms: Some(120.0),
