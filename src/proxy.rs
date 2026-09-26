@@ -230,8 +230,11 @@ pub struct StreamObserver {
     ttft_ms: Option<f64>,
     saw_first_byte: bool,
     tail: Vec<u8>,
-    /// Cap the retained copy; usage always arrives in the terminal event, so
-    /// retaining the tail is sufficient and bounded (spec: no unbounded buffer).
+    /// The most informative usage-bearing event seen so far, retained across
+    /// tail eviction. Usage can arrive early (Anthropic `message_start`) while
+    /// large content follows, so it must not be lost to the tail cap.
+    usage_doc: Option<Vec<u8>>,
+    /// Cap the retained copy; the tail is a fallback for content-free streams.
     cap: usize,
 }
 
@@ -242,6 +245,7 @@ impl StreamObserver {
             ttft_ms: None,
             saw_first_byte: false,
             tail: Vec::new(),
+            usage_doc: None,
             cap: 64 * 1024,
         }
     }
@@ -258,6 +262,11 @@ impl StreamObserver {
             let drop = self.tail.len() - self.cap;
             self.tail.drain(..drop);
         }
+        // Capture any usage-bearing event now, before it can be evicted. Parse
+        // the accumulated tail so events split across chunks are seen whole.
+        if has_usage_or_cache_in(&self.tail) {
+            self.usage_doc = Some(last_json_event(&self.tail));
+        }
     }
 
     /// Finalize the observation into a record. `complete` is false when the
@@ -270,9 +279,11 @@ impl StreamObserver {
         rates: &Rates,
         complete: bool,
     ) -> Record {
-        // Reduce the tail once; both the cache signal and the billed count read
-        // the same usage-bearing event.
-        let doc = last_json_event(&self.tail);
+        // Prefer the retained usage event; fall back to the (bounded) tail.
+        let doc = self
+            .usage_doc
+            .clone()
+            .unwrap_or_else(|| last_json_event(&self.tail));
         let (cached_tokens, cache_written_tokens, source) = observe_doc(adapter, &doc);
         let billed = billed_from_doc(&doc).unwrap_or(plan.resent_history_tokens);
         let obs = Observation {
@@ -282,6 +293,64 @@ impl StreamObserver {
             billed_input_tokens: billed,
         };
         build_record(plan, obs, model, rates, source, complete)
+    }
+}
+
+/// Whether the accumulated buffer contains any usage- or cache-bearing `data:`
+/// event. Cheap substring check; the exact event is chosen by `last_json_event`.
+fn has_usage_or_cache_in(buf: &[u8]) -> bool {
+    let needle = |n: &[u8]| buf.windows(n.len()).any(|w| w == n);
+    needle(b"\"usage\"")
+        || needle(b"cache_read_input_tokens")
+        || needle(b"cache_creation_input_tokens")
+        || needle(b"cached_tokens")
+}
+
+/// Records exactly one turn, at whichever end comes first: the upstream stream
+/// finishing (`finish`) or the response body being dropped when the client
+/// disconnects mid-stream (`Drop`). A finalize written only after the read loop
+/// would never run on a dropped stream, losing the turn. `done` makes it
+/// idempotent so the explicit finish and the drop never double-append.
+struct Finalizer<A: Adapter> {
+    observer: StreamObserver,
+    plan: RequestPlan,
+    adapter: Arc<A>,
+    model: String,
+    rates: Rates,
+    sessions: Arc<SharedSessions>,
+    /// False once an upstream read error was seen.
+    complete: bool,
+    done: bool,
+}
+
+impl<A: Adapter> Finalizer<A> {
+    /// Record the turn once. `complete` is true only when the upstream stream
+    /// finished cleanly and answered 2xx.
+    fn finish(&mut self, complete: bool) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let record = self.observer.finalize(
+            &self.plan,
+            self.adapter.as_ref(),
+            &self.model,
+            &self.rates,
+            complete,
+        );
+        crate::export::log_finalize(&record);
+        self.sessions.lock().append(record);
+    }
+}
+
+impl<A: Adapter> Drop for Finalizer<A> {
+    fn drop(&mut self) {
+        // The generator was dropped mid-suspension: either the read loop
+        // finished and called `finish` (then `done` short-circuits) or the
+        // client disconnected before the stream ended. A disconnect is not a
+        // completed turn — record it Incomplete so a partial stream never
+        // counts as a measured turn.
+        self.finish(false);
     }
 }
 
@@ -569,24 +638,35 @@ pub async fn handle_chat<A: Adapter + 'static>(
     let sessions = state.sessions.clone();
     let rates = state.rates.clone();
     let stream = async_stream::stream! {
-        let mut observer = StreamObserver::new();
-        let mut complete = true;
+        // The finalizer records exactly once, whichever comes first: the end of
+        // the upstream stream (complete = upstream finished and was 2xx) or the
+        // generator being dropped when the client disconnects mid-stream. A
+        // plain tail after the loop would never run on disconnect, losing the
+        // turn entirely; the guard's Drop finalizes it as Incomplete instead.
+        let mut fin = Finalizer {
+            observer: StreamObserver::new(),
+            plan,
+            adapter,
+            model,
+            rates,
+            sessions,
+            complete: true,
+            done: false,
+        };
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    observer.on_chunk(&bytes);
+                    fin.observer.on_chunk(&bytes);
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(_) => {
-                    complete = false;
+                    fin.complete = false;
                     break;
                 }
             }
         }
-        let record =
-            observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete && upstream_ok);
-        crate::export::log_finalize(&record);
-        sessions.lock().append(record);
+        let complete = fin.complete && upstream_ok;
+        fin.finish(complete);
     };
 
     Response::builder()
