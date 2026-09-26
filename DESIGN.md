@@ -1,6 +1,6 @@
 ---
 # gstack: design-md-format=spec
-name: cache-maxing
+name: cachemax
 description: A warm bone-and-graphite instrument face; amber reserved for measured cache reuse; numbers set in ink.
 colors:
   background: "#e9e4db"
@@ -69,7 +69,7 @@ components:
     textColor: "{colors.text}"
 ---
 
-# cache-maxing
+# cachemax
 
 ## Overview
 

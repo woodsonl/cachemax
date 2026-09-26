@@ -1,4 +1,4 @@
-# cache-maxing
+# cachemax
 
 An OpenAI-compatible proxy that sits in front of an LLM endpoint, measures how
 much of each request's re-sent history was served from the provider's prompt
@@ -14,19 +14,29 @@ It measures first. It does not repair yet.
 
 Both are first-class targets.
 
-See [docs/designs/cache-maxing-measurement-core.md](docs/designs/cache-maxing-measurement-core.md)
+See [docs/designs/cachemax-measurement-core.md](docs/designs/cachemax-measurement-core.md)
 for the design.
 
 ## Status
 
-Spec complete, zero implementation. The core will be Rust (axum/tokio); the repo
-scaffolding below is Python, retained for the mlx-lm precision sidecar and dev
-tooling.
+Spec complete, zero implementation. The core is Rust (axum/tokio), built at the
+repo root. The Python package under `sidecar/` is the mlx-lm precision path
+(subprocess, off the hot path) plus dev tooling; it is not required to run
+cachemax.
+
+## Layout
+
+- repo root — the Rust core (`Cargo.toml`, `src/*.rs`), the dashboard, the spec link above
+- `sidecar/` — the Python mlx-lm sidecar (`cache_max/`), its tests, and its uv project
 
 ## Development
 
 ```bash
-uv sync
-uv run pytest
-uv run cache-maxing  # placeholder entry point
+# Rust core (not yet scaffolded)
+cargo test
+
+# Python sidecar
+uv sync --project sidecar
+uv run --project sidecar pytest
+uv run --project sidecar cachemax-sidecar  # placeholder entry point
 ```

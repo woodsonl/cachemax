@@ -1,4 +1,4 @@
-# cache-maxing — agent guidance
+# cachemax — agent guidance
 
 ## Design System
 Always read DESIGN.md before making any visual or UI decisions.

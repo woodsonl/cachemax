@@ -1,6 +1,6 @@
-# cache-maxing: measurement core spec
+# cachemax: measurement core spec
 
-Repo: woodsonl/cache-maxing (github.com/woodsonl/cache-maxing)
+Repo: woodsonl/cachemax (github.com/woodsonl/cachemax)
 Branch: main
 Status: SPEC, zero implementation. Every number here is a design decision, not a measurement.
 Supersedes: docs/designs/cache-maxing-proxy.md
@@ -78,7 +78,7 @@ Cloud figures carry the compact `provider_reported` label.
 ## Architecture
 
 ```
-client (app / agent) ──► cache-maxing proxy ──► LLM endpoint
+client (app / agent) ──► cachemax proxy ──► LLM endpoint
    OpenAI dialect          │   (cloud: api.openai.com, api.anthropic.com)
                            │   (local: llama.cpp, vLLM, mlx-lm)
                            │
@@ -111,11 +111,11 @@ Edge cases: empty messages → `—` (zero denominator, not 0); oversized prompt
 
 ## Stack
 
-- **Core: Rust** (axum/tokio, hyper unbuffered SSE, reqwest, HF `tokenizers` crate when a local tokenizer is needed). Single binary, cross-platform (macOS Intel/AS, Linux x86_64/aarch64, Windows MSVC).
-- **Local mlx-lm precision path: Python sidecar** (subprocess, off the hot path). Never imported by the core.
-- **No tokenizer and no Python are required to run and show a curve.** Tokenizers and the sidecar are opt-in precision layers.
-- Repo scaffolding (uv + FastAPI skeleton) remains only for the Python sidecar and dev tooling.
-- Distribution: `cargo install cache-maxing`, release binaries, `cargo binstall`. The dashboard is a single HTML file embedded in the binary.
+- **Core: Rust** (axum/tokio, hyper unbuffered SSE, reqwest, HF `tokenizers` crate when a local tokenizer is needed). Live at the repo root (`Cargo.toml`, `src/*.rs`). Single binary, cross-platform (macOS Intel/AS, Linux x86_64/aarch64, Windows MSVC).
+- **Local mlx-lm precision path: Python sidecar** (subprocess, off the hot path). Lives under `sidecar/`. Never imported by the core.
+- **No tokenizer and no Python are required to run and show a curve.** Only the tape's prefix hashing always runs (it needs the bundled tokenizer); token counting on the cloud path stays provider-reported, never locally re-derived. Tokenizers and the sidecar are opt-in precision layers.
+- Repo scaffolding (uv project under `sidecar/`) remains only for the Python sidecar and dev tooling.
+- Distribution: `cargo install cachemax`, release binaries, `cargo binstall`. The dashboard is a single HTML file embedded in the binary.
 - Tests: `cargo test` for the core (unit + integration + latency system test), engineless via trait mocks; pytest for the sidecar's contract tests. CI: macOS + Linux + Windows.
 
 ## Dashboard interaction states
@@ -197,7 +197,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 
 ## What already exists
 
-- Repo scaffolding: uv project, FastAPI skeleton, placeholder CLI, 1 passing test. Repurposed for the sidecar and dev tooling; the core is new Rust.
+- Repo scaffolding: uv project under `sidecar/`, FastAPI skeleton, placeholder CLI, 1 passing test. Repurposed for the sidecar and dev tooling; the core is new Rust at the repo root.
 - llamacpp-stats-dashboard (MIT): patterns borrowed (read1() streaming, caps-field display, pre-warm TTFT testing).
 - LMCache: per-request hit-rate attribute pattern, token-level counters, blake3 hashing option.
 - Rust ecosystem: axum/hyper SSE, reqwest, HF `tokenizers`.
@@ -206,7 +206,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 
 - vLLM: poll `/metrics` per request or scrape continuously? Attribution granularity differs.
 - Tape from the proxy's own token stream (portable) or engine ground truth where available (accurate)? Default: engine truth when available, labeled otherwise.
-- Binary name: `cache-maxing` or shorter `cache-max` CLI. Decide before first release.
+- Binary name: `cachemax`. Decided (was `cache-maxing` or `cache-max`).
 
 ## Implementation Tasks (design review)
 
