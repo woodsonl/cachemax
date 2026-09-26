@@ -399,6 +399,19 @@ const FORWARD_HEADERS: &[&str] = &[
     "x-title",
 ];
 
+/// The chat-completions URL for `base`. `base` is the API base and may already
+/// end in `/v1` (the documented form: `https://api.openai.com/v1`, OpenRouter's
+/// `.../api/v1`) or omit it (a bare host). Append only the missing part so
+/// neither form yields `/v1/v1/chat/completions`.
+fn upstream_chat_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
 /// The request handler: plan, forward, stream through, observe, finalize.
 pub async fn handle_chat<A: Adapter + 'static>(
     State(state): State<Arc<AppState<A>>>,
@@ -420,10 +433,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
 
     // Forward first. The request body is passed through untouched; auth and
     // provider-identification headers are forwarded so cloud keys keep working.
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.upstream_url.trim_end_matches('/')
-    );
+    let url = upstream_chat_url(&state.upstream_url);
     let mut req = state
         .client
         .post(&url)
@@ -545,6 +555,29 @@ mod tests {
             role: role.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn upstream_url_never_doubles_the_version_segment() {
+        // The documented form already includes /v1; appending the full path
+        // would yield /v1/v1/chat/completions and 404 against a real server.
+        assert_eq!(
+            upstream_chat_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_chat_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        // A bare host still gets the version segment.
+        assert_eq!(
+            upstream_chat_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_chat_url("http://127.0.0.1:8080/"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
     }
 
     #[test]
