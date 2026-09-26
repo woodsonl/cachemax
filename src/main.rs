@@ -231,7 +231,10 @@ fn load_rates(path: Option<&str>) -> Result<Rates, Box<dyn std::error::Error>> {
 /// response (even 401) proves the host is reachable; a transport error fails.
 async fn check_upstream(upstream: &str) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/models", upstream.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    // Bounded: a check that hangs is a failure, not a wait.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
     match client.get(&url).send().await {
         Ok(resp) => {
             println!(
@@ -247,7 +250,12 @@ async fn check_upstream(upstream: &str) -> Result<(), Box<dyn std::error::Error>
 
 async fn fetch_export(base: &str) -> Result<String, Box<dyn std::error::Error>> {
     let url = format!("{base}/api/export");
-    let resp = reqwest::get(&url)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .send()
         .await
         .map_err(|e| Fault::no_proxy(base, e.to_string()))?;
     if !resp.status().is_success() {
@@ -264,6 +272,10 @@ async fn fetch_export(base: &str) -> Result<String, Box<dyn std::error::Error>> 
 
 async fn fetch_current_session_id(base: &str) -> Option<u64> {
     let url = format!("{base}/api/state");
-    let v: serde_json::Value = reqwest::get(&url).await.ok()?.json().await.ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
     v.get("session_id").and_then(|n| n.as_u64())
 }

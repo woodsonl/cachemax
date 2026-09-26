@@ -286,3 +286,61 @@ async fn authorization_header_is_forwarded_to_upstream() {
         "the client's bearer token must reach the upstream verbatim"
     );
 }
+
+/// A non-2xx upstream answer is not a measured turn. It must be recorded
+/// incomplete (excluded from the aggregate), never as a fabricated miss with a
+/// billed count equal to the whole history.
+#[tokio::test]
+async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(401)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":{"message":"invalid key"}}"#))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let state = Arc::new(proxy::AppState {
+        adapter: Arc::new(OpenAiAdapter),
+        tokenizer: Tokenizer::default_encoder().unwrap(),
+        sessions: Arc::new(SharedSessions::new()),
+        rates: cachemax::rates::Rates::builtin(),
+        upstream_url: format!("http://{addr}"),
+        client: reqwest::Client::new(),
+    });
+    let sessions = state.sessions.clone();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, proxy::router(state)).await.unwrap();
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{paddr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(request_body())
+        .send()
+        .await
+        .unwrap();
+    let _ = resp.bytes().await.unwrap(); // drain so the observer finalizes
+
+    // Give the stream task a beat to append.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let guard = sessions.0.lock().unwrap();
+    let s = guard.most_recent().expect("a session was created");
+    let r = s.records.last().expect("the failed request was recorded");
+    assert_eq!(
+        r.status,
+        cachemax::record::Status::Incomplete,
+        "a 401 is not a complete measured turn"
+    );
+}

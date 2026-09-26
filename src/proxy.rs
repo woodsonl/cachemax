@@ -292,7 +292,13 @@ pub async fn serve<A: Adapter + 'static>(
         sessions: Arc::new(SharedSessions::new()),
         rates,
         upstream_url,
-        client: reqwest::Client::new(),
+        // A connect timeout fails fast on an unreachable upstream without
+        // capping a legitimate long-lived SSE stream. No total request timeout:
+        // streams are open-ended by design.
+        client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client"),
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -435,6 +441,18 @@ pub async fn handle_chat<A: Adapter + 'static>(
         }
     };
     let status = upstream.status();
+    // A non-2xx upstream answer is not a measured turn: recording it would
+    // fabricate a billed count for a rejected/failed request. Mark it
+    // incomplete so it is excluded from the aggregate.
+    let upstream_ok = status.is_success();
+    // Forward the upstream's content type (SSE or JSON); fall back to SSE only
+    // when the upstream did not name one.
+    let content_type = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_string();
     let mut upstream_stream = upstream.bytes_stream();
 
     // Unbuffered passthrough: each chunk is forwarded as it arrives; a clone is
@@ -457,14 +475,15 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 }
             }
         }
-        let record = observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete);
+        let record =
+            observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete && upstream_ok);
         crate::export::log_finalize(&record);
         sessions.0.lock().unwrap().append(record);
     };
 
     Response::builder()
         .status(status)
-        .header("content-type", "text/event-stream")
+        .header("content-type", content_type)
         .header("cache-control", "no-cache")
         .body(Body::from_stream(stream))
         .unwrap()
