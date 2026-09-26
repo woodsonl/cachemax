@@ -184,3 +184,52 @@ async fn incomplete_upstream_stream_is_recorded_incomplete() {
     }
     assert!(n >= 1, "partial content still flowed to the client");
 }
+
+/// Spec rule: local engine counts are clamped to the history span (ratio ≤ 100%);
+/// cloud provider-reported counts pass through unchanged.
+#[test]
+fn engine_measured_counts_clamp_to_history_span() {
+    use cachemax::proxy::{build_record, Observation, RequestPlan};
+    use cachemax::rates::Rates;
+    use cachemax::record::SourceLabel;
+
+    let plan = RequestPlan {
+        session_id: 1,
+        turn: 1,
+        resent_history_tokens: 100,
+    };
+    let rates = Rates::default();
+
+    let local = build_record(
+        &plan,
+        Observation {
+            ttft_ms: None,
+            cached_tokens: 150,
+            cache_written_tokens: 0,
+            billed_input_tokens: 300,
+        },
+        "unknown-model",
+        &rates,
+        SourceLabel::EngineMeasured,
+        true,
+    );
+    assert_eq!(
+        local.cached_tokens, 100,
+        "local clamp: never exceeds history"
+    );
+
+    let cloud = build_record(
+        &plan,
+        Observation {
+            ttft_ms: None,
+            cached_tokens: 150,
+            cache_written_tokens: 0,
+            billed_input_tokens: 300,
+        },
+        "unknown-model",
+        &rates,
+        SourceLabel::ProviderReported,
+        true,
+    );
+    assert_eq!(cloud.cached_tokens, 150, "cloud counts pass through as-is");
+}

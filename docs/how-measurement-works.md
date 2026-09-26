@@ -74,6 +74,12 @@ The label is not a disclaimer about what the number *isn't* — it is a statemen
 of what it *is*: the provider's reported count. Local engines are labeled
 `engine_measured` (llama.cpp, vLLM) or `no_cache_truth` (mlx-lm).
 
+A local engine reports cached tokens in its own token space, which can drift
+slightly from cachemax's tokenizer. To keep the ratio honest, an
+`engine_measured` count is clamped to the history span, so a local hit rate
+never exceeds 100%. A `provider_reported` count is the provider's own figure and
+is shown as-is.
+
 ## The Anthropic write/read split
 
 Anthropic does not expose a single hit count. It splits cache activity in two:

@@ -95,12 +95,20 @@ pub fn build_record(
     source: SourceLabel,
     complete: bool,
 ) -> Record {
+    // Local engines report cached tokens in the engine's own token space, which
+    // can drift from our tokenizer; clamp to the history span so the ratio never
+    // exceeds 100%. Cloud counts are provider-reported and shown as-is.
+    let cached = match source {
+        SourceLabel::EngineMeasured => obs.cached_tokens.min(plan.resent_history_tokens),
+        SourceLabel::ProviderReported => obs.cached_tokens,
+        SourceLabel::NoCacheTruth => 0,
+    };
     let cost_usd = rates
         .lookup(model)
         .map(|r| r.input_cost(obs.billed_input_tokens));
     let cost_saved_usd = rates.cost_saved(
         model,
-        obs.cached_tokens,
+        cached,
         plan.resent_history_tokens,
         obs.cache_written_tokens,
     );
@@ -114,7 +122,7 @@ pub fn build_record(
         },
         source,
         ttft_ms: obs.ttft_ms,
-        cached_tokens: obs.cached_tokens,
+        cached_tokens: cached,
         cache_written_tokens: obs.cache_written_tokens,
         resent_history_tokens: plan.resent_history_tokens,
         billed_input_tokens: obs.billed_input_tokens,
