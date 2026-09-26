@@ -344,20 +344,7 @@ impl<A: Adapter> Finalizer<A> {
     /// Record the turn once. `complete` is true only when the upstream stream
     /// finished cleanly and answered 2xx.
     fn finish(&mut self, complete: bool) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        let record = self.observer.finalize(
-            &self.plan,
-            self.adapter.as_ref(),
-            &self.model,
-            &self.rates,
-            complete,
-            None,
-        );
-        crate::export::log_finalize(&record);
-        self.sessions.lock().append(record);
+        self.record(complete, None);
     }
 
     /// Record a vLLM turn, using the `/metrics` counter delta as the cache
@@ -367,15 +354,19 @@ impl<A: Adapter> Finalizer<A> {
     /// where the engine has finished updating its counters. A cut stream is an
     /// Incomplete turn and takes no delta.
     async fn finish_with_metrics(&mut self, complete: bool) {
-        if self.done {
-            return;
-        }
         let delta = match &self.metrics {
             Some((client, url, before)) if complete => sample_prom(client, url)
                 .await
                 .map(|after| crate::adapters::vllm::PromCounters::delta_hits(*before, after)),
             _ => None,
         };
+        self.record(complete, delta);
+    }
+
+    fn record(&mut self, complete: bool, engine_cached: Option<u64>) {
+        if self.done {
+            return;
+        }
         self.done = true;
         let record = self.observer.finalize(
             &self.plan,
@@ -383,7 +374,7 @@ impl<A: Adapter> Finalizer<A> {
             &self.model,
             &self.rates,
             complete,
-            delta,
+            engine_cached,
         );
         crate::export::log_finalize(&record);
         self.sessions.lock().append(record);
@@ -658,15 +649,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // measurement is the delta of its `/metrics` counters across the request.
     // Snapshot before we forward, for backends that have the endpoint.
     let metrics = if state.adapter.name() == "vllm" {
-        sample_prom(&state.client, &upstream_metrics_url(&state.upstream_url))
+        let url = upstream_metrics_url(&state.upstream_url);
+        sample_prom(&state.client, &url)
             .await
-            .map(|before| {
-                (
-                    state.client.clone(),
-                    upstream_metrics_url(&state.upstream_url),
-                    before,
-                )
-            })
+            .map(|before| (state.client.clone(), url, before))
     } else {
         None
     };
