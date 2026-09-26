@@ -119,8 +119,9 @@ async fn ttft_is_not_total_time() {
         Bytes::from(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{big}\"}}}}]}}\n\n")),
         Bytes::from_static(b"data: [DONE]\n\n"),
     ];
-    // 40ms between chunks: a buffering proxy would take 80ms+ before any byte.
-    let upstream = fake_upstream(events, Duration::from_millis(40)).await;
+    // 100ms between chunks: a buffering proxy would spend the whole stream
+    // (3 gaps) before emitting a single byte.
+    let upstream = fake_upstream(events, Duration::from_millis(100)).await;
     let proxy_url = boot_proxy(upstream).await;
 
     let start = std::time::Instant::now();
@@ -134,12 +135,18 @@ async fn ttft_is_not_total_time() {
     let mut stream = resp.bytes_stream();
     let first = stream.next().await.unwrap().unwrap();
     let ttft = start.elapsed();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let total = start.elapsed();
 
-    // First byte arrives after ~40ms (one upstream gap), well under the 80ms a
-    // full-response buffer would cost.
+    // Relative, not wall-clock: a streaming proxy emits the first chunk roughly
+    // one gap in while the total spans three gaps, so TTFT is a small fraction
+    // of the total. A buffering proxy makes TTFT ~= total. This survives a slow
+    // CI runner where an absolute millisecond ceiling would flake.
     assert!(
-        ttft < Duration::from_millis(70),
-        "TTFT {ttft:?} suggests buffering"
+        ttft * 2 < total,
+        "TTFT {ttft:?} is not meaningfully below total {total:?}; suggests buffering"
     );
     assert!(!first.is_empty());
 }
