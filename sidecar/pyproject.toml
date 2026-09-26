@@ -16,6 +16,13 @@ dev = [
     "pytest-asyncio>=1.4.0",
 ]
 
+[project.optional-dependencies]
+# Real mlx-lm inference (macOS / Apple Silicon only). Install with:
+#   uv sync --project sidecar --extra mlx
+mlx = [
+    "mlx-lm>=0.31.0; platform_system == 'Darwin'",
+]
+
 [project.scripts]
 cachemax-sidecar = "cache_max.main:main"
 
