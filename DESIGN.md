@@ -10,6 +10,7 @@ colors:
   text-muted: "#5c5749"
   text-faint: "#6a6557"
   accent: "#c47a12"
+  accent-text: "#8f5300"
   accent-resent: "#8a5a3c"
   line: "#cbc5b8"
   line-strong: "#8f8a7d"
@@ -92,10 +93,10 @@ components:
 Dark-mode values (parallel to the front-matter tokens):
 - background `#16181a`, surface `#1e2124`, surface-raised `#24282b`
 - text `#ece8de`, text-muted `#9a968b`, text-faint `#8a8578`
-- accent `#e0a23c`, accent-resent `#cf8f5f`
+- accent `#e0a23c`, accent-text `#e0a23c` (dark amber already clears 4.5:1 for text, so the two collapse), accent-resent `#cf8f5f`
 - line `#33373a`, line-strong `#4a4f53`
 
-Amber (`accent`) is the one signal color, in two roles only: it marks verified cache-served data (the hit rate and the tape's hit cells), and it marks the instrument's own live/active states (the status-strip live dot, focus-visible outlines). It is never a button fill, never a logo, never the hero number. Cost and money are facts, so they stay in `text` ink. `accent-resent` marks resent prefix. `text-faint` marks cold, absent, and past values. Neutrals derive from the warm bone hue, so dark mode dims and slightly desaturates rather than inverting.
+Amber (`accent`) is the one signal color, in two roles only: it marks verified cache-served data (the hit rate and the tape's hit cells), and it marks the instrument's own live/active states (the status-strip live dot, focus-visible outlines). `accent` `#c47a12` is reserved for fills and glyphs (large marks, ≥3:1); body-size amber text uses `accent-text` `#8f5300` (4.87:1 on light) so the hit-rate number clears the 4.5:1 bar. It is never a button fill, never a logo, never the hero number. Cost and money are facts, so they stay in `text` ink. `accent-resent` marks resent prefix. `text-faint` marks cold, absent, and past values. Neutrals derive from the warm bone hue, so dark mode dims and slightly desaturates rather than inverting.
 
 ## Typography
 
@@ -130,7 +131,7 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 - **hero-value:** mono 700, tabular, `text` color for facts; `text-faint` for the past value in a transition. Never in `accent` or any signal color.
 - **provenance-tag:** 1px `line-strong` border, mono 11px `text-muted`, uppercase. Used for `provider_reported`, `engine_measured`, and `no_cache_truth`.
 - **data-table-row:** bottom border `line`; cold rows in `text-faint`; the cumulative row gets a `line-strong` top border and weight 700. Hover raises the row to `surface`. Focus-visible adds an `accent` outline.
-- **tape-cell:** monospace glyph, color by state (hit `accent`, resent `accent-resent`, cold `text-faint`, miss `text`, break `text-muted`, incomplete `text-faint`), always distinguishable with color removed by glyph shape (incomplete is marked by its own glyph, never conflated with cold).
+- **tape-cell:** monospace glyph, color by state (hit `accent` `█`, resent `accent-resent` `▓`, cold `text-faint` `░`, miss `text` `▚`, break `text-muted` `┊`, incomplete `text-faint` `?`), always distinguishable with color removed by glyph shape (incomplete is marked by its own glyph, never conflated with cold).
 - **control** (tape-mode toggle, export): body face 14px, `text` color, no fill; 1px `line-strong` underline or border only. Hover darkens the label to `text`. Focus-visible draws an `accent` outline at 2px offset. Minimum 44x44px target even when the label is smaller. Never amber-filled.
 
 ## Do's and Don'ts

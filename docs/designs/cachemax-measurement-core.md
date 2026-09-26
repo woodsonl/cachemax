@@ -33,10 +33,10 @@ The dashboard shows both; the hero surface weights by backend.
 
 ## Binding constraints
 
-- **Proxy overhead: ≤1-2 ms p50 (≈5 ms p95) added TTFT vs direct, both backends.** Measured as the proxy-vs-direct first-token delta (not absolute client-observed TTFT, which RTT dominates) with equivalent cache conditions on both arms, warm-pinned, median-of-N, p95 gate. Every microsecond counts; one budget, no cloud relaxation. Engineless CI cannot certify the real budget (no engine); it runs structural checks plus a latency harness on an injected delay that must fail the build above 5 ms p95, proving the gate detects regressions. A >5 ms p95 regression fails the build.
+- **Proxy overhead: ≤1-2 ms p50 (≈5 ms p95) added TTFT vs direct, both backends.** Measured as the proxy-vs-direct first-token delta (not absolute client-observed TTFT, which RTT dominates) with equivalent cache conditions on both arms, warm-pinned, median-of-N, p95 gate. Every microsecond counts; one budget, no cloud relaxation. The target is ≤5 ms p95; the CI fail gate sits strictly above at >6 ms p95, so measurement noise near the target does not flake the build. Engineless CI cannot certify the real budget (no engine); it runs structural checks plus a latency harness on an injected delay that must fail the build above 6 ms p95, proving the gate detects regressions.
 - **Streaming (SSE) passes through unbuffered** while the record builds; the stored record must byte-match what the client received. Any feature that would buffer, batch, or delay the client stream is rejected at design time.
 - **Secrets are pass-through only, never stored, never logged.** The client sends its provider key; the proxy forwards it and forgets it.
-- **Request bodies are recorded only with explicit opt-in.** No-opt-in model: session-scoped token-prefix hashes and per-request numeric metrics (TTFT, token counts, cached-token counts, cost) live in memory only and nothing is written to disk. The tape renders hash-level match/mismatch; forensic byte diagnosis requires opt-in. A user-invoked `export` writes metrics-only JSONL; body export requires the same body opt-in.
+- **Request bodies are recorded only with explicit opt-in.** No-opt-in model: session-scoped token-prefix hashes and per-request numeric metrics (TTFT, token counts, cached-token counts, cost) live in memory only and nothing is written to disk. The tape renders hash-level match/mismatch; forensic byte diagnosis requires opt-in. One export artifact, two triggers: `cachemax export` writes metrics-only JSONL to a path (default `./cachemax-<session>.jsonl`, `--out` to override) and the dashboard `export` control downloads the same JSONL via the browser. Body export requires the same body opt-in.
 - **Hit-rate formula (binding):** per turn t ≥ 1 (turn 0 is cold, excluded), `hit_rate = Σ cached_tokens(t) / Σ resent_history_tokens(t)`. `resent_history_tokens(t)` is the token count of the re-sent message list: system prompt plus all prior user, assistant, and tool messages, excluding turn t's new content. `cached_tokens` is the provider- or engine-reported count of prefix tokens served from cache. On local engines it is clamped to the history span (ratio ≤ 100%); on cloud it is the provider-reported figure as-is, labeled `provider_reported`. Reported per-turn and session-cumulative; acceptance compares per-turn counts individually, not just the session sum.
 - **Session definition:** a session is a tracked conversation. A request belongs to the session whose remembered token-prefix it extends; no match starts a new session; forks resolve by longest-matching-prefix (ties: most recent activity). A request whose prefix breaks against a tracked session stays in that session and is measured as a miss. It does not become turn 0 of a silent new session.
 - **Incomplete records** (dropped stream, engine/provider error mid-request) are marked `incomplete`, excluded from session-cumulative aggregation, and shown with an explicit marker.
@@ -55,7 +55,7 @@ One normalized record type, five adapters. `--backend` selects; default `openai`
 | **vLLM** (local) | `/metrics` token counters, delta-sampled per request | Record fidelity (±5% at session-aggregate; fallback to log-line parsing if noisy). |
 | **mlx-lm** (local, macOS/Apple Silicon only) | none exposed | TTFT warm/cold discrimination only. No hit-rate number. Requires the Python sidecar; unavailable on Linux/Windows. |
 
-Anthropic uses a different cache model, not a hit count: `cache_creation_input_tokens` are tokens written to cache (billed at a premium) and `cache_read_input_tokens` are served from cache (billed at a discount). The dashboard shows the write/read split and the cost, not a single percentage.
+Anthropic uses a different cache model, not a single hit count: `cache_creation_input_tokens` are tokens written to cache (billed at a premium) and `cache_read_input_tokens` are served from cache (billed at a discount). The dashboard shows the write/read split (creation vs read) alongside cost, and derives a hit-rate from `cache_read_input_tokens` over `cache_read + cache_creation`, labeled `provider_reported` like the rest of the cloud path.
 
 Cloud figures carry the compact `provider_reported` label.
 
@@ -70,7 +70,7 @@ Cloud figures carry the compact `provider_reported` label.
 - **vLLM (record fidelity):** cached-token figures agree with `/metrics` within ±5% at session-aggregate, single-client serialized run. If delta-sampling is too noisy, restate to log-line parsing; ±5% bar unchanged.
 - **mlx-lm (macOS/Apple Silicon only):** TTFT warm turns ≥2x faster than comparable-length cold turns on ≥90% of warm turns; no hit-rate number. Skipped on Linux/Windows, where the engine cannot run.
 - **OpenAI:** the proxy reports `cached_tokens` from the response usage and computes hit-rate + cost consistently; record matches provider usage exactly (it is the provider's own number). OpenRouter uses the same adapter with the provider endpoint set to its URL.
-- **Anthropic:** the proxy reports cache read/creation tokens and the write/read split; cost reflects the premium/discount; figures match the provider usage exactly.
+- **Anthropic:** the proxy reports cache read/creation tokens, the write/read split, and a derived hit-rate (`cache_read` over `cache_read + cache_creation`); cost reflects the premium/discount; figures match the provider usage exactly.
 - **Dashboard:** live curve visible during a real session, both a cloud run and a local run.
 - **Cloud cost gate:** on a replayed real trace, ≥30% reduction in billed-at-full-rate input tokens (deferred until repair; the measurement core proves the measurement, not the reduction).
 - **Repair (later):** zero tool-call correctness regressions; fallback rule exercised on every ambiguity.
@@ -125,9 +125,9 @@ What the user sees per surface, per state. Empty states name the one next action
 | Surface | Loading | Empty | Error | Success | Partial |
 |---|---|---|---|---|---|
 | Hero band | Skeleton bar + "connecting to upstream…" | "No session yet. Point your app or agent at this proxy and send a request." + the proxy URL to copy | Upstream unreachable: red status line with cause + fix (mirrors the D3 error contract); hero shows `—` | Live numbers updating per turn | `incomplete` request: hero keeps last good value, badge `⚠ 1 incomplete` |
-| Session view | Table shell, 3 placeholder rows | One ghost row using the `—` convention | Table frozen at last good row + error banner | Per-turn rows append as turns complete | Incomplete turn row shows `M` + `⚠`, excluded from cumulative |
-| Prefix tape | Empty tape with legend | Tape shows a single `·` cold cell; caption "waiting for turn 1" | Tape dims, error banner over it | Per-turn cells fill left-to-right | Break cell `✂`, incomplete cell `⚠` |
-| Status strip | "connecting…" | "idle" | "upstream error" + docs link | "● live" | "+N incomplete" |
+| Session view | Table shell, 3 placeholder rows | One ghost row using the `—` convention | Table frozen at last good row + error banner | Per-turn rows append as turns complete | Incomplete turn row shows `?` (its own glyph), excluded from cumulative |
+| Prefix tape | Empty tape with legend | Tape shows a single `·` cold cell; caption "waiting for turn 1" | Tape dims, error banner over it | Per-turn cells fill left-to-right | Break cell `┊`, incomplete cell `?` |
+| Status strip | "connecting…" | "idle" | "upstream error" + docs link | "● live" | "N incomplete" |
 | Whole dashboard | | | | | **metrics reset banner** after proxy restart (state is ephemeral by design); **session break** (not a splice) when the engine restarts mid-session |
 
 `—` (not `0`) is the unexposed-value token. Source labels (`provider_reported`, `engine_measured`, `no_cache_truth`) are labeled inline wherever the figure appears.
@@ -149,7 +149,7 @@ The local path reuses steps 1, 4, and 5 with the hero weighted to TTFT collapse 
 
 ## Latency budget method
 
-The CI test measures proxy-vs-direct first-token timing, warm-pinned, median-of-N, p95 gate. A micro-profile breaks the hot path into stages (serde, tokenize, hash, session lookup, forward), so a budget verdict names the culprit. A >5 ms p95 failure on an injected delay fails the build.
+The CI test measures proxy-vs-direct first-token timing, warm-pinned, median-of-N, p95 gate. The target is ≤5 ms p95; the fail gate is >6 ms p95 (strictly above the target, so noise does not flake the build). A micro-profile breaks the hot path into stages (serde, tokenize, hash, session lookup, forward), so a budget verdict names the culprit. A >6 ms p95 failure on an injected delay fails the build.
 
 ## Security posture
 
@@ -159,21 +159,21 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 
 ### Core
 
-- [ ] **C1 — proxy core.** axum/tokio SSE passthrough, concurrent tokenization, record builder, normalized record type. Files: `src/proxy.rs`, `src/record.rs`. Verify: byte-match fixture (stream == record, reassembled by concatenation); 50K-token prompt TTFT regression; incomplete-record unit test.
+- [ ] **C1 — proxy core.** axum/tokio SSE passthrough, concurrent tokenization, record builder, normalized record type, and the binding hit-rate formula (per-turn and cumulative, denominator = `resent_history_tokens`). Files: `src/proxy.rs`, `src/record.rs`. Verify: byte-match fixture (stream == record, reassembled by concatenation); 50K-token prompt TTFT regression; incomplete-record unit test; **hit-rate formula unit fixture**: a known multi-turn conversation with hand-computed per-turn `cached / resent_history` ratios (denominator = system + all prior messages, excluding the turn's new content), asserting every per-turn value and the cumulative sum individually.
 - [ ] **C2 — cloud adapters.** openai (`cached_tokens`; covers OpenAI and OpenRouter by setting the provider endpoint to its URL) and anthropic (read/creation split). Files: `src/adapters/openai.rs`, `src/adapters/anthropic.rs`. Verify: record matches provider usage exactly on a live run; cost math reflects published rates.
 - [ ] **C3 — local adapters.** llama.cpp (ground truth), vLLM (metrics), mlx-lm (discrimination only). Files: `src/adapters/llamacpp.rs`, `src/adapters/vllm.rs`, `src/adapters/mlxlm.rs`. Verify: ±5% llama.cpp criterion; mocked-adapter CI suite passes engineless.
 - [ ] **C4 — sessions + aggregation.** prefix-continuity store, fork resolution, atomic aggregate. Files: `src/sessions.rs`. Verify: interleaved-requests atomicity test (real interleave, tokio); fork tie-break fixture; collision log test.
-- [ ] **C5 — latency budget CI.** warm-pinned median-of-N proxy-vs-direct TTFT + micro-profile. Files: `tests/` + CI workflow. Verify: >5 ms p95 fails on injected delay; passes on clean tree.
+- [ ] **C5 — latency budget CI.** warm-pinned median-of-N proxy-vs-direct TTFT + micro-profile. Files: `tests/` + CI workflow. Verify: >6 ms p95 fails on injected delay; passes on clean tree; target is ≤5 ms p95.
 - [ ] **C6 — dashboard.** single-file, single-screen, no navigation. Primary workspace is one composition, hero-first:
   1. **Status strip (top):** live indicator, tape mode (hash-level / byte-level), export, incomplete count.
   2. **Hero band (weights by backend):** cloud shows cost saved (`billed input`, `cache-served`, hit rate labeled `provider_reported`); local shows TTFT cold→warm with the speedup factor. The cold-to-warm readout sits beside it always.
-  3. **Session view (left, 42%):** per-turn table (turn, hit, cached/resent, cost) plus cumulative row.
+  3. **Session view (left, 42%):** per-turn table (turn, hit, `cached / resent history`, cost) plus cumulative row. The denominator is `resent_history_tokens`, which grows each turn (system + all prior messages); turn 0 shows `— / —` since it is cold and excluded.
   4. **Prefix tape (right, 58%):** per-turn prefix map (hit / resent / cold / break / miss / incomplete) with a legend. Turn rows align with the session view.
   Files: `src/dashboard.rs`. Verify: state-map rows each render; tape legible without color (glyph, not just green/red); no fake detail in hash-level mode; every color/type/space value comes from DESIGN.md tokens.
   > Layout and tokens are defined in `DESIGN.md` (direction A: warm bone/graphite instrument; the one amber accent marks verified cache-served data and the instrument's live/focus states only). No ad-hoc palette, type scale, or layout beyond DESIGN.md.
   > Responsive + a11y contract: minimum supported viewport 1024px; below 1024px the session view and tape stack vertically with the hero staying full-width (no nav to collapse). Keyboard: session rows and tape cells are focusable, `export` is keyboard-reachable, focus ring always visible. Contrast ≥4.5:1 on body text. All figures use tabular numerals. The tape is legible with color removed (glyph rule, above). Any interactive control has a ≥44px target.
   > Theme: light **and** dark, following the OS `prefers-color-scheme`. Both palettes come from DESIGN.md CSS variables; no hard-coded colors.
-- [ ] **C7 — observability.** JSONL export (metrics-only by default) + structured finalize logs. Files: `src/export.rs`. Verify: export matches dashboard numbers; logs grep-able without bodies.
+- [ ] **C7 — observability.** JSONL export (metrics-only by default; CLI writes a file, dashboard downloads the same schema) + structured finalize logs. Files: `src/export.rs`. Verify: export matches dashboard numbers; CLI file and browser download are byte-identical for one session; logs grep-able without bodies.
 - [ ] **C8 — CLI.** `serve`, `--backend`, `--upstream-url` (provider endpoint; OpenRouter sets it to `https://openrouter.ai/api/v1`), `--check`, `export`, `--verbose` (metadata only), engine/precision flags. Files: `src/main.rs`. Verify: `--check` fails loudly on unreachable upstream; `--help` lists everything; defaults work with zero flags.
 
 ### Getting started (T0 contract)
