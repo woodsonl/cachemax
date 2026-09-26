@@ -1,5 +1,9 @@
 """Unit tests for the warm/cold measurement math (no engine, any platform)."""
 
+import threading
+import time
+
+from cache_max.engine import MlxEngine
 from cache_max.measure import Discrimination
 
 
@@ -16,3 +20,27 @@ def test_median_ratio_odd_and_even():
 def test_zero_warm_is_guarded():
     d = Discrimination(warm_ms=[0.0], cold_ms=[10.0])
     assert d.ratios == [0.0]
+
+
+def test_lazy_load_runs_exactly_once_under_concurrency():
+    # FastAPI serves the sync handler from a threadpool, so concurrent first
+    # requests must not each trigger a model load. `load()` is idempotent and
+    # lock-guarded.
+    engine = MlxEngine(model_name="unused")
+    loads = []
+
+    def fake_load_locked() -> None:
+        if engine._model is not None:  # mirror the real idempotence guard
+            return
+        loads.append(1)
+        time.sleep(0.05)  # widen the race window
+        engine._model = object()  # mark loaded
+
+    engine._load_locked = fake_load_locked  # type: ignore[method-assign]
+    threads = [threading.Thread(target=engine.load) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(loads) == 1, f"model loaded {len(loads)} times, expected 1"
+

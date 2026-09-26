@@ -13,6 +13,7 @@ the fake path and the whole test suite run where mlx-lm cannot be installed.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -64,13 +65,25 @@ class MlxEngine:
 
     The model load is deferred to `load()` so importing this module never
     requires mlx-lm. macOS / Apple Silicon only; construction does not touch mlx.
+
+    FastAPI runs the sync `/v1/chat/completions` handler in a threadpool, so
+    concurrent first requests would otherwise race the lazy load (double load,
+    and shared MLX state mutated by two threads). `_lock` serializes both the
+    load and every `generate`, since mlx-lm does not guarantee concurrent
+    evaluation on a shared model.
     """
 
     model_name: str
     _model: object = field(default=None, init=False)
     _tokenizer: object = field(default=None, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def load(self) -> None:
+        """Load the model (idempotent, thread-safe)."""
+        with self._lock:
+            self._load_locked()
+
+    def _load_locked(self) -> None:
         if self._model is not None:
             return
         try:
@@ -83,7 +96,15 @@ class MlxEngine:
         self._model, self._tokenizer = load(self.model_name)
 
     def generate(self, messages: list[dict], max_tokens: int) -> Completion:
-        self.load()
+        # One lock around load + generate: mlx-lm shares model/KV state and is
+        # not documented as safe for concurrent evaluation, so requests are
+        # serialized rather than run in parallel. This is a local single-user
+        # precision path, not a throughput surface.
+        with self._lock:
+            return self._generate_locked(messages, max_tokens)
+
+    def _generate_locked(self, messages: list[dict], max_tokens: int) -> Completion:
+        self._load_locked()
         from mlx_lm import stream_generate  # type: ignore[import-not-found]
 
         prompt = _apply_chat_template(self._tokenizer, messages)

@@ -37,8 +37,10 @@ def _measure(args: argparse.Namespace) -> int:
 
     engine = _engine(args)
     result = warm_cold_discrimination(engine, turns=args.turns)
-    for i, (warm, cold) in enumerate(zip(result.warm_ms, result.cold_ms)):
-        print(f"turn {i + 1}: warm {warm:.1f} ms  cold {cold:.1f} ms  ratio {cold / warm:.2f}x")
+    for i, (warm, cold, ratio) in enumerate(
+        zip(result.warm_ms, result.cold_ms, result.ratios)
+    ):
+        print(f"turn {i + 1}: warm {warm:.1f} ms  cold {cold:.1f} ms  ratio {ratio:.2f}x")
     print(f"median warm/cold ratio: {result.median_ratio:.2f}x")
     return 0
 
