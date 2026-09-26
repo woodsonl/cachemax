@@ -40,6 +40,7 @@
   .hero .big{font-family:var(--fm);font-weight:700;font-size:72px;line-height:1;font-variant-numeric:tabular-nums;margin:8px 0}
   .hero .sub{font-family:var(--fm);font-size:14px;color:var(--muted)}
   .hero .prov{display:inline-block;margin-top:10px;font-family:var(--fm);font-size:11px;letter-spacing:.06em;border:var(--rule) solid var(--line-strong);padding:3px 7px;color:var(--muted);text-transform:uppercase}
+  .hero .badge{display:inline-block;margin-top:10px;margin-left:8px;font-family:var(--fm);font-size:12px;letter-spacing:.04em;border:var(--rule) solid var(--line-strong);background:var(--raised);padding:3px 8px;color:var(--text)}
   .hero .facts{display:flex;flex-direction:column;justify-content:flex-end;gap:10px;font-family:var(--fm);font-size:14px}
   .hero .facts .row{display:flex;justify-content:space-between;border-bottom:var(--rule) solid var(--line);padding-bottom:6px}
   .hero .facts .v{font-variant-numeric:tabular-nums}
@@ -97,6 +98,7 @@
       <div class="big" id="hero-value">—</div>
       <div class="sub" id="hero-sub">saved this session · cold turn onward</div>
       <div class="prov" id="hero-prov">—</div>
+      <div class="badge" id="hero-badge" style="display:none"></div>
       <div class="facts" style="margin-top:22px">
         <div class="row"><span>billed input</span><span class="v" id="f-billed">—</span></div>
         <div class="row"><span>cache-served</span><span class="v" id="f-cached">—</span></div>
@@ -180,6 +182,13 @@
     document.getElementById("hero-value").textContent = cloud ? state.cost_saved : state.transition.reuse;
     document.getElementById("hero-sub").textContent = cloud ? "saved this session · cold turn onward" : "reuse on the last warm turn";
     document.getElementById("hero-prov").textContent = state.provenance;
+    var badge = document.getElementById("hero-badge");
+    if(state.incomplete_count > 0){
+      badge.style.display = "";
+      badge.textContent = "⚠ " + state.incomplete_count + " incomplete";
+    } else {
+      badge.style.display = "none";
+    }
     document.getElementById("f-billed").textContent = state.billed_input;
     document.getElementById("f-cached").textContent = state.cache_served;
     document.getElementById("f-hit").textContent = state.hit_rate;

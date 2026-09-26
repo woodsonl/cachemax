@@ -274,6 +274,19 @@ fn t2_page_draws_reset_banner_and_session_break() {
     );
 }
 
+#[test]
+fn t2_hero_carries_the_incomplete_badge() {
+    let html = dashboard::DASHBOARD_HTML;
+    assert!(
+        html.contains("hero-badge"),
+        "the hero must have a badge slot"
+    );
+    assert!(
+        html.contains("⚠ ") && html.contains("incomplete"),
+        "the hero badge reads ⚠ N incomplete"
+    );
+}
+
 // --- T3: cloud journey liveness + payoff ---
 
 #[test]
