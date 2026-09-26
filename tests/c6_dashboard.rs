@@ -241,6 +241,28 @@ fn t2_partial_state_excludes_incomplete_from_cumulative() {
 }
 
 #[test]
+fn t2_incomplete_turn_is_excluded_from_cost_and_billed_too() {
+    // The page states "Complete records only"; cost and billed must honor it.
+    let mut inc = rec(2, 0, 0);
+    inc.status = Status::Incomplete;
+    inc.billed_input_tokens = 9_999;
+    inc.cost_usd = Some(9.99);
+    inc.cost_saved_usd = Some(9.99);
+    let rs = vec![rec(1, 1000, 2000), inc];
+    let v = dashboard::view(&rs, true, 2);
+    assert!(
+        !v.billed_input.contains("9,999"),
+        "incomplete billed tokens must be excluded: {}",
+        v.billed_input
+    );
+    assert!(
+        !v.cost_saved.contains("9.99"),
+        "incomplete cost must be excluded: {}",
+        v.cost_saved
+    );
+}
+
+#[test]
 fn t2_page_draws_reset_banner_and_session_break() {
     let html = dashboard::DASHBOARD_HTML;
     assert!(html.contains("Metrics reset"), "must draw the reset banner");
@@ -315,5 +337,19 @@ fn t4_page_covers_the_responsive_and_a11y_contract() {
     assert!(
         html.contains("prefers-reduced-motion"),
         "must respect reduced motion"
+    );
+}
+
+#[test]
+fn provenance_is_the_dominant_source_not_the_first_record() {
+    // A cloud session whose first response omitted the provider's cache field
+    // must not be mislabeled local by that single turn.
+    let mut untruth = rec(1, 0, 0);
+    untruth.source = SourceLabel::NoCacheTruth;
+    let rs = vec![untruth, rec(2, 1000, 2000), rec(3, 1100, 2100)];
+    assert_eq!(
+        dashboard::provenance(&rs),
+        SourceLabel::ProviderReported,
+        "the majority source wins"
     );
 }

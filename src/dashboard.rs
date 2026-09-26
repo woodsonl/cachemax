@@ -91,11 +91,27 @@ pub fn hero_hit_rate(records: &[Record]) -> String {
     format_pct(cumulative_hit_rate(records))
 }
 
-/// The provenance tag for the session's figures.
+/// The provenance tag for the session's figures: the source shared by the
+/// session's measured turns. A session whose turns disagree (e.g. one early
+/// response omitted the provider's cache field) is tagged by the most frequent
+/// source among complete turns, so a single field-less turn cannot mislabel a
+/// cloud session as local.
 pub fn provenance(records: &[Record]) -> SourceLabel {
-    records
-        .first()
-        .map(|r| r.source)
+    let mut counts: [(SourceLabel, usize); 3] = [
+        (SourceLabel::ProviderReported, 0),
+        (SourceLabel::EngineMeasured, 0),
+        (SourceLabel::NoCacheTruth, 0),
+    ];
+    for r in records.iter().filter(|r| r.status == Status::Complete) {
+        if let Some(slot) = counts.iter_mut().find(|(s, _)| *s == r.source) {
+            slot.1 += 1;
+        }
+    }
+    counts
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .max_by_key(|(_, n)| *n)
+        .map(|(s, _)| *s)
         .unwrap_or(SourceLabel::NoCacheTruth)
 }
 
@@ -181,10 +197,18 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
 
     let cached_sum: u64 = complete.iter().map(|r| r.cached_tokens).sum();
     let history_sum: u64 = complete.iter().map(|r| r.resent_history_tokens).sum();
-    let billed_sum: u64 = records.iter().map(|r| r.billed_input_tokens).sum();
-    let cost_saved_sum: f64 = records.iter().filter_map(|r| r.cost_saved_usd).sum();
-    let cost_sum: f64 = records.iter().filter_map(|r| r.cost_usd).sum();
-    let has_cost = records.iter().any(|r| r.cost_usd.is_some());
+    // Billed and cost follow the same "complete records only" rule the page
+    // states: an incomplete turn's partial usage is excluded, as it is from the
+    // hit rate. (Turn 0 is complete but carries no history; its own fresh input
+    // still bills, so it is included in billed/cost, matching the counterfactual.)
+    let counted: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.status == Status::Complete)
+        .collect();
+    let billed_sum: u64 = counted.iter().map(|r| r.billed_input_tokens).sum();
+    let cost_saved_sum: f64 = counted.iter().filter_map(|r| r.cost_saved_usd).sum();
+    let cost_sum: f64 = counted.iter().filter_map(|r| r.cost_usd).sum();
+    let has_cost = counted.iter().any(|r| r.cost_usd.is_some());
 
     // The transition uses the most recent warm turn.
     let last_warm = complete.last();

@@ -11,17 +11,19 @@ pub struct AnthropicAdapter;
 
 impl AnthropicAdapter {
     /// The write/read split for display, plus the derived hit-rate inputs.
-    pub fn split(response_body: &[u8]) -> (u64, u64) {
-        let v: serde_json::Value = serde_json::from_slice(response_body).unwrap_or_default();
+    /// `None` when neither field is present (no cache activity exposed).
+    pub fn split(response_body: &[u8]) -> Option<(u64, u64)> {
+        let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
         let read = v
             .pointer("/usage/cache_read_input_tokens")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
+            .and_then(|n| n.as_u64());
         let creation = v
             .pointer("/usage/cache_creation_input_tokens")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        (read, creation)
+            .and_then(|n| n.as_u64());
+        match (read, creation) {
+            (None, None) => None,
+            (r, c) => Some((r.unwrap_or(0), c.unwrap_or(0))),
+        }
     }
 
     /// The derived cache-hit share shown beside the write/read split:
@@ -30,7 +32,7 @@ impl AnthropicAdapter {
     /// `cached / resent_history` for cross-backend comparability. `None` when
     /// no cache activity is exposed.
     pub fn derived_hit_rate(response_body: &[u8]) -> Option<f64> {
-        let (read, creation) = Self::split(response_body);
+        let (read, creation) = Self::split(response_body)?;
         let total = read + creation;
         if total == 0 {
             None
@@ -50,8 +52,11 @@ impl Adapter for AnthropicAdapter {
     }
 
     fn cache_signal(&self, response_body: &[u8]) -> CacheSignal {
-        let (read, creation) = Self::split(response_body);
-        CacheSignal::reported_split(read, creation)
+        match Self::split(response_body) {
+            Some((read, creation)) => CacheSignal::reported_split(read, creation),
+            // No cache fields at all: report no truth rather than a fake zero.
+            None => CacheSignal::none(),
+        }
     }
 }
 
@@ -63,7 +68,16 @@ mod tests {
     fn split_reads_both_fields() {
         let body =
             br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
-        assert_eq!(AnthropicAdapter::split(body), (900, 300));
+        assert_eq!(AnthropicAdapter::split(body), Some((900, 300)));
+    }
+
+    #[test]
+    fn no_cache_fields_is_no_truth_not_a_fabricated_zero() {
+        let body = br#"{"usage":{"input_tokens":100}}"#;
+        assert_eq!(AnthropicAdapter::split(body), None);
+        let sig = AnthropicAdapter.cache_signal(body);
+        assert_eq!(sig.cached_tokens, 0);
+        assert_eq!(sig.source, Some(SourceLabel::NoCacheTruth));
     }
 
     #[test]

@@ -105,20 +105,24 @@ impl Adapter for VllmAdapter {
         SourceLabel::EngineMeasured
     }
 
-    /// A single body here is a pair of Prometheus snapshots, or a pre-computed
-    /// delta payload `{"cached_tokens":N}`. The proxy uses [`PromCounters`]
-    /// directly for the two-sample path; this covers the fallback.
+    /// A single body here is either a pre-computed delta payload
+    /// `{"cached_tokens":N}` (the per-request figure the proxy samples) or raw
+    /// Prometheus text. Raw text carries only *cumulative* counters, which are
+    /// not a per-turn measurement, so it reports no cache truth rather than
+    /// passing an ever-growing total off as this turn's cached tokens. The
+    /// per-request number comes from [`PromCounters::delta_hits`] between two
+    /// samples (see the module note), not from this single-body path.
     fn cache_signal(&self, response_body: &[u8]) -> CacheSignal {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(response_body) {
             if let Some(n) = v.get("cached_tokens").and_then(|n| n.as_u64()) {
                 return CacheSignal::reported(n, SourceLabel::EngineMeasured);
             }
         }
-        // Otherwise treat the body as Prometheus text and report the raw hits
-        // counter (only meaningful for a single-sample, non-delta context).
-        let text = String::from_utf8_lossy(response_body);
-        let c = PromCounters::parse(&text);
-        CacheSignal::reported(c.hits, SourceLabel::EngineMeasured)
+        CacheSignal {
+            cached_tokens: 0,
+            written_tokens: 0,
+            source: Some(SourceLabel::NoCacheTruth),
+        }
     }
 }
 
@@ -196,5 +200,14 @@ vllm:prefix_cache_hits{engine="1"} 50.0
         let sig = VllmAdapter.cache_signal(body);
         assert_eq!(sig.cached_tokens, 412);
         assert_eq!(sig.source, Some(SourceLabel::EngineMeasured));
+    }
+
+    #[test]
+    fn raw_prometheus_body_is_not_passed_off_as_a_per_turn_number() {
+        // A single metrics scrape is cumulative; reporting it as this turn's
+        // cached tokens would be a silent wrong number. It reports no truth.
+        let sig = VllmAdapter.cache_signal(SAMPLE.as_bytes());
+        assert_eq!(sig.cached_tokens, 0);
+        assert_eq!(sig.source, Some(SourceLabel::NoCacheTruth));
     }
 }

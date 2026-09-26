@@ -135,7 +135,13 @@ pub fn build_record(
 /// and adapter share one path. `response_body` may be a single JSON document
 /// (non-streaming) or a buffered SSE tail; the usage-bearing event wins.
 pub fn observe<A: Adapter>(adapter: &A, response_body: &[u8]) -> (u64, u64, SourceLabel) {
-    let sig = adapter.cache_signal(&last_json_event(response_body));
+    observe_doc(adapter, &last_json_event(response_body))
+}
+
+/// [`observe`] over an already-reduced JSON document, so a caller that also
+/// needs the document (e.g. for billing) reduces the tail only once.
+fn observe_doc<A: Adapter>(adapter: &A, doc: &[u8]) -> (u64, u64, SourceLabel) {
+    let sig = adapter.cache_signal(doc);
     (
         sig.cached_tokens,
         sig.written_tokens,
@@ -156,7 +162,11 @@ fn last_json_event(body: &[u8]) -> Vec<u8> {
     }
     let mut fallback: Option<Vec<u8>> = None;
     for line in body.split(|&b| b == b'\n').rev() {
-        let line = line.strip_prefix(b"data: ").unwrap_or(line);
+        // SSE allows `data:` with or without the space.
+        let line = line
+            .strip_prefix(b"data: ")
+            .or_else(|| line.strip_prefix(b"data:"))
+            .unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line == b"[DONE]" || line.is_empty() {
             continue;
@@ -226,8 +236,11 @@ impl StreamObserver {
         rates: &Rates,
         complete: bool,
     ) -> Record {
-        let (cached_tokens, cache_written_tokens, source) = observe(adapter, &self.tail);
-        let billed = billed_from(&self.tail).unwrap_or(plan.resent_history_tokens);
+        // Reduce the tail once; both the cache signal and the billed count read
+        // the same usage-bearing event.
+        let doc = last_json_event(&self.tail);
+        let (cached_tokens, cache_written_tokens, source) = observe_doc(adapter, &doc);
+        let billed = billed_from_doc(&doc).unwrap_or(plan.resent_history_tokens);
         let obs = Observation {
             ttft_ms: self.ttft_ms,
             cached_tokens,
@@ -244,10 +257,9 @@ impl Default for StreamObserver {
     }
 }
 
-/// Read `billed_input_tokens` from the tail if the provider reported it.
-fn billed_from(tail: &[u8]) -> Option<u64> {
-    let doc = last_json_event(tail);
-    let v: serde_json::Value = serde_json::from_slice(&doc).ok()?;
+/// Read `billed_input_tokens` from an already-reduced JSON document.
+fn billed_from_doc(doc: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(doc).ok()?;
     v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64())
 }
 
@@ -355,10 +367,23 @@ async fn export_session<A: Adapter + 'static>(State(state): State<Arc<AppState<A
     }
 }
 
+/// Request headers forwarded to the upstream verbatim. Auth must pass through
+/// or every cloud call 401s; the rest are the provider-identification headers
+/// OpenRouter and similar gateways read. Everything else is dropped.
+const FORWARD_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "anthropic-version",
+    "openai-organization",
+    "openai-project",
+    "http-referer",
+    "x-title",
+];
+
 /// The request handler: plan, forward, stream through, observe, finalize.
 pub async fn handle_chat<A: Adapter + 'static>(
     State(state): State<Arc<AppState<A>>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let messages = match messages_from(&body) {
@@ -374,19 +399,22 @@ pub async fn handle_chat<A: Adapter + 'static>(
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
-    // Forward first. The request body is passed through untouched.
+    // Forward first. The request body is passed through untouched; auth and
+    // provider-identification headers are forwarded so cloud keys keep working.
     let url = format!(
         "{}/v1/chat/completions",
         state.upstream_url.trim_end_matches('/')
     );
-    let upstream = match state
+    let mut req = state
         .client
         .post(&url)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-    {
+        .header("content-type", "application/json");
+    for name in FORWARD_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            req = req.header(*name, value);
+        }
+    }
+    let upstream = match req.body(body).send().await {
         Ok(r) => r,
         Err(e) => {
             let record = build_record(

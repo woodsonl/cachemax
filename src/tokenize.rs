@@ -70,20 +70,31 @@ impl Tokenizer {
     /// hash of the token stream of all messages up to and including index `i`,
     /// so two requests share a prefix iff their hash sequences share one.
     ///
+    /// Message and field boundaries are delimited explicitly (a fixed sentinel
+    /// byte hashed between role and text and between messages). Without that,
+    /// two different message lists could flatten to the same token-ID sequence
+    /// and collide into one session; the sentinel makes the boundary structural
+    /// rather than a tokenizer coincidence.
+    ///
     /// Incremental: one running hasher is extended per message and snapshotted,
     /// so the whole thing is O(total tokens), not O(n²) over the conversation.
     pub fn prefix_hashes(&self, messages: &[Message]) -> Vec<u64> {
         use std::hash::{Hash, Hasher};
+        const FIELD_SEP: u8 = 0x1f; // unit separator
+        const MSG_SEP: u8 = 0x1e; // record separator
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let mut hashes = Vec::with_capacity(messages.len());
         for m in messages {
-            // Feed this message's tokens into the single running hasher.
+            // Feed this message's tokens into the single running hasher,
+            // delimiting role from text so the boundary can't be forged.
             for tok in self.bpe.encode_with_special_tokens(&m.role) {
                 tok.hash(&mut hasher);
             }
+            FIELD_SEP.hash(&mut hasher);
             for tok in self.bpe.encode_with_special_tokens(&m.text) {
                 tok.hash(&mut hasher);
             }
+            MSG_SEP.hash(&mut hasher);
             // The running hasher's state after message i is the prefix hash.
             hashes.push(hasher.finish());
         }
@@ -140,6 +151,23 @@ mod tests {
         let hb = t.prefix_hashes(&b);
         assert_eq!(ha[0], hb[0], "the shared system message hashes the same");
         assert_ne!(ha[1], hb[1], "the divergent user message differs");
+    }
+
+    #[test]
+    fn message_boundaries_cannot_be_forged() {
+        // Two message lists whose flattened content is identical must not
+        // collide: the boundary between messages is structural, not incidental.
+        // Here the second list folds the first list's two messages into one,
+        // which would share a token stream without an explicit separator.
+        let t = Tokenizer::default_encoder().unwrap();
+        let two = [msg("user", "hello"), msg("user", "world")];
+        let one = [msg("user", "hello world")];
+        let h_two = t.prefix_hashes(&two);
+        let h_one = t.prefix_hashes(&one);
+        assert_ne!(
+            h_two[0], h_one[0],
+            "one message must not hash to a two-message prefix"
+        );
     }
 
     #[test]

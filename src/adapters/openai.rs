@@ -22,9 +22,18 @@ impl Adapter for OpenAiAdapter {
             .and_then(|v| {
                 v.pointer("/usage/prompt_tokens_details/cached_tokens")
                     .and_then(|n| n.as_u64())
-            })
-            .unwrap_or(0);
-        CacheSignal::reported(cached, SourceLabel::ProviderReported)
+            });
+        match cached {
+            // The provider reported a figure (possibly a real 0): keep it.
+            Some(n) => CacheSignal::reported(n, SourceLabel::ProviderReported),
+            // No figure at all (uncached model, error body): report no truth
+            // rather than fabricating a measured zero.
+            None => CacheSignal {
+                cached_tokens: 0,
+                written_tokens: 0,
+                source: Some(SourceLabel::NoCacheTruth),
+            },
+        }
     }
 }
 
@@ -52,8 +61,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_cached_field_is_zero_not_an_error() {
+    fn missing_cached_field_is_no_truth_not_a_fabricated_zero() {
         let body = br#"{"usage":{"prompt_tokens":100}}"#;
-        assert_eq!(OpenAiAdapter.cache_signal(body).cached_tokens, 0);
+        let sig = OpenAiAdapter.cache_signal(body);
+        assert_eq!(sig.cached_tokens, 0);
+        assert_eq!(
+            sig.source,
+            Some(SourceLabel::NoCacheTruth),
+            "an absent provider figure is not a reported zero"
+        );
+    }
+
+    #[test]
+    fn reported_zero_stays_provider_reported() {
+        let body =
+            br#"{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+        let sig = OpenAiAdapter.cache_signal(body);
+        assert_eq!(sig.cached_tokens, 0);
+        assert_eq!(sig.source, Some(SourceLabel::ProviderReported));
     }
 }

@@ -233,3 +233,55 @@ fn engine_measured_counts_clamp_to_history_span() {
     );
     assert_eq!(cloud.cached_tokens, 150, "cloud counts pass through as-is");
 }
+
+/// Auth must reach the upstream, or every cloud call 401s. The proxy forwards
+/// `authorization` (and provider-identification headers) verbatim.
+#[tokio::test]
+async fn authorization_header_is_forwarded_to_upstream() {
+    use std::sync::Mutex;
+
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen2 = seen.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |headers: axum::http::HeaderMap| {
+            let seen = seen2.clone();
+            async move {
+                *seen.lock().unwrap() = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"usage\":{\"prompt_tokens\":1}}\n\ndata: [DONE]\n\n",
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let proxy_url = boot_proxy(format!("http://{addr}")).await;
+    reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-test-123")
+        .body(request_body())
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some("Bearer sk-test-123"),
+        "the client's bearer token must reach the upstream verbatim"
+    );
+}

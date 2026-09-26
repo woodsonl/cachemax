@@ -56,10 +56,11 @@ impl Adapter for LlamaCppAdapter {
         match Self::tokens_cached(response_body) {
             Some(n) => CacheSignal::reported(n, SourceLabel::EngineMeasured),
             // No cache field → the engine exposed nothing; not a measured zero.
+            // Label it NoCacheTruth so an absent field never fabricates a miss.
             None => CacheSignal {
                 cached_tokens: 0,
                 written_tokens: 0,
-                source: Some(SourceLabel::EngineMeasured),
+                source: Some(SourceLabel::NoCacheTruth),
             },
         }
     }
@@ -107,6 +108,17 @@ mod tests {
         let sig = LlamaCppAdapter.cache_signal(body);
         assert_eq!(sig.cached_tokens, 236);
         assert_eq!(sig.source, Some(SourceLabel::EngineMeasured));
+    }
+
+    #[test]
+    fn missing_cache_field_is_no_truth_not_a_fabricated_miss() {
+        let sig = LlamaCppAdapter.cache_signal(br#"{"content":"hi"}"#);
+        assert_eq!(sig.cached_tokens, 0);
+        assert_eq!(
+            sig.source,
+            Some(SourceLabel::NoCacheTruth),
+            "an absent field must not be recorded as a measured zero"
+        );
     }
 
     #[test]
