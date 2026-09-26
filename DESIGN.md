@@ -79,7 +79,7 @@ components:
 **Reference sites:** omlx.ai (adjacent local-LLM dashboard; broad strokes only, not the palette).
 **Key characteristics:**
 - One continuous faceplate divided by hairline seams. No cards.
-- Amber is a measurement, not a brand. It marks verified cache-served data only.
+- Amber is a signal, not a brand. It marks verified cache-served data, and the instrument's own live/active states, and nothing else.
 - Numbers are the hero: mono, tabular, oversized.
 - The cold-to-warm (cloud: billed-to-cached) transition is always in the hero.
 - `—` is visually distinct from `0`, so unexposed never reads as zero.
@@ -95,7 +95,7 @@ Dark-mode values (parallel to the front-matter tokens):
 - accent `#e0a23c`, accent-resent `#cf8f5f`
 - line `#33373a`, line-strong `#4a4f53`
 
-Amber (`accent`) marks verified cache-served data and nothing else: the hit rate and the tape's hit cells. It is never a button, never a logo, never the hero number. Cost and money are facts, so they stay in `text` ink. `accent-resent` marks resent prefix. `text-faint` marks cold, absent, and past values. Neutrals derive from the warm bone hue, so dark mode dims and slightly desaturates rather than inverting.
+Amber (`accent`) is the one signal color, in two roles only: it marks verified cache-served data (the hit rate and the tape's hit cells), and it marks the instrument's own live/active states (the status-strip live dot, focus-visible outlines). It is never a button fill, never a logo, never the hero number. Cost and money are facts, so they stay in `text` ink. `accent-resent` marks resent prefix. `text-faint` marks cold, absent, and past values. Neutrals derive from the warm bone hue, so dark mode dims and slightly desaturates rather than inverting.
 
 ## Typography
 
@@ -126,7 +126,7 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 
 ## Components
 
-- **status-strip:** uppercase mono labels in `text-muted`; the live dot in `accent`. Hover none (not interactive). Focus none.
+- **status-strip:** uppercase mono labels in `text-muted`; the live dot in `accent`. The labels and dot are not interactive (no hover, no focus). The embedded `control`s (tape-mode toggle, export) own their own hover and focus-visible treatment.
 - **hero-value:** mono 700, tabular, `text` color for facts; `text-faint` for the past value in a transition. Never in `accent` or any signal color.
 - **provenance-tag:** 1px `line-strong` border, mono 11px `text-muted`, uppercase. Used for `provider_reported`, `engine_measured`, and `no_cache_truth`.
 - **data-table-row:** bottom border `line`; cold rows in `text-faint`; the cumulative row gets a `line-strong` top border and weight 700. Hover raises the row to `surface`. Focus-visible adds an `accent` outline.
@@ -135,7 +135,7 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 
 ## Do's and Don'ts
 
-- Do: reserve amber for verified cache-served data only.
+- Do: reserve amber for verified cache-served data and live/focus states only.
 - Do: render every unexposed value as `—`, styled to look unlike a digit.
 - Do: use tabular mono for all figures and keep units attached.
 - Do: keep the cold-to-warm transition in the hero at all times.

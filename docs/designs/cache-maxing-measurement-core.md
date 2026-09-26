@@ -170,7 +170,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
   3. **Session view (left, 42%):** per-turn table (turn, hit, cached/resent, cost) plus cumulative row.
   4. **Prefix tape (right, 58%):** per-turn prefix map (hit / resent / cold / break / miss / incomplete) with a legend. Turn rows align with the session view.
   Files: `src/dashboard.rs`. Verify: state-map rows each render; tape legible without color (glyph, not just green/red); no fake detail in hash-level mode; every color/type/space value comes from DESIGN.md tokens.
-  > Layout and tokens are defined in `DESIGN.md` (direction A: warm bone/graphite instrument, amber reserved for verified cache-served data). No ad-hoc palette, type scale, or layout beyond DESIGN.md.
+  > Layout and tokens are defined in `DESIGN.md` (direction A: warm bone/graphite instrument; the one amber accent marks verified cache-served data and the instrument's live/focus states only). No ad-hoc palette, type scale, or layout beyond DESIGN.md.
   > Responsive + a11y contract: minimum supported viewport 1024px; below 1024px the session view and tape stack vertically with the hero staying full-width (no nav to collapse). Keyboard: session rows and tape cells are focusable, `export` is keyboard-reachable, focus ring always visible. Contrast ≥4.5:1 on body text. All figures use tabular numerals. The tape is legible with color removed (glyph rule, above). Any interactive control has a ≥44px target.
   > Theme: light **and** dark, following the OS `prefers-color-scheme`. Both palettes come from DESIGN.md CSS variables; no hard-coded colors.
 - [ ] **C7 — observability.** JSONL export (metrics-only by default) + structured finalize logs. Files: `src/export.rs`. Verify: export matches dashboard numbers; logs grep-able without bodies.
@@ -233,7 +233,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Pass 4+5 (AI Slop 4/10, Design Sys 2/10): no DESIGN.md; visual language deferred by owner
   - Files: `DESIGN.md`, `src/dashboard.rs`
   - Verify: every dashboard color/type/space value references a DESIGN.md token
-  - Done: DESIGN.md created (direction A: warm amber instrument); C6 token check now unblocked.
+  - Done: DESIGN.md created (direction A: warm bone/graphite instrument); C6 token check now unblocked.
 
 
 ## GSTACK REVIEW REPORT
