@@ -343,7 +343,7 @@ async fn serve_dashboard() -> Response {
 /// The live dashboard snapshot: the most recently active session's view.
 async fn dashboard_state<A: Adapter + 'static>(State(state): State<Arc<AppState<A>>>) -> Response {
     let (records, session_count, live) = {
-        let guard = state.sessions.0.lock().unwrap();
+        let guard = state.sessions.lock();
         let live = guard
             .most_recent()
             .map(|s| !s.records.is_empty())
@@ -368,7 +368,7 @@ async fn dashboard_state<A: Adapter + 'static>(State(state): State<Arc<AppState<
 /// Export the most recently active session as metrics-only JSONL.
 async fn export_session<A: Adapter + 'static>(State(state): State<Arc<AppState<A>>>) -> Response {
     let (records, id) = {
-        let guard = state.sessions.0.lock().unwrap();
+        let guard = state.sessions.lock();
         match guard.most_recent() {
             Some(s) => (s.records.clone(), s.id),
             None => (Vec::new(), 0),
@@ -416,7 +416,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
     let model = model_from(&body);
 
     let plan = {
-        let mut guard = state.sessions.0.lock().unwrap();
+        let mut guard = state.sessions.lock();
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
@@ -447,7 +447,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 false,
             );
             crate::export::log_finalize(&record);
-            state.sessions.0.lock().unwrap().append(record);
+            state.sessions.lock().append(record);
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();
         }
     };
@@ -489,7 +489,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         let record =
             observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete && upstream_ok);
         crate::export::log_finalize(&record);
-        sessions.0.lock().unwrap().append(record);
+        sessions.lock().append(record);
     };
 
     Response::builder()

@@ -212,6 +212,13 @@ impl SharedSessions {
     pub fn new() -> Self {
         Self(Mutex::new(SessionStore::new()))
     }
+
+    /// Lock the store, recovering from poisoning. A panic in one handler must
+    /// not brick every later request; the measurement store has no invariant a
+    /// poisoned lock could break, so the guard is taken anyway.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, SessionStore> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl Default for SharedSessions {
@@ -302,6 +309,21 @@ mod tests {
         let c = &store.collision_log()[0];
         assert_eq!(c.session_id, a.session_id);
         assert_eq!(c.shared_prefix_len, 2);
+    }
+
+    #[test]
+    fn a_poisoned_lock_still_yields_the_store() {
+        let store = SharedSessions::new();
+        // Poison the mutex by panicking while holding it.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = store.0.lock().unwrap();
+            panic!("handler panic");
+        }));
+        assert!(poisoned.is_err());
+        // The recovery lock must still return a usable guard.
+        let mut g = store.lock();
+        let r = g.resolve(&[1, 2, 3]);
+        assert_eq!(r.session_id, 1, "the store survived the poison");
     }
 
     #[test]
