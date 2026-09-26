@@ -13,6 +13,82 @@ use clap::{Parser, Subcommand};
 /// Default loopback address the proxy binds.
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
+/// Docs base for error-contract links.
+const DOCS: &str = "https://github.com/woodsonl/cachemax/blob/main/docs/troubleshooting.md";
+
+/// The D3 error contract: every failure names the problem, the cause, the fix,
+/// and a docs link. No raw panic by default.
+#[derive(Debug)]
+pub struct Fault {
+    pub problem: &'static str,
+    pub cause: String,
+    pub fix: &'static str,
+    pub docs: &'static str,
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "problem: {}\n  cause: {}\n  fix: {}\n  docs: {}#{}",
+            self.problem, self.cause, self.fix, DOCS, self.docs
+        )
+    }
+}
+
+impl std::error::Error for Fault {}
+
+impl Fault {
+    fn upstream_unreachable(cause: String) -> Self {
+        Fault {
+            problem: "upstream unreachable",
+            cause,
+            fix: "check --upstream-url and your network; a reachable host that returns 401 is fine",
+            docs: "upstream-unreachable",
+        }
+    }
+    fn upstream_required() -> Self {
+        Fault {
+            problem: "no upstream configured",
+            cause: "--upstream-url was not provided".into(),
+            fix: "pass --upstream-url, e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1",
+            docs: "upstream-unreachable",
+        }
+    }
+    fn tokenizer_unavailable(name: &str, cause: String) -> Self {
+        Fault {
+            problem: "tokenizer unavailable",
+            cause: format!("'{name}': {cause}"),
+            fix: "use --tokenizer cl100k_base (the default), another encoding name, or a known model name",
+            docs: "tokenizer-unavailable",
+        }
+    }
+    fn unknown_backend(other: &str) -> Self {
+        Fault {
+            problem: "unknown backend",
+            cause: format!("'{other}' is not a known adapter"),
+            fix: "use one of: openai, anthropic, llamacpp, vllm, mlxlm",
+            docs: "no-cache-signal",
+        }
+    }
+    fn no_proxy(base: &str, cause: String) -> Self {
+        Fault {
+            problem: "no running proxy",
+            cause: format!("nothing answered at {base}: {cause}"),
+            fix: "start the proxy first with `cachemax serve --upstream-url ...`",
+            docs: "no-running-proxy",
+        }
+    }
+    fn rates_load(path: &str, cause: String) -> Self {
+        Fault {
+            problem: "rates file unusable",
+            cause: format!("{path}: {cause}"),
+            fix: "provide a JSON file of the form {\"models\": {\"<model-prefix>\": {\"input_per_mtok\": N, \"output_per_mtok\": N}}}",
+            docs: "rates-file",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "cachemax",
@@ -82,13 +158,14 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rates = load_rates(cli.rates.as_deref())?;
     let tokenizer = Tokenizer::resolve(&cli.tokenizer)
-        .map_err(|e| format!("tokenizer '{}' unavailable: {e}", cli.tokenizer))?;
+        .map_err(|e| Fault::tokenizer_unavailable(&cli.tokenizer, e))?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
-            let upstream = cli.upstream_url.clone().ok_or(
-                "cachemax serve: --upstream-url is required (e.g. https://api.openai.com/v1)",
-            )?;
+            let upstream = cli
+                .upstream_url
+                .clone()
+                .ok_or_else(Fault::upstream_required)?;
             tracing::info!(
                 backend = %cli.backend,
                 upstream = %upstream,
@@ -101,7 +178,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let upstream = cli
                 .upstream_url
                 .as_deref()
-                .ok_or("cachemax --check: --upstream-url is required")?;
+                .ok_or_else(Fault::upstream_required)?;
             check_upstream(upstream).await
         }
         Command::Export { out } => {
@@ -135,10 +212,7 @@ async fn dispatch_serve(
         "llamacpp" => proxy::serve(LlamaCppAdapter, tokenizer, rates, upstream, bind).await,
         "vllm" => proxy::serve(VllmAdapter, tokenizer, rates, upstream, bind).await,
         "mlxlm" => proxy::serve(MlxLmAdapter, tokenizer, rates, upstream, bind).await,
-        other => Err(format!(
-            "unknown backend '{other}': expected openai | anthropic | llamacpp | vllm | mlxlm"
-        )
-        .into()),
+        other => Err(Fault::unknown_backend(other).into()),
     }
 }
 
@@ -146,13 +220,14 @@ fn load_rates(path: Option<&str>) -> Result<Rates, Box<dyn std::error::Error>> {
     match path {
         None => Ok(Rates::builtin()),
         Some(p) => {
-            let json = std::fs::read_to_string(p).map_err(|e| format!("--rates {p}: {e}"))?;
-            Rates::from_json(&json).map_err(|e| format!("--rates {p}: {e}").into())
+            let json =
+                std::fs::read_to_string(p).map_err(|e| Fault::rates_load(p, e.to_string()))?;
+            Rates::from_json(&json).map_err(|e| Fault::rates_load(p, e).into())
         }
     }
 }
 
-/// Reachability check: a HEAD/GET to the upstream's models endpoint. Any HTTP
+/// Reachability check: a GET to the upstream's models endpoint. Any HTTP
 /// response (even 401) proves the host is reachable; a transport error fails.
 async fn check_upstream(upstream: &str) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/models", upstream.trim_end_matches('/'));
@@ -166,7 +241,7 @@ async fn check_upstream(upstream: &str) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
-        Err(e) => Err(format!("cachemax --check: upstream {upstream} not reachable: {e}").into()),
+        Err(e) => Err(Fault::upstream_unreachable(e.to_string()).into()),
     }
 }
 
@@ -174,9 +249,15 @@ async fn fetch_export(base: &str) -> Result<String, Box<dyn std::error::Error>> 
     let url = format!("{base}/api/export");
     let resp = reqwest::get(&url)
         .await
-        .map_err(|e| format!("no running proxy at {base}: {e}"))?;
+        .map_err(|e| Fault::no_proxy(base, e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(format!("export failed: HTTP {}", resp.status()).into());
+        return Err(Fault {
+            problem: "export failed",
+            cause: format!("HTTP {}", resp.status()),
+            fix: "check the proxy logs for the failed request",
+            docs: "no-running-proxy",
+        }
+        .into());
     }
     Ok(resp.text().await?)
 }

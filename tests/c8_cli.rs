@@ -14,8 +14,15 @@ fn help_lists_every_flag_and_command() {
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     for needle in [
-        "serve", "check", "export", "--backend", "--upstream-url", "--bind",
-        "--tokenizer", "--rates", "--verbose",
+        "serve",
+        "check",
+        "export",
+        "--backend",
+        "--upstream-url",
+        "--bind",
+        "--tokenizer",
+        "--rates",
+        "--verbose",
     ] {
         assert!(s.contains(needle), "--help missing {needle}");
     }
@@ -27,9 +34,19 @@ fn check_fails_loudly_on_unreachable_upstream() {
         .args(["check", "--upstream-url", "http://127.0.0.1:1/v1"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "unreachable upstream must exit non-zero");
+    assert!(
+        !out.status.success(),
+        "unreachable upstream must exit non-zero"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not reachable"), "error must name the problem: {err}");
+    assert!(
+        err.contains("upstream unreachable"),
+        "error must name the problem: {err}"
+    );
+    // D3 contract: problem + cause + fix + docs link.
+    assert!(err.contains("cause:"), "must name the cause: {err}");
+    assert!(err.contains("fix:"), "must give a fix: {err}");
+    assert!(err.contains("docs:"), "must link docs: {err}");
 }
 
 #[test]
@@ -47,7 +64,13 @@ fn export_without_a_proxy_fails_clearly() {
 #[test]
 fn unknown_backend_fails_with_the_valid_list() {
     let out = cachemax()
-        .args(["serve", "--backend", "bogus", "--upstream-url", "http://127.0.0.1:1"])
+        .args([
+            "serve",
+            "--backend",
+            "bogus",
+            "--upstream-url",
+            "http://127.0.0.1:1",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success());
