@@ -76,7 +76,6 @@ impl PromCounters {
         after.queries.saturating_sub(before.queries)
     }
 }
-
 /// Split a Prometheus line into `(metric_name, remainder)`.
 fn split_metric(line: &str) -> Option<(&str, &str)> {
     let brace = line.find('{');

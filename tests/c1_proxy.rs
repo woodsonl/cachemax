@@ -49,6 +49,42 @@ async fn fake_upstream(chunks: Vec<Bytes>, gap: Duration) -> String {
     format!("http://{addr}")
 }
 
+/// An upstream that emits all but the last chunk immediately, then waits for
+/// `first_seen` before emitting the final chunk. A buffering proxy never lets
+/// the client see an early chunk, so the client's first `next()` times out.
+async fn gated_upstream(chunks: Vec<Bytes>, first_seen: Arc<tokio::sync::Notify>) -> String {
+    let chunks = Arc::new(chunks);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let chunks = chunks.clone();
+            let first_seen = first_seen.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    let (head, tail) = chunks.split_at(chunks.len() - 1);
+                    for c in head {
+                        yield Ok::<Bytes, std::io::Error>(c.clone());
+                    }
+                    first_seen.notified().await;
+                    for c in tail {
+                        yield Ok::<Bytes, std::io::Error>(c.clone());
+                    }
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 /// Boot the proxy pointed at `upstream`, return its base URL.
 async fn boot_proxy(upstream: String) -> String {
     let state = Arc::new(proxy::AppState {
@@ -108,8 +144,12 @@ async fn stream_bytes_match_upstream_exactly() {
 
 #[tokio::test]
 async fn ttft_is_not_total_time() {
-    // A 50K-token prompt still streams: the first token arrives early while a
-    // slow tail follows. TTFT must reflect the first chunk, not the total.
+    // A 50K-token prompt still streams: the first chunk reaches the client
+    // while the upstream is still holding its tail open. This is asserted
+    // deterministically, not by wall-clock: the upstream refuses to emit its
+    // final chunk until the client has already received the first one. A
+    // buffering proxy would deadlock here (caught below by the timeout), never
+    // flake on a slow runner.
     let big = "x".repeat(50_000);
     let events: Vec<Bytes> = vec![
         Bytes::from(format!(
@@ -119,11 +159,10 @@ async fn ttft_is_not_total_time() {
         Bytes::from(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{big}\"}}}}]}}\n\n")),
         Bytes::from_static(b"data: [DONE]\n\n"),
     ];
-    // 40ms between chunks: a buffering proxy would take 80ms+ before any byte.
-    let upstream = fake_upstream(events, Duration::from_millis(40)).await;
+    let first_seen = Arc::new(tokio::sync::Notify::new());
+    let upstream = gated_upstream(events, first_seen.clone()).await;
     let proxy_url = boot_proxy(upstream).await;
 
-    let start = std::time::Instant::now();
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/v1/chat/completions"))
         .header("content-type", "application/json")
@@ -132,15 +171,17 @@ async fn ttft_is_not_total_time() {
         .await
         .unwrap();
     let mut stream = resp.bytes_stream();
-    let first = stream.next().await.unwrap().unwrap();
-    let ttft = start.elapsed();
 
-    // First byte arrives after ~40ms (one upstream gap), well under the 80ms a
-    // full-response buffer would cost.
-    assert!(
-        ttft < Duration::from_millis(70),
-        "TTFT {ttft:?} suggests buffering"
-    );
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("first chunk must arrive before the upstream emits its tail (not buffered)")
+        .unwrap()
+        .unwrap();
+    first_seen.notify_one();
+
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
     assert!(!first.is_empty());
 }
 

@@ -27,10 +27,7 @@ impl AnthropicAdapter {
     }
 
     /// The derived cache-hit share shown beside the write/read split:
-    /// `read / (read + creation)`. This is a *secondary* display for Anthropic's
-    /// cache economics — the headline hit-rate stays the binding
-    /// `cached / resent_history` for cross-backend comparability. `None` when
-    /// no cache activity is exposed.
+    /// `read / (read + creation)`. `None` when no cache activity is exposed.
     pub fn derived_hit_rate(response_body: &[u8]) -> Option<f64> {
         let (read, creation) = Self::split(response_body)?;
         let total = read + creation;
