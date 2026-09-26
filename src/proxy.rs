@@ -110,15 +110,23 @@ pub fn build_record(
         SourceLabel::ProviderReported => obs.cached_tokens,
         SourceLabel::NoCacheTruth => 0,
     };
-    let cost_usd = rates
-        .lookup(model)
-        .map(|r| r.input_cost(obs.billed_input_tokens));
-    let cost_saved_usd = rates.cost_saved(
-        model,
-        cached,
-        plan.resent_history_tokens,
-        obs.cache_written_tokens,
-    );
+    // An incomplete turn (cut stream, non-2xx) has partial usage; a cost derived
+    // from it would be a fabricated bill. Report no cost rather than a wrong one.
+    let (cost_usd, cost_saved_usd) = if complete {
+        (
+            rates
+                .lookup(model)
+                .map(|r| r.input_cost(obs.billed_input_tokens)),
+            rates.cost_saved(
+                model,
+                cached,
+                plan.resent_history_tokens,
+                obs.cache_written_tokens,
+            ),
+        )
+    } else {
+        (None, None)
+    };
     Record {
         session_id: plan.session_id,
         turn: plan.turn,
@@ -432,7 +440,7 @@ pub async fn serve<A: Adapter + 'static>(
     tokenizer: Tokenizer,
     rates: Rates,
     upstream_url: String,
-    bind: &str,
+    listener: tokio::net::TcpListener,
     inject_usage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend = adapter.name();
@@ -453,7 +461,7 @@ pub async fn serve<A: Adapter + 'static>(
             .expect("reqwest client"),
     });
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let listener = listener;
     tracing::info!(
         addr = %listener.local_addr()?,
         backend,
@@ -474,8 +482,17 @@ pub fn router<A: Adapter + 'static>(state: Arc<AppState<A>>) -> Router {
         .route("/", axum::routing::get(serve_dashboard))
         .route("/api/state", axum::routing::get(dashboard_state::<A>))
         .route("/api/export", axum::routing::get(export_session::<A>))
+        // Axum's default 2 MB body cap silently 413s a legitimately large
+        // long-context prompt before the handler runs, so the turn is never
+        // measured. Raise it well past real context sizes. A prompt larger than
+        // this, or one the upstream rejects, still records Incomplete.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
+
+/// Upper bound on an accepted request body. Long-context prompts run to many
+/// megabytes; 32 MB leaves headroom without unbounded buffering.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Serve the embedded single-file dashboard.
 async fn serve_dashboard() -> Response {

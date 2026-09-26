@@ -401,6 +401,51 @@ fn engine_measured_counts_clamp_to_history_span() {
     assert_eq!(cloud.cached_tokens, 150, "cloud counts pass through as-is");
 }
 
+/// An incomplete turn has partial usage; a cost derived from it would be a
+/// fabricated bill. It must carry no cost at all.
+#[test]
+fn incomplete_turns_carry_no_cost() {
+    use cachemax::proxy::{build_record, Observation, RequestPlan};
+    use cachemax::rates::Rates;
+    use cachemax::record::SourceLabel;
+
+    let plan = RequestPlan {
+        session_id: 1,
+        turn: 1,
+        resent_history_tokens: 1000,
+        broke_prefix: false,
+    };
+    let obs = Observation {
+        ttft_ms: None,
+        cached_tokens: 500,
+        cache_written_tokens: 0,
+        billed_input_tokens: 1000,
+    };
+    let complete = build_record(
+        &plan,
+        obs,
+        "gpt-4o",
+        &Rates::builtin(),
+        SourceLabel::ProviderReported,
+        true,
+    );
+    assert!(complete.cost_usd.is_some(), "a complete turn is billed");
+
+    let incomplete = build_record(
+        &plan,
+        obs,
+        "gpt-4o",
+        &Rates::builtin(),
+        SourceLabel::ProviderReported,
+        false,
+    );
+    assert!(
+        incomplete.cost_usd.is_none(),
+        "an incomplete turn must not carry a fabricated cost"
+    );
+    assert!(incomplete.cost_saved_usd.is_none());
+}
+
 /// Auth must reach the upstream, or every cloud call 401s. The proxy forwards
 /// `authorization` (and provider-identification headers) verbatim.
 #[tokio::test]

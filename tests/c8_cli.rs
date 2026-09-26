@@ -78,3 +78,26 @@ fn unknown_backend_fails_with_the_valid_list() {
     assert!(err.contains("unknown backend"), "got: {err}");
     assert!(err.contains("openai"), "must list valid backends: {err}");
 }
+
+#[test]
+fn serve_on_a_taken_port_fails_with_the_error_contract() {
+    // Hold a port, then ask the proxy to bind it. This must surface the D3
+    // error contract (problem, cause, fix, docs link), not a raw OS error.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = held.local_addr().unwrap();
+    let out = cachemax()
+        .args([
+            "serve",
+            "--upstream-url",
+            "http://127.0.0.1:1",
+            "--bind",
+            &addr.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("address unavailable"), "got: {err}");
+    assert!(err.contains("--bind"), "must offer a fix: {err}");
+    assert!(err.contains("docs"), "must link docs: {err}");
+}
