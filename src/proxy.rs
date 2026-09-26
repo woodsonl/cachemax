@@ -267,16 +267,12 @@ impl StreamObserver {
             self.scanned = self.scanned.saturating_sub(drop);
         }
         // Capture any usage-bearing event as it passes, before tail eviction can
-        // drop it. Scan only the newly appended bytes (plus a small overlap for
+        // drop it. Scan only the newly appended bytes (plus a 256B overlap for
         // events split across chunk boundaries), not the whole growing tail.
-        let scan_from = self.scanned.saturating_sub(256).min(self.tail.len());
-        let fresh = &self.tail[scan_from..];
-        if has_usage_or_cache_in(fresh) {
-            self.scanned = self.tail.len();
+        if has_usage_or_cache_in(&self.tail[self.scanned.saturating_sub(256)..]) {
             self.usage_doc = Some(last_json_event(&self.tail));
-        } else {
-            self.scanned = self.tail.len();
         }
+        self.scanned = self.tail.len();
     }
 
     /// Finalize the observation into a record. `complete` is false when the
