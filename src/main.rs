@@ -224,7 +224,7 @@ fn load_rates(path: Option<&str>) -> Result<Rates, Box<dyn std::error::Error>> {
 /// Reachability check: a GET to the upstream's models endpoint. Any HTTP
 /// response (even 401) proves the host is reachable; a transport error fails.
 async fn check_upstream(upstream: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/models", upstream.trim_end_matches('/'));
+    let url = format!("{}/models", proxy::versioned_base(upstream));
     // Bounded: a check that hangs is a failure, not a wait.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

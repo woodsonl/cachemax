@@ -399,17 +399,23 @@ const FORWARD_HEADERS: &[&str] = &[
     "x-title",
 ];
 
-/// The chat-completions URL for `base`. `base` is the API base and may already
+/// The versioned API base for `base`. `base` is the API base and may already
 /// end in `/v1` (the documented form: `https://api.openai.com/v1`, OpenRouter's
-/// `.../api/v1`) or omit it (a bare host). Append only the missing part so
-/// neither form yields `/v1/v1/chat/completions`.
-fn upstream_chat_url(base: &str) -> String {
+/// `.../api/v1`) or omit it (a bare host). Append `/v1` only when missing, so a
+/// base that already carries it is not doubled. Shared by `serve` and `check`
+/// so both agree on the version segment.
+pub fn versioned_base(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/v1") {
-        format!("{base}/chat/completions")
+        base.to_string()
     } else {
-        format!("{base}/v1/chat/completions")
+        format!("{base}/v1")
     }
+}
+
+/// The chat-completions URL for `base`. See [`versioned_base`].
+fn upstream_chat_url(base: &str) -> String {
+    format!("{}/chat/completions", versioned_base(base))
 }
 
 /// The request handler: plan, forward, stream through, observe, finalize.
@@ -578,6 +584,17 @@ mod tests {
             upstream_chat_url("http://127.0.0.1:8080/"),
             "http://127.0.0.1:8080/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn versioned_base_matches_between_serve_and_check() {
+        // `serve` (chat/completions) and `check` (/models) must agree on /v1.
+        for base in ["https://api.openai.com/v1", "http://127.0.0.1:8080"] {
+            assert!(versioned_base(base).ends_with("/v1"));
+            assert!(!versioned_base(base).ends_with("/v1/v1"));
+        }
+        assert_eq!(versioned_base("http://h/v1"), "http://h/v1");
+        assert_eq!(versioned_base("http://h"), "http://h/v1");
     }
 
     #[test]
