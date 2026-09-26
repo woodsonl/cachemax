@@ -8,12 +8,13 @@
 // (the web dashboard is the single full UI).
 //
 // Build/run:  menubar/build.sh        (produces cachemax-menubar.app)
-// Override the URL: CACHEMAX_URL=http://127.0.0.1:9999 menubar/build.sh && open ...
+// Override the URL at launch (the proxy's default bind is 127.0.0.1:8787):
+//   CACHEMAX_URL=http://127.0.0.1:9999 open menubar/cachemax-menubar.app
 
 import AppKit
 import Foundation
 
-let baseURL = ProcessInfo.processInfo.environment["CACHEMAX_URL"] ?? "http://127.0.0.1:8899"
+let baseURL = ProcessInfo.processInfo.environment["CACHEMAX_URL"] ?? "http://127.0.0.1:8787"
 let pollSeconds: TimeInterval = 2
 
 struct ProxyState: Decodable {

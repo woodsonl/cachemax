@@ -173,7 +173,8 @@ panels of its own.
 ```bash
 menubar/build.sh    # builds menubar/cachemax-menubar.app
 open menubar/cachemax-menubar.app
-CACHEMAX_URL=http://127.0.0.1:9000 menubar/build.sh   # point at a non-default proxy
+# point at a non-default proxy (default bind is 127.0.0.1:8787):
+CACHEMAX_URL=http://127.0.0.1:9000 open menubar/cachemax-menubar.app
 ```
 
 Requires the Swift toolchain (Xcode Command Line Tools). macOS only.
