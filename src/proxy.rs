@@ -36,6 +36,8 @@ pub struct RequestPlan {
     /// `resent_history_tokens`: token count of system + all prior messages,
     /// excluding this turn's new content.
     pub resent_history_tokens: u64,
+    /// This request broke a tracked session's prefix (measured as a miss).
+    pub broke_prefix: bool,
 }
 
 /// Compute the plan for an incoming request from its messages.
@@ -72,6 +74,7 @@ pub fn plan_request(
         session_id,
         turn,
         resent_history_tokens,
+        broke_prefix: resolution.broke_prefix,
     }
 }
 
@@ -126,6 +129,7 @@ pub fn build_record(
         cache_written_tokens: obs.cache_written_tokens,
         resent_history_tokens: plan.resent_history_tokens,
         billed_input_tokens: obs.billed_input_tokens,
+        broke_prefix: plan.broke_prefix,
         cost_usd,
         cost_saved_usd,
     }
@@ -521,6 +525,7 @@ mod tests {
             session_id: 1,
             turn: 1,
             resent_history_tokens: 1550,
+            broke_prefix: false,
         };
         let obs = Observation {
             ttft_ms: Some(120.0),
@@ -562,6 +567,7 @@ mod tests {
             session_id: 7,
             turn: 2,
             resent_history_tokens: 1810,
+            broke_prefix: false,
         };
         let mut o = StreamObserver::new();
         o.on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
@@ -631,6 +637,7 @@ mod tests {
             session_id: 1,
             turn: 1,
             resent_history_tokens: 2000,
+            broke_prefix: false,
         };
         let mut o = StreamObserver::new();
         o.on_chunk(
@@ -683,6 +690,23 @@ mod tests {
                 assert!(w[1] > w[0], "history must grow: {:?}", histories);
             }
         }
+    }
+
+    #[test]
+    fn plan_flags_a_broken_prefix() {
+        let tokenizer = Tokenizer::default_encoder().unwrap();
+        let store = Arc::new(SharedSessions::new());
+        // Seed a session with a two-message prefix.
+        let seed = vec![msg("system", "You are helpful."), msg("user", "First")];
+        let _ = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &seed);
+        // A request that shares only the system message then diverges.
+        let broken = vec![msg("system", "You are helpful."), msg("user", "Different")];
+        let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &broken);
+        assert!(p.broke_prefix, "a divergent prefix is flagged on the plan");
+        assert_eq!(
+            p.session_id, 1,
+            "the break stays in the tracked session, not a new one"
+        );
     }
 
     #[test]

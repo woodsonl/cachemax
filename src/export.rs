@@ -63,6 +63,7 @@ mod tests {
             cache_written_tokens: 0,
             resent_history_tokens: 1550,
             billed_input_tokens: 1750,
+            broke_prefix: false,
             cost_usd: Some(0.02),
             cost_saved_usd: Some(0.01),
         }

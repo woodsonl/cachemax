@@ -265,6 +265,7 @@ mod tests {
             cache_written_tokens: 0,
             resent_history_tokens: 0,
             billed_input_tokens: 0,
+            broke_prefix: false,
             cost_usd: None,
             cost_saved_usd: None,
         });
@@ -317,6 +318,7 @@ mod tests {
             cache_written_tokens: 0,
             resent_history_tokens: 2000,
             billed_input_tokens: 2000,
+            broke_prefix: false,
             cost_usd: None,
             cost_saved_usd: None,
         });

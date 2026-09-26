@@ -51,6 +51,10 @@ pub struct Record {
     pub resent_history_tokens: u64,
     /// Billed input tokens for this turn.
     pub billed_input_tokens: u64,
+    /// This turn's prefix broke against the tracked session (a cache miss that
+    /// stays in the session). Drives the tape's break/miss glyph.
+    #[serde(default)]
+    pub broke_prefix: bool,
     /// Cost in USD at the provider's published rate, if known.
     pub cost_usd: Option<f64>,
     /// Cost saved versus the no-cache counterfactual, if rates are known.
@@ -103,6 +107,7 @@ mod tests {
             cached_tokens: cached,
             resent_history_tokens: history,
             billed_input_tokens: history + 200,
+            broke_prefix: false,
             cache_written_tokens: 0,
             cost_usd: None,
             cost_saved_usd: None,

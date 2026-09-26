@@ -21,6 +21,7 @@ fn record(session_id: u64, turn: u32) -> Record {
         cache_written_tokens: 0,
         resent_history_tokens: 200,
         billed_input_tokens: 200,
+        broke_prefix: false,
         cost_usd: None,
         cost_saved_usd: None,
     }

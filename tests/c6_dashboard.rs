@@ -153,6 +153,7 @@ fn rec(turn: u32, cached: u64, history: u64) -> Record {
         cache_written_tokens: 0,
         resent_history_tokens: history,
         billed_input_tokens: history + 200,
+        broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
     }
@@ -170,6 +171,7 @@ fn hash_level_mode_prints_no_fake_byte_detail() {
         cache_written_tokens: 0,
         resent_history_tokens: 2000,
         billed_input_tokens: 2000,
+        broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
     };

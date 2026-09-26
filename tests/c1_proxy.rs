@@ -197,6 +197,7 @@ fn engine_measured_counts_clamp_to_history_span() {
         session_id: 1,
         turn: 1,
         resent_history_tokens: 100,
+        broke_prefix: false,
     };
     let rates = Rates::default();
 

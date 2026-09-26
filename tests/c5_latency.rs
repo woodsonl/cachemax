@@ -129,6 +129,12 @@ async fn deltas(direct: &str, via_proxy: &str, n: usize) -> Vec<f64> {
 
 #[tokio::test]
 async fn clean_tree_is_within_the_p95_target() {
+    if cfg!(debug_assertions) {
+        // The budget is only meaningful optimized; debug builds inflate the
+        // proxy's own work. CI certifies it in the dedicated release step.
+        eprintln!("skipping latency budget in debug; run --release to gate");
+        return;
+    }
     let up = upstream(Duration::ZERO).await;
     let proxy_url = proxy_for(up.clone()).await;
     let samples = deltas(&up, &proxy_url, 60).await;
@@ -143,6 +149,8 @@ async fn clean_tree_is_within_the_p95_target() {
 
 #[tokio::test]
 async fn injected_delay_trips_the_gate() {
+    // 20 ms is far above the 6 ms gate, so this holds in debug too: it proves
+    // the gate detects a buffering hop regardless of build profile.
     // An added delay on the *proxy* path only (a second hop that sleeps) must
     // push the delta over the gate. This simulates a proxy that buffers.
     let up = upstream(Duration::ZERO).await;

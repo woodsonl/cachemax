@@ -307,7 +307,7 @@ fn turn_row(r: &Record) -> TurnRow {
 fn tape_row(r: &Record) -> TapeRow {
     const CELLS: usize = 16;
     let incomplete = r.status == Status::Incomplete;
-    let cells = if incomplete {
+    let mut cells = if incomplete {
         vec![TapeState::Incomplete; CELLS / 2]
     } else if r.turn == 0 || r.resent_history_tokens == 0 {
         vec![TapeState::Cold; CELLS]
@@ -319,6 +319,12 @@ fn tape_row(r: &Record) -> TapeRow {
         v.extend(std::iter::repeat_n(TapeState::Resent, CELLS - hit));
         v
     };
+    // A prefix break is a leading miss: the tape records where the prefix
+    // diverged from the tracked session, ahead of this turn's hit/resent run.
+    if r.broke_prefix && !incomplete {
+        cells.insert(0, TapeState::Break);
+        cells.insert(1, TapeState::Miss);
+    }
     TapeRow {
         turn: r.turn,
         cells,
@@ -352,6 +358,7 @@ mod tests {
             cache_written_tokens: 0,
             resent_history_tokens: history,
             billed_input_tokens: history + 200,
+            broke_prefix: false,
             cost_usd: Some(0.01),
             cost_saved_usd: Some(0.005),
         }
@@ -384,6 +391,19 @@ mod tests {
         assert!(row.cold);
         assert_eq!(row.hit, "—");
         assert_eq!(row.cached_over_history, "— / —");
+    }
+
+    #[test]
+    fn a_broken_prefix_leads_the_tape_with_break_and_miss() {
+        let mut r = rec(3, 100, 200);
+        r.broke_prefix = true;
+        let row = tape_row(&r);
+        assert_eq!(row.cells[0], TapeState::Break, "break glyph leads the tape");
+        assert_eq!(
+            row.cells[1],
+            TapeState::Miss,
+            "miss glyph follows the break"
+        );
     }
 
     #[test]

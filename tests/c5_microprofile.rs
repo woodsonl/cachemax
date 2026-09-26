@@ -60,6 +60,7 @@ fn micro_profile_hot_path_stages() {
         session_id: 1,
         turn: 1,
         resent_history_tokens: 2000,
+        broke_prefix: false,
     };
     let t = Instant::now();
     for _ in 0..N {

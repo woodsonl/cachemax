@@ -65,6 +65,7 @@ fn observed_figure_survives_into_the_record() {
         session_id: 1,
         turn: 1,
         resent_history_tokens: 2000,
+        broke_prefix: false,
     };
     let body =
         br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
