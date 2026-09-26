@@ -64,6 +64,11 @@ impl SessionStore {
             s.records.push(record);
         }
     }
+
+    /// Look up a session by id.
+    pub fn session(&self, id: u64) -> Option<&Session> {
+        self.sessions.get(&id)
+    }
 }
 
 fn is_prefix(short: &[u64], long: &[u64]) -> bool {

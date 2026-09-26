@@ -1,32 +1,100 @@
-//! Proxy core: forward first, unbuffered SSE passthrough, observe while streaming,
-//! finalize one record per request. C1 fills in the axum/hyper wiring; the shape
-//! is the contract.
+//! Proxy core: forward first, unbuffered SSE passthrough, observe while
+//! streaming, finalize one record per request.
+//!
+//! The design rule (spec §Streaming): the SSE bytes the client receives are the
+//! bytes we observed; the stored record must byte-match reassembly of the stream
+//! by concatenation. So the hot path never parses-to-forward — it forwards
+//! chunks untouched and runs observation on a side copy. Only at finalize do we
+//! look at the buffered copy (bounded: usage arrives in the terminal SSE event).
+//!
+//! The network wiring is in [`serve`]; the pure seams ([`build_record`],
+//! [`observe`], [`finalize`], [`RequestPlan`]) are tested without a socket.
 
 use crate::adapters::Adapter;
 use crate::record::{Record, SourceLabel, Status};
+use crate::sessions::{SessionStore, SharedSessions};
+use crate::tokenize::{Message, Tokenizer};
 
-/// A finalized-request outcome the proxy hands to the session store.
-pub struct Finalize {
-    pub record: Record,
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
+use bytes::Bytes;
+use futures::StreamExt;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// What the proxy knows about a request *before* forwarding: which session it
+/// extends, its turn index, and the binding denominator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestPlan {
+    pub session_id: u64,
+    pub turn: u32,
+    /// `resent_history_tokens`: token count of system + all prior messages,
+    /// excluding this turn's new content.
+    pub resent_history_tokens: u64,
 }
 
-/// Build a record from the observed response. This is the pure seam C1 tests
-/// against, independent of the network.
+/// Compute the plan for an incoming request from its messages.
+///
+/// `prefix_hashes` is this request's cumulative per-message hash sequence. The
+/// matched session tells us the turn index (its record count) and the longest
+/// shared prefix; everything past that shared prefix is this turn's new
+/// content, so the denominator is the token count up to the shared boundary.
+///
+/// Token counts are measured locally here only to size the denominator. On the
+/// cloud path the *provider's* figure stays authoritative for `cached_tokens`;
+/// this local count is the re-sent-history measure the dashboard divides by.
+pub fn plan_request(
+    store: &mut SessionStore,
+    tokenizer: &Tokenizer,
+    messages: &[Message],
+) -> RequestPlan {
+    let hashes = tokenizer.prefix_hashes(messages);
+    let session_id = store.resolve(&hashes);
+    let session = store.session(session_id);
+    let turn = session.map(|s| s.records.len() as u32).unwrap_or(0);
+    // History is the span prior turns established. On a cold turn (no prior
+    // records) there is none, so the denominator is 0 — never this request's
+    // own messages. The shared prefix only counts once the session has history.
+    let resent_history_tokens = if turn == 0 {
+        0
+    } else {
+        let shared = session
+            .map(|s| shared_prefix_len(&s.prefix_hashes, &hashes))
+            .unwrap_or(0);
+        tokenizer.count_messages(&messages[..shared.min(messages.len())]) as u64
+    };
+
+    RequestPlan {
+        session_id,
+        turn,
+        resent_history_tokens,
+    }
+}
+
+/// Length of the longest common prefix of two hash sequences.
+fn shared_prefix_len(a: &[u64], b: &[u64]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Build a record from the observed response. The pure seam C1 tests against,
+/// independent of the network.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
-    session_id: u64,
-    turn: u32,
+    plan: &RequestPlan,
     ttft_ms: Option<f64>,
     cached_tokens: u64,
-    resent_history_tokens: u64,
     billed_input_tokens: u64,
     cost_usd: Option<f64>,
     source: SourceLabel,
     complete: bool,
 ) -> Record {
     Record {
-        session_id,
-        turn,
+        session_id: plan.session_id,
+        turn: plan.turn,
         status: if complete {
             Status::Complete
         } else {
@@ -35,17 +103,270 @@ pub fn build_record(
         source,
         ttft_ms,
         cached_tokens,
-        resent_history_tokens,
+        resent_history_tokens: plan.resent_history_tokens,
         billed_input_tokens,
         cost_usd,
     }
 }
 
-/// The cache signal an adapter would read from a response, factored out so the
-/// proxy and the adapter share one path.
+/// The cache signal an adapter reads from a response, factored out so the proxy
+/// and adapter share one path. `response_body` may be a single JSON document
+/// (non-streaming) or a buffered SSE tail; the last full `data:` event wins.
 pub fn observe<A: Adapter>(adapter: &A, response_body: &[u8]) -> (u64, SourceLabel) {
-    let sig = adapter.cache_signal(response_body);
+    let sig = adapter.cache_signal(&last_json_event(response_body));
     (sig.cached_tokens, sig.source.unwrap_or_else(|| adapter.source()))
+}
+
+/// Reduce a body to the most informative JSON document: the whole body if it is
+/// one JSON object, else the last `data:` SSE event. Prefers an event that
+/// carries `usage` (cache/ billing figures live there); falls back to the last
+/// parseable event. Usage arrives in the terminal event, so scanning from the
+/// end is both correct and cheap.
+fn last_json_event(body: &[u8]) -> Vec<u8> {
+    if body.first().map(|&b| b == b'{').unwrap_or(false)
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok()
+    {
+        return body.to_vec();
+    }
+    let mut fallback: Option<Vec<u8>> = None;
+    for line in body.split(|&b| b == b'\n').rev() {
+        let line = line.strip_prefix(b"data: ").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line == b"[DONE]" || line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(v) => {
+                if v.get("usage").is_some() {
+                    return line.to_vec();
+                }
+                if fallback.is_none() {
+                    fallback = Some(line.to_vec());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    fallback.unwrap_or_default()
+}
+
+/// Incremental stream observer. Fed each forwarded chunk in order, untouched;
+/// tracks TTFT and accumulates a bounded copy for the finalize parse.
+///
+/// The client stream is *never* delayed by this: chunk bytes are cloned for
+/// observation and the originals are forwarded as-is. See [`serve`].
+pub struct StreamObserver {
+    started: Instant,
+    ttft_ms: Option<f64>,
+    saw_first_byte: bool,
+    tail: Vec<u8>,
+    /// Cap the retained copy; usage always arrives in the terminal event, so
+    /// retaining the tail is sufficient and bounded (spec: no unbounded buffer).
+    cap: usize,
+}
+
+impl StreamObserver {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            ttft_ms: None,
+            saw_first_byte: false,
+            tail: Vec::new(),
+            cap: 64 * 1024,
+        }
+    }
+
+    /// Observe one forwarded chunk. Called with the exact bytes being sent to
+    /// the client; must not mutate them.
+    pub fn on_chunk(&mut self, chunk: &[u8]) {
+        if !self.saw_first_byte && !chunk.is_empty() {
+            self.saw_first_byte = true;
+            self.ttft_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
+        }
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > self.cap {
+            let drop = self.tail.len() - self.cap;
+            self.tail.drain(..drop);
+        }
+    }
+
+    /// Finalize the observation into a record. `complete` is false when the
+    /// stream ended early (client disconnect, upstream error mid-stream).
+    pub fn finalize<A: Adapter>(
+        &self,
+        plan: &RequestPlan,
+        adapter: &A,
+        complete: bool,
+    ) -> Record {
+        let (cached_tokens, source) = observe(adapter, &self.tail);
+        let billed = billed_from(&self.tail).unwrap_or(plan.resent_history_tokens);
+        build_record(
+            plan,
+            self.ttft_ms,
+            cached_tokens,
+            billed,
+            None,
+            source,
+            complete,
+        )
+    }
+}
+
+impl Default for StreamObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read `billed_input_tokens` from the tail if the provider reported it.
+fn billed_from(tail: &[u8]) -> Option<u64> {
+    let doc = last_json_event(tail);
+    let v: serde_json::Value = serde_json::from_slice(&doc).ok()?;
+    v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64())
+}
+
+/// State shared by every request handler.
+pub struct AppState<A: Adapter> {
+    pub adapter: Arc<A>,
+    pub tokenizer: Tokenizer,
+    pub sessions: Arc<SharedSessions>,
+    pub upstream_url: String,
+    pub client: reqwest::Client,
+}
+
+/// Run the proxy. Forwards to `upstream_url`, streams the response through
+/// unbuffered, and finalizes one record per request.
+pub async fn serve<A: Adapter + 'static>(
+    adapter: A,
+    tokenizer: Tokenizer,
+    upstream_url: String,
+    bind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AppState {
+        adapter: Arc::new(adapter),
+        tokenizer,
+        sessions: Arc::new(SharedSessions::new()),
+        upstream_url,
+        client: reqwest::Client::new(),
+    });
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(addr = %listener.local_addr()?, "cachemax listening");
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
+
+/// The proxy's axum router. Shared by [`serve`] and integration tests so both
+/// exercise one construction path.
+pub fn router<A: Adapter + 'static>(state: Arc<AppState<A>>) -> Router {
+    Router::new()
+        .route("/v1/chat/completions", post(handle_chat::<A>))
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .with_state(state)
+}
+
+/// The request handler: plan, forward, stream through, observe, finalize.
+pub async fn handle_chat<A: Adapter + 'static>(
+    State(state): State<Arc<AppState<A>>>,
+    _headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let messages = match messages_from(&body) {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
+        }
+    };
+
+    let plan = {
+        let mut guard = state.sessions.0.lock().unwrap();
+        plan_request(&mut guard, &state.tokenizer, &messages)
+    };
+
+    // Forward first. The request body is passed through untouched.
+    let url = format!("{}/v1/chat/completions", state.upstream_url.trim_end_matches('/'));
+    let upstream = match state
+        .client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let record = build_record(
+                &plan,
+                None,
+                0,
+                0,
+                None,
+                state.adapter.source(),
+                false,
+            );
+            state.sessions.0.lock().unwrap().append(record);
+            return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();
+        }
+    };
+
+    let status = upstream.status();
+    let mut upstream_stream = upstream.bytes_stream();
+
+    // Unbuffered passthrough: each chunk is forwarded as it arrives; a clone is
+    // handed to the observer, which never blocks the forward path.
+    let adapter = state.adapter.clone();
+    let sessions = state.sessions.clone();
+    let stream = async_stream::stream! {
+        let mut observer = StreamObserver::new();
+        let mut complete = true;
+        while let Some(chunk) = upstream_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    observer.on_chunk(&bytes);
+                    yield Ok::<Bytes, std::io::Error>(bytes);
+                }
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        let record = observer.finalize(&plan, adapter.as_ref(), complete);
+        sessions.0.lock().unwrap().append(record);
+    };
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Extract messages from an OpenAI-dialect request body. Dialect-neutral output.
+fn messages_from(body: &[u8]) -> Option<Vec<Message>> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let arr = v.get("messages")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for m in arr {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let text = flatten_content(m.get("content"));
+        out.push(Message { role: role.to_string(), text });
+    }
+    Some(out)
+}
+
+/// Flatten OpenAI content — a string, or an array of `{type,text}` parts.
+fn flatten_content(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -53,28 +374,96 @@ mod tests {
     use super::*;
     use crate::adapters::openai::OpenAiAdapter;
 
+    fn msg(role: &str, text: &str) -> Message {
+        Message { role: role.into(), text: text.into() }
+    }
+
     #[test]
     fn a_dropped_stream_finalizes_incomplete() {
-        let r = build_record(
-            1,
-            1,
-            Some(120.0),
-            0,
-            1550,
-            1750,
-            None,
-            SourceLabel::ProviderReported,
-            false,
-        );
+        let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 1550 };
+        let r = build_record(&plan, Some(120.0), 0, 1750, None, SourceLabel::ProviderReported, false);
         assert_eq!(r.status, Status::Incomplete);
-        assert!(r.hit_rate().is_none() || r.hit_rate().is_some());
     }
 
     #[test]
     fn observe_routes_through_the_adapter() {
         let body = br#"{"usage":{"prompt_tokens_details":{"cached_tokens":1455}}}"#;
-        let (cached, source) = observe(&OpenAiAdapter::default(), body);
+        let (cached, source) = observe(&OpenAiAdapter, body);
         assert_eq!(cached, 1455);
         assert_eq!(source, SourceLabel::ProviderReported);
+    }
+
+    #[test]
+    fn observer_records_ttft_at_first_nonempty_chunk() {
+        let mut o = StreamObserver::new();
+        assert!(o.ttft_ms.is_none());
+        o.on_chunk(b"");
+        assert!(o.ttft_ms.is_none(), "empty chunk is not first byte");
+        o.on_chunk(b"data: {}\n\n");
+        assert!(o.ttft_ms.is_some(), "first nonempty chunk sets TTFT");
+    }
+
+    #[test]
+    fn observer_finalizes_cached_and_billed_from_the_tail() {
+        let plan = RequestPlan { session_id: 7, turn: 2, resent_history_tokens: 1810 };
+        let mut o = StreamObserver::new();
+        o.on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
+        o.on_chunk(
+            b"data: {\"usage\":{\"prompt_tokens\":2140,\"prompt_tokens_details\":{\"cached_tokens\":1455}}}\n\n",
+        );
+        let r = o.finalize(&plan, &OpenAiAdapter, true);
+        assert_eq!(r.cached_tokens, 1455);
+        assert_eq!(r.billed_input_tokens, 2140);
+        assert_eq!(r.resent_history_tokens, 1810);
+        assert_eq!(r.turn, 2);
+    }
+
+    #[test]
+    fn tail_is_bounded() {
+        let mut o = StreamObserver::new();
+        for _ in 0..2000 {
+            o.on_chunk(&[b'x'; 100]);
+        }
+        assert!(o.tail.len() <= o.cap, "tail must not grow unbounded");
+    }
+
+    #[test]
+    fn plan_tracks_turns_and_denominator_across_a_session() {
+        let tokenizer = Tokenizer::default_encoder().unwrap();
+        let store = Arc::new(SharedSessions::new());
+        let conv1 = vec![msg("system", "You are helpful."), msg("user", "Hi")];
+        let p0 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv1);
+        assert_eq!(p0.turn, 0, "first request is cold");
+        assert_eq!(p0.resent_history_tokens, 0, "turn 0 has no history");
+
+        // Simulate the finalized turn 0 so the next request sees turn 1.
+        let r = build_record(&p0, Some(100.0), 0, 10, None, SourceLabel::ProviderReported, true);
+        store.0.lock().unwrap().append(r);
+
+        let conv2 = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Hi"),
+            msg("assistant", "Hello!"),
+            msg("user", "More"),
+        ];
+        let p1 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv2);
+        assert_eq!(p1.session_id, p0.session_id, "same session");
+        assert_eq!(p1.turn, 1);
+        assert!(
+            p1.resent_history_tokens > 0,
+            "history excludes this turn's new content but includes the prefix"
+        );
+    }
+
+    #[test]
+    fn messages_from_flattens_string_and_parts() {
+        let body = br#"{"messages":[
+            {"role":"system","content":"sys"},
+            {"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}
+        ]}"#;
+        let msgs = messages_from(body).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text, "sys");
+        assert_eq!(msgs[1].text, "ab");
     }
 }

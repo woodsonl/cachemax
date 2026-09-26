@@ -8,14 +8,7 @@
 // are wired end to end.
 #![allow(dead_code)]
 
-mod adapters;
-mod dashboard;
-mod export;
-mod proxy;
-mod record;
-mod sessions;
-mod tokenize;
-
+use cachemax::export;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
