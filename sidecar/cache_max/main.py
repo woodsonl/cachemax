@@ -41,7 +41,7 @@ def _measure(args: argparse.Namespace) -> int:
         zip(result.warm_ms, result.cold_ms, result.ratios)
     ):
         print(f"turn {i + 1}: warm {warm:.1f} ms  cold {cold:.1f} ms  ratio {ratio:.2f}x")
-    print(f"median warm/cold ratio: {result.median_ratio:.2f}x")
+    print(f"median cold/warm ratio: {result.median_ratio:.2f}x (>1 means warm was faster)")
     return 0
 
 

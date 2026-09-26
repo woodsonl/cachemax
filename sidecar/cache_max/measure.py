@@ -1,8 +1,9 @@
 """Warm/cold TTFT discrimination — the mlx-lm sidecar's reported signal.
 
 mlx-lm exposes no cache truth, so there is no hit-rate number. It does expose
-per-token timing, so the sidecar reports per-turn TTFT and the warm/cold ratio.
-It does NOT assert a speedup threshold; reporting the number is the contract.
+per-token timing, so the sidecar reports per-turn TTFT and the cold/warm ratio
+(>1 means warm was faster). It does NOT assert a speedup threshold; reporting
+the number is the contract.
 """
 
 from __future__ import annotations
