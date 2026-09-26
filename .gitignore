@@ -26,3 +26,6 @@ htmlcov/
 
 # Rust
 /target/
+
+# macOS menu bar build artifact
+menubar/*.app/

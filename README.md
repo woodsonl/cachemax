@@ -161,6 +161,22 @@ required to run cachemax.
 
 - repo root — the Rust core (`Cargo.toml`, `src/*.rs`) and the embedded dashboard
 - `sidecar/` — the Python mlx-lm sidecar and its uv project
+- `menubar/` — the macOS menu bar status item (AppKit, no dependencies)
+
+### macOS menu bar (optional)
+
+A glanceable status item: `● <hit rate>` when the proxy is live, `○ —` when it
+is not running, `⚠ <n>` when turns are incomplete. Clicking it opens the web
+dashboard, which remains the single full UI. It polls `/api/state`; it shows no
+panels of its own.
+
+```bash
+menubar/build.sh    # builds menubar/cachemax-menubar.app
+open menubar/cachemax-menubar.app
+CACHEMAX_URL=http://127.0.0.1:9000 menubar/build.sh   # point at a non-default proxy
+```
+
+Requires the Swift toolchain (Xcode Command Line Tools). macOS only.
 
 ### mlx-lm sidecar (macOS / Apple Silicon)
 
@@ -191,4 +207,6 @@ cargo fmt --all -- --check
 uv sync --project sidecar  # Python sidecar (fake engine; no mlx-lm needed)
 uv run --project sidecar pytest
 CACHEMAX_MLX_REAL=1 uv run --project sidecar pytest tests/test_real_mlx.py -s  # real mlx-lm, opt-in
+
+menubar/test.sh            # menu bar render logic (macOS)
 ```

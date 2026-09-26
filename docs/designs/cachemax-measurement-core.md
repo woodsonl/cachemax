@@ -186,7 +186,7 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 
 ### Later (post-T0)
 
-- [ ] **M1 — macOS menu bar item.** Glanceable status only (proxy running / live / error, current hit rate), click-through opens the existing web dashboard. The web dashboard remains the single full UI; the menu bar item duplicates no panels. macOS only. Not T0.
+- [x] **M1 — macOS menu bar item.** Glanceable status only (proxy running / live / error, current hit rate), click-through opens the existing web dashboard. The web dashboard remains the single full UI; the menu bar item duplicates no panels. macOS only. Not T0. Files: `menubar/CacheMaxMenuBar.swift`, `menubar/build.sh`. Verify: `menubar/test.sh` covers the render decision (live → `● <hit rate>`, incomplete → `⚠ <n>`, down/malformed → `○ —`); the app polls `/api/state` and opens the dashboard root on click. AppKit only, no new dependencies; a separate build artifact, off the Rust hot path.
 
 ## Not in scope
 
