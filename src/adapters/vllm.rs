@@ -40,16 +40,18 @@ impl PromCounters {
             let Some((name, rest)) = split_metric(line) else {
                 continue;
             };
-            // `rest` is the value (optionally preceded by {labels}); take the
-            // last whitespace-separated token as the number.
-            let Some(value) = rest
+            // Prometheus exposition writes counters with a `_total` suffix
+            // (`vllm:prefix_cache_hits_total`); the docs name them without it.
+            // Strip the suffix so both spellings match.
+            let name = name.strip_suffix("_total").unwrap_or(name);
+            // `rest` is `{labels} value [timestamp]`; the value is the first
+            // whitespace-separated token after any label set, not the last
+            // (the last would be the optional timestamp).
+            let value = rest
                 .split_whitespace()
-                .last()
-                .and_then(|v| v.parse::<f64>().ok())
-            else {
-                continue;
-            };
-            let value = value as u64;
+                .find_map(|v| v.parse::<f64>().ok())
+                .map(|v| v as u64);
+            let Some(value) = value else { continue };
             match name {
                 "vllm:prefix_cache_queries" => c.queries += value,
                 "vllm:prefix_cache_hits" => c.hits += value,
@@ -145,6 +147,27 @@ vllm:num_requests_running{model_name="llama",engine="0"} 3.0
         assert_eq!(c.queries, 1000);
         assert_eq!(c.hits, 640);
         assert_eq!(c.prompt_cached, 640);
+    }
+
+    #[test]
+    fn parses_counters_exposed_with_the_total_suffix() {
+        // Prometheus exposition writes counters as `<name>_total`. This is the
+        // form actually on the wire from a real vLLM `/metrics`.
+        let text = r#"
+vllm:prefix_cache_queries_total{model_name="llama"} 1250.0
+vllm:prefix_cache_hits_total{model_name="llama"} 940.0
+"#;
+        let c = PromCounters::parse(text);
+        assert_eq!(c.queries, 1250);
+        assert_eq!(c.hits, 940);
+    }
+
+    #[test]
+    fn ignores_a_trailing_timestamp() {
+        // Prometheus allows `<metric> <value> <timestamp_ms>`; the value is not
+        // the last token.
+        let text = "vllm:prefix_cache_hits_total 940.0 1700000000000\n";
+        assert_eq!(PromCounters::parse(text).hits, 940);
     }
 
     #[test]

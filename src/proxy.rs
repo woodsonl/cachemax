@@ -277,6 +277,9 @@ impl StreamObserver {
 
     /// Finalize the observation into a record. `complete` is false when the
     /// stream ended early (client disconnect, upstream error mid-stream).
+    /// `engine_cached` is a per-turn cache figure measured out-of-band (the
+    /// vLLM `/metrics` delta); when present it overrides the body-derived
+    /// count and labels the source `EngineMeasured`.
     pub fn finalize<A: Adapter>(
         &self,
         plan: &RequestPlan,
@@ -284,13 +287,18 @@ impl StreamObserver {
         model: &str,
         rates: &Rates,
         complete: bool,
+        engine_cached: Option<u64>,
     ) -> Record {
         // Prefer the retained usage event; fall back to the (bounded) tail.
         let doc = self
             .usage_doc
             .clone()
             .unwrap_or_else(|| last_json_event(&self.tail));
-        let (cached_tokens, cache_written_tokens, source) = observe_doc(adapter, &doc);
+        let (mut cached_tokens, cache_written_tokens, mut source) = observe_doc(adapter, &doc);
+        if let Some(n) = engine_cached {
+            cached_tokens = n;
+            source = SourceLabel::EngineMeasured;
+        }
         let billed = billed_from_doc(&doc).unwrap_or(plan.resent_history_tokens);
         let obs = Observation {
             ttft_ms: self.ttft_ms,
@@ -327,12 +335,35 @@ struct Finalizer<A: Adapter> {
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
+    /// vLLM metrics sampling: the client, the `/metrics` URL, and the counter
+    /// snapshot taken just before the request. `None` for other backends.
+    metrics: Option<(reqwest::Client, String, crate::adapters::vllm::PromCounters)>,
 }
 
 impl<A: Adapter> Finalizer<A> {
     /// Record the turn once. `complete` is true only when the upstream stream
     /// finished cleanly and answered 2xx.
     fn finish(&mut self, complete: bool) {
+        self.record(complete, None);
+    }
+
+    /// Record a vLLM turn, using the `/metrics` counter delta as the cache
+    /// figure when one is available. The delta is the only per-turn cache
+    /// measurement vLLM exposes (its response body carries none). Async because
+    /// it takes the "after" scrape; only called on the clean-completion path,
+    /// where the engine has finished updating its counters. A cut stream is an
+    /// Incomplete turn and takes no delta.
+    async fn finish_with_metrics(&mut self, complete: bool) {
+        let delta = match &self.metrics {
+            Some((client, url, before)) if complete => sample_prom(client, url)
+                .await
+                .map(|after| crate::adapters::vllm::PromCounters::delta_hits(*before, after)),
+            _ => None,
+        };
+        self.record(complete, delta);
+    }
+
+    fn record(&mut self, complete: bool, engine_cached: Option<u64>) {
         if self.done {
             return;
         }
@@ -343,6 +374,7 @@ impl<A: Adapter> Finalizer<A> {
             &self.model,
             &self.rates,
             complete,
+            engine_cached,
         );
         crate::export::log_finalize(&record);
         self.sessions.lock().append(record);
@@ -529,9 +561,27 @@ pub fn versioned_base(base: &str) -> String {
     }
 }
 
-/// The chat-completions URL for `base`. See [`versioned_base`].
+/// The `chat/completions` URL for `base`. See [`versioned_base`].
 fn upstream_chat_url(base: &str) -> String {
     format!("{}/chat/completions", versioned_base(base))
+}
+
+/// The engine's Prometheus endpoint, for backends that expose one (`vllm`).
+/// `/metrics` sits at the server origin, not under the OpenAI `/v1` prefix.
+fn upstream_metrics_url(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    let origin = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{origin}/metrics")
+}
+
+/// Sample the engine's Prometheus counters once. `None` on any failure; a
+/// missing scrape is a missing measurement, never a wrong one.
+async fn sample_prom(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<crate::adapters::vllm::PromCounters> {
+    let text = client.get(url).send().await.ok()?.text().await.ok()?;
+    Some(crate::adapters::vllm::PromCounters::parse(&text))
 }
 
 /// Ensure an OpenAI-dialect streaming request reports usage.
@@ -595,6 +645,17 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Forward first. The request body is passed through untouched; auth and
     // provider-identification headers are forwarded so cloud keys keep working.
     let url = upstream_chat_url(&state.upstream_url);
+    // vLLM exposes no per-request cache figure in the response; the only
+    // measurement is the delta of its `/metrics` counters across the request.
+    // Snapshot before we forward, for backends that have the endpoint.
+    let metrics = if state.adapter.name() == "vllm" {
+        let url = upstream_metrics_url(&state.upstream_url);
+        sample_prom(&state.client, &url)
+            .await
+            .map(|before| (state.client.clone(), url, before))
+    } else {
+        None
+    };
     let mut req = state
         .client
         .post(&url)
@@ -658,6 +719,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             sessions,
             complete: true,
             done: false,
+            metrics,
         };
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
@@ -672,7 +734,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             }
         }
         let complete = fin.complete && upstream_ok;
-        fin.finish(complete);
+        fin.finish_with_metrics(complete).await;
     };
 
     Response::builder()
@@ -871,7 +933,14 @@ mod tests {
         o.on_chunk(
             b"data: {\"usage\":{\"prompt_tokens\":2140,\"prompt_tokens_details\":{\"cached_tokens\":1455}}}\n\n",
         );
-        let r = o.finalize(&plan, &OpenAiAdapter, "gpt-4o", &Rates::builtin(), true);
+        let r = o.finalize(
+            &plan,
+            &OpenAiAdapter,
+            "gpt-4o",
+            &Rates::builtin(),
+            true,
+            None,
+        );
         assert_eq!(r.cached_tokens, 1455);
         assert_eq!(r.billed_input_tokens, 2140);
         assert_eq!(r.resent_history_tokens, 1810);
@@ -946,6 +1015,7 @@ mod tests {
             "claude-3-5-sonnet",
             &Rates::builtin(),
             true,
+            None,
         );
         assert_eq!(r.cached_tokens, 900);
         assert_eq!(r.cache_written_tokens, 300, "creation split recorded");

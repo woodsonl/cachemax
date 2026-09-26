@@ -13,7 +13,7 @@ use cachemax::tokenize::Tokenizer;
 
 use axum::body::Body;
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -529,5 +529,130 @@ async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
         r.status,
         cachemax::record::Status::Incomplete,
         "a 401 is not a complete measured turn"
+    );
+}
+
+/// vLLM exposes no per-request cache figure in its response. The proxy must
+/// sample `/metrics` before and after the request and record the counter delta.
+/// This drives a fake vLLM that serves both `/metrics` (advancing on each
+/// scrape) and `/v1/chat/completions`, and asserts the recorded cached tokens
+/// equal the delta and carry the engine-measured label.
+#[tokio::test]
+async fn vllm_metrics_delta_is_wired_into_the_record() {
+    use cachemax::adapters::vllm::VllmAdapter;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // hits advances by 455 between the before and after scrape.
+    static SCRAPE: AtomicU64 = AtomicU64::new(0);
+    let metrics = move || {
+        // Each scrape advances hits by 455, so each request's delta is 455.
+        let n = SCRAPE.fetch_add(1, Ordering::SeqCst) + 1;
+        let hits = 1000 + n * 455;
+        format!("vllm:prefix_cache_queries_total 2000.0\nvllm:prefix_cache_hits_total {hits}.0\n")
+    };
+    let app = Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let body = metrics();
+                async move { body }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    ));
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let u = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.unwrap();
+    });
+
+    let sessions = Arc::new(SharedSessions::new());
+    let state = Arc::new(proxy::AppState {
+        adapter: Arc::new(VllmAdapter),
+        tokenizer: Tokenizer::default_encoder().unwrap(),
+        sessions: sessions.clone(),
+        rates: cachemax::rates::Rates::builtin(),
+        // Includes /v1 so the metrics URL strips it back to the origin.
+        upstream_url: format!("http://{u}/v1"),
+        client: reqwest::Client::new(),
+        inject_usage: true,
+    });
+    let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr = pl.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(pl, proxy::router(state)).await.unwrap();
+    });
+
+    // Two turns so turn 1 has re-sent history; the engine-measured clamp is to
+    // the history span, so a turn-0 request would legitimately clamp to 0.
+    let long = "x".repeat(4000);
+    let body1 = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": long},
+            {"role": "user", "content": "first"}
+        ]
+    })
+    .to_string();
+    let body2 = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": long},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"}
+        ]
+    })
+    .to_string();
+
+    for body in [body1, body2] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{paddr}/v1/chat/completions"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let _ = resp.bytes().await.unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let done = sessions
+            .0
+            .lock()
+            .unwrap()
+            .most_recent()
+            .map(|s| s.records.len() >= 2)
+            .unwrap_or(false);
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the vLLM turns were never recorded within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let guard = sessions.0.lock().unwrap();
+    let r = guard.most_recent().unwrap().records.last().unwrap();
+    assert_eq!(r.source, cachemax::record::SourceLabel::EngineMeasured);
+    // The delta over the second request is 455 (hits 1000 -> 1455), and the
+    // re-sent history exceeds that, so the recorded figure is the raw delta.
+    assert_eq!(
+        r.cached_tokens, 455,
+        "recorded figure is the /metrics delta"
     );
 }
