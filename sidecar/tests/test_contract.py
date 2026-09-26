@@ -67,10 +67,14 @@ def test_max_tokens_is_honoured_as_an_input():
 
 
 def test_engine_sees_the_messages():
-    engine = FakeEngine(reply="ok")
-    app_client = TestClient(build_app(engine))
-    app_client.post(
+    # The prompt-token count is derived from message content, so a longer
+    # message must produce a larger reported prompt size.
+    short = client().post(
         "/v1/chat/completions",
-        json={"model": "m", "messages": [{"role": "user", "content": "abc"}]},
-    )
-    assert engine._calls == 1
+        json={"model": "m", "messages": [{"role": "user", "content": "a"}]},
+    ).json()
+    long = client().post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "a" * 400}]},
+    ).json()
+    assert long["usage"]["prompt_tokens"] > short["usage"]["prompt_tokens"]

@@ -47,10 +47,8 @@ class FakeEngine:
 
     reply: str = "ok"
     ttft_ms: float = 1.0
-    _calls: int = field(default=0, init=False)
 
     def generate(self, messages: list[dict], max_tokens: int) -> Completion:
-        self._calls += 1
         prompt = sum(len(str(m.get("content", ""))) for m in messages)
         return Completion(
             text=self.reply,
@@ -117,7 +115,6 @@ class MlxEngine:
 
 def _apply_chat_template(tokenizer: object, messages: list[dict]) -> str:
     """Render `messages` with the model's chat template when it has one."""
-    apply = getattr(tokenizer, "apply_chat_template", None)
-    if callable(apply):
+    if apply := getattr(tokenizer, "apply_chat_template", None):
         return apply(messages, add_generation_prompt=True, tokenize=False)
     return "\n".join(f"{m.get('role')}: {m.get('content')}" for m in messages)

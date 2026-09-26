@@ -2,14 +2,12 @@
 
 mlx-lm exposes no cache truth, so there is no hit-rate number. It does expose
 per-token timing, so the sidecar reports per-turn TTFT and the warm/cold ratio.
-It does NOT assert a speedup threshold: measured on real mlx-lm (0.5B model,
-600-4000 tokens), warm/cold ratios cluster around 1.0x because prefill is a
-small share of first-token latency at these sizes. Reporting the number is the
-contract; a guaranteed speedup is not.
+It does NOT assert a speedup threshold; reporting the number is the contract.
 """
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 
 from .engine import Engine
@@ -27,13 +25,7 @@ class Discrimination:
 
     @property
     def median_ratio(self) -> float:
-        if not self.ratios:
-            return 0.0
-        ordered = sorted(self.ratios)
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[mid]
-        return (ordered[mid - 1] + ordered[mid]) / 2.0
+        return statistics.median(self.ratios) if self.ratios else 0.0
 
 
 def _prompt(size: int) -> list[dict]:
