@@ -214,19 +214,19 @@ Local binary binds loopback by default, with no auth (single user, no multi-user
 Synthesized from the design review's findings. Each task derives from a specific
 finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~1h / CC: ~10min)** — dashboard — build the hero-first single-screen layout (status strip, hero band, session view, prefix tape)
+- [x] **T1 (P1, human: ~1h / CC: ~10min)** — dashboard — build the hero-first single-screen layout (status strip, hero band, session view, prefix tape)
   - Surfaced by: Pass 1 (Info Arch 3/10): no hierarchy or layout specified
   - Files: `src/dashboard.rs`
   - Verify: all four regions render; no navigation; hero weights by backend
-- [ ] **T2 (P1, human: ~1h / CC: ~10min)** — dashboard — implement the interaction state table (loading/empty/error/success/partial) for every surface
+- [x] **T2 (P1, human: ~1h / CC: ~10min)** — dashboard — implement the interaction state table (loading/empty/error/success/partial) for every surface
   - Surfaced by: Pass 2 (States 2/10): no loading/empty/error states; reset banner and session break undrawn
   - Files: `src/dashboard.rs`
   - Verify: each state in the table renders; `—` never `0`; reset banner + session break appear
-- [ ] **T3 (P2, human: ~30min / CC: ~5min)** — dashboard — make the cloud journey's "is it alive" signal land on turn 0 and the cost payoff on turn 1
+- [x] **T3 (P2, human: ~30min / CC: ~5min)** — dashboard — make the cloud journey's "is it alive" signal land on turn 0 and the cost payoff on turn 1
   - Surfaced by: Pass 3 (Journey 2/10): no emotional arc; first-turn liveness unaddressed
   - Files: `src/dashboard.rs`
   - Verify: cold turn (t0) shows activity within one turn; first warm turn (t1) shows hit rate + the mode's source label (`provider_reported` cloud, `engine_measured` local)
-- [ ] **T4 (P1, human: ~1h / CC: ~10min)** — dashboard — responsive + a11y contract (1024px floor, stack below, keyboard, contrast, tabular numerals, 44px targets, light/dark via `prefers-color-scheme`)
+- [x] **T4 (P1, human: ~1h / CC: ~10min)** — dashboard — responsive + a11y contract (1024px floor, stack below, keyboard, contrast, tabular numerals, 44px targets, light/dark via `prefers-color-scheme`)
   - Surfaced by: Pass 6 (Responsive 2/10): no viewport/a11y spec
   - Files: `src/dashboard.rs`
   - Verify: keyboard-only walkthrough; contrast check; both themes render

@@ -139,6 +139,8 @@
 (function(){
   var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?"};
   var lastTurnCount = -1;
+  var lastSessionId = null;   // for session-break detection
+  var sawSession = false;     // for metrics-reset detection
 
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];}); }
 
@@ -188,16 +190,30 @@
     document.getElementById("foot-live").textContent = state.live ? "● live" : "idle";
     document.getElementById("foot-url").textContent = location.host;
 
-    var empty = !state.turns.length;
-    document.getElementById("banner").style.display = empty ? "" : "none";
-    if(empty){
-      document.getElementById("banner").textContent =
-        "No session yet. Point your app or agent at " + location.origin + " and send a request.";
-    }
-
     renderTurns(state);
     renderTape(state.tape);
     lastTurnCount = state.turns.length ? state.turns[state.turns.length-1].turn : -1;
+
+    // Ephemeral-state banners (DESIGN state table).
+    var banner = document.getElementById("banner");
+    var notes = [];
+    if(!state.turns.length){
+      banner.style.display = "";
+      banner.textContent = "No session yet. Point your app or agent at " + location.origin + " and send a request.";
+    } else {
+      // Metrics reset: the proxy restarted and its in-memory state is gone.
+      if(sawSession && state.session_id === 0){
+        notes.push("Metrics reset — the proxy restarted; state is ephemeral by design.");
+      }
+      // Session break: a new session id appeared mid-view (engine restart).
+      if(lastSessionId !== null && state.session_id !== lastSessionId && state.session_id !== 0){
+        notes.push("Session break — a new session started (engine or conversation restart).");
+      }
+      banner.style.display = notes.length ? "" : "none";
+      banner.textContent = notes.join(" ");
+    }
+    if(state.session_id !== 0){ sawSession = true; }
+    lastSessionId = state.session_id;
   }
 
   async function poll(){

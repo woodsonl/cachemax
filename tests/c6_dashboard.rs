@@ -141,6 +141,23 @@ fn every_tape_state_renders_distinctly_without_color() {
     assert_eq!(sorted.len(), glyphs.len());
 }
 
+/// A complete cloud record with a cost, for the state-legendity tests.
+fn rec(turn: u32, cached: u64, history: u64) -> Record {
+    Record {
+        session_id: 1,
+        turn,
+        status: Status::Complete,
+        source: SourceLabel::ProviderReported,
+        ttft_ms: Some(120.0),
+        cached_tokens: cached,
+        cache_written_tokens: 0,
+        resent_history_tokens: history,
+        billed_input_tokens: history + 200,
+        cost_usd: Some(0.01),
+        cost_saved_usd: Some(0.005),
+    }
+}
+
 #[test]
 fn hash_level_mode_prints_no_fake_byte_detail() {
     let r = Record {
@@ -198,4 +215,105 @@ fn no_ad_hoc_colors_in_embedded_page() {
         }
     }
     let _ = hex_lines;
+}
+
+// --- T2: interaction states ---
+
+#[test]
+fn t2_empty_state_has_no_rows_and_dash_convention() {
+    let v = dashboard::view(&[], false, 0);
+    assert_eq!(v.turns.len(), 0);
+    assert_eq!(v.hit_rate, "—", "empty state is unexposed, never 0");
+    assert_eq!(v.cost_saved, "—");
+    assert_eq!(v.session_id, 0);
+}
+
+#[test]
+fn t2_partial_state_excludes_incomplete_from_cumulative() {
+    let mut inc = rec(2, 0, 0);
+    inc.status = Status::Incomplete;
+    let rs = vec![rec(1, 1000, 2000), inc];
+    let v = dashboard::view(&rs, true, 1);
+    assert_eq!(v.incomplete_count, 1);
+    // cumulative is 1000/2000 = 50%, the incomplete row contributes nothing
+    assert_eq!(v.cumulative.cached_over_history, "1,000 / 2,000");
+    assert_eq!(v.hit_rate, "50%");
+}
+
+#[test]
+fn t2_page_draws_reset_banner_and_session_break() {
+    let html = dashboard::DASHBOARD_HTML;
+    assert!(html.contains("Metrics reset"), "must draw the reset banner");
+    assert!(
+        html.contains("Session break"),
+        "must draw the session break"
+    );
+}
+
+// --- T3: cloud journey liveness + payoff ---
+
+#[test]
+fn t3_cold_turn_shows_activity_and_warm_turn_shows_payoff() {
+    // Turn 0: activity (a cold tape run and a row), no hit number yet.
+    let t0 = rec(0, 0, 0);
+    let v0 = dashboard::view(std::slice::from_ref(&t0), true, 1);
+    assert_eq!(v0.turns.len(), 1, "turn 0 is an activity row, not blank");
+    assert!(
+        v0.tape[0].cells.iter().all(|c| *c == TapeState::Cold),
+        "turn 0 shows a cold tape run"
+    );
+    assert_eq!(v0.turns[0].hit, "—", "no hit rate on the cold turn");
+
+    // Turn 1: the payoff — hit rate + the provider_reported label.
+    let rs = vec![t0, rec(1, 1020, 1550)];
+    let v1 = dashboard::view(&rs, true, 1);
+    assert_eq!(v1.provenance, "provider_reported");
+    assert_eq!(v1.turns[1].hit, "66%", "first warm turn shows its hit rate");
+}
+
+// --- T4: responsive + a11y contract ---
+
+#[test]
+fn t4_page_covers_the_responsive_and_a11y_contract() {
+    let html = dashboard::DASHBOARD_HTML;
+    // 1024px floor, stack below.
+    assert!(
+        html.contains("@media (max-width:1024px)"),
+        "must stack below 1024px"
+    );
+    // Keyboard-reachable rows and cells.
+    assert!(
+        html.contains("tabindex=\"0\""),
+        "rows/cells must be focusable"
+    );
+    // Focus ring always visible.
+    assert!(html.contains(":focus-visible"), "must define focus-visible");
+    assert!(
+        html.contains("outline:2px solid var(--accent)"),
+        "focus ring in accent"
+    );
+    // 44px targets on controls.
+    assert!(
+        html.contains("min-height:44px"),
+        "controls need a 44px target"
+    );
+    assert!(
+        html.contains("min-width:44px"),
+        "controls need a 44px target"
+    );
+    // Tabular numerals on all figures.
+    assert!(
+        html.contains("font-variant-numeric:tabular-nums"),
+        "figures must use tabular numerals"
+    );
+    // Light + dark via prefers-color-scheme.
+    assert!(
+        html.contains("prefers-color-scheme"),
+        "must follow the OS theme"
+    );
+    // Reduced motion respected.
+    assert!(
+        html.contains("prefers-reduced-motion"),
+        "must respect reduced motion"
+    );
 }
