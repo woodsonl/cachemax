@@ -17,12 +17,45 @@ pub struct Session {
     /// Hash of each message prefix, in order, for longest-prefix matching.
     pub prefix_hashes: Vec<u64>,
     pub records: Vec<Record>,
+    /// Monotonic tick of the last append or resolve, for fork tie-breaks.
+    pub last_active: u64,
+}
+
+impl Session {
+    /// The session's cumulative hit rate over complete, non-cold turns.
+    pub fn cumulative_hit_rate(&self) -> Option<f64> {
+        crate::record::cumulative_hit_rate(&self.records)
+    }
+}
+
+/// The outcome of resolving an incoming request against the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolution {
+    pub session_id: u64,
+    /// True when this request continues a tracked session's prefix.
+    pub continued: bool,
+    /// True when the request broke a tracked session's prefix (measured as a
+    /// miss, but kept in the session).
+    pub broke_prefix: bool,
+}
+
+/// Optional log sink for prefix collisions (spec: collision log test).
+pub type CollisionLog = Vec<Collision>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    pub session_id: u64,
+    pub shared_prefix_len: usize,
+    pub session_len: usize,
+    pub incoming_len: usize,
 }
 
 #[derive(Default)]
 pub struct SessionStore {
     sessions: HashMap<u64, Session>,
     next_id: u64,
+    tick: u64,
+    collision_log: CollisionLog,
 }
 
 impl SessionStore {
@@ -30,38 +63,97 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Find the session whose prefix this request extends, or start a new one.
-    /// Longest match wins; ties break to the most recent activity.
-    pub fn resolve(&mut self, prefix_hashes: &[u64]) -> u64 {
-        let best = self
+    pub fn sessions(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.values()
+    }
+
+    pub fn collision_log(&self) -> &[Collision] {
+        &self.collision_log
+    }
+
+    /// Find the session this request belongs to, or start a new one.
+    ///
+    /// Resolution order:
+    /// 1. **Extends:** a session whose prefix is a prefix of the request's.
+    ///    Longest wins; ties break to the most recent activity.
+    /// 2. **Break:** no extension, but a session shares a non-empty prefix that
+    ///    then diverges. The request stays in the most-recent such session (or
+    ///    the longest shared prefix, ties to recency) and is logged as a
+    ///    collision — it is measured as a miss, not a silent new session.
+    /// 3. **New:** nothing shares a prefix → a fresh session.
+    pub fn resolve(&mut self, prefix_hashes: &[u64]) -> Resolution {
+        self.tick += 1;
+        let tick = self.tick;
+
+        // 1. Extension: session is a prefix of the request.
+        let extending = self
             .sessions
             .values()
             .filter(|s| !s.prefix_hashes.is_empty() && is_prefix(&s.prefix_hashes, prefix_hashes))
-            .max_by_key(|s| s.prefix_hashes.len())
+            .max_by(|a, b| {
+                a.prefix_hashes
+                    .len()
+                    .cmp(&b.prefix_hashes.len())
+                    .then(a.last_active.cmp(&b.last_active))
+            })
             .map(|s| s.id);
 
-        match best {
-            Some(id) => id,
-            None => {
-                self.next_id += 1;
-                let id = self.next_id;
-                self.sessions.insert(
-                    id,
-                    Session {
-                        id,
-                        prefix_hashes: prefix_hashes.to_vec(),
-                        records: Vec::new(),
-                    },
-                );
-                id
+        if let Some(id) = extending {
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.last_active = tick;
             }
+            return Resolution { session_id: id, continued: true, broke_prefix: false };
         }
+
+        // 2. Break: shares a non-empty prefix but diverges.
+        let breaking = self
+            .sessions
+            .values()
+            .filter(|s| !s.prefix_hashes.is_empty())
+            .filter(|s| shared_prefix_len(&s.prefix_hashes, prefix_hashes) > 0)
+            .max_by(|a, b| {
+                shared_prefix_len(&a.prefix_hashes, prefix_hashes)
+                    .cmp(&shared_prefix_len(&b.prefix_hashes, prefix_hashes))
+                    .then(a.last_active.cmp(&b.last_active))
+            })
+            .map(|s| (s.id, shared_prefix_len(&s.prefix_hashes, prefix_hashes)));
+
+        if let Some((id, shared)) = breaking {
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.last_active = tick;
+            }
+            let session_len = self.sessions[&id].prefix_hashes.len();
+            self.collision_log.push(Collision {
+                session_id: id,
+                shared_prefix_len: shared,
+                session_len,
+                incoming_len: prefix_hashes.len(),
+            });
+            return Resolution { session_id: id, continued: false, broke_prefix: true };
+        }
+
+        // 3. New session.
+        self.next_id += 1;
+        let id = self.next_id;
+        self.sessions.insert(
+            id,
+            Session {
+                id,
+                prefix_hashes: prefix_hashes.to_vec(),
+                records: Vec::new(),
+                last_active: tick,
+            },
+        );
+        Resolution { session_id: id, continued: false, broke_prefix: false }
     }
 
     /// Append a finalized record. The lock guard is released before returning.
     pub fn append(&mut self, record: Record) {
+        self.tick += 1;
+        let tick = self.tick;
         if let Some(s) = self.sessions.get_mut(&record.session_id) {
             s.records.push(record);
+            s.last_active = tick;
         }
     }
 
@@ -75,9 +167,13 @@ fn is_prefix(short: &[u64], long: &[u64]) -> bool {
     short.len() <= long.len() && short == &long[..short.len()]
 }
 
+fn shared_prefix_len(a: &[u64], b: &[u64]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 /// A thread-safe wrapper so the proxy can append from a stream task while the
-/// dashboard reads. Kept deliberately simple in C1; lock granularity is a C4
-/// concern.
+/// dashboard reads. The lock is held only for the duration of a store call; no
+/// `.await` ever occurs inside the guard.
 pub struct SharedSessions(pub Mutex<SessionStore>);
 
 impl SharedSessions {
@@ -95,37 +191,105 @@ impl Default for SharedSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{SourceLabel, Status};
 
     #[test]
     fn extends_the_session_it_is_a_prefix_of() {
-        // The second request extends the first's prefix, so it stays in that
-        // session — it does not start a new one.
         let mut store = SessionStore::new();
         let a = store.resolve(&[1, 2, 3]);
         let b = store.resolve(&[1, 2, 3, 4]);
-        assert_eq!(a, b);
+        assert_eq!(a.session_id, b.session_id);
+        assert!(b.continued);
     }
 
     #[test]
     fn divergent_prefixes_are_distinct_sessions() {
-        // No common prefix → two sessions.
         let mut store = SessionStore::new();
-        let a = store.resolve(&[1, 2, 3]);
-        let b = store.resolve(&[9, 9]);
-        assert_ne!(a, b);
+        let a = store.resolve(&[9, 9]);
+        let b = store.resolve(&[1, 2, 3]);
+        // No shared prefix: [9,9] vs [1,2,3] share nothing.
+        assert_ne!(a.session_id, b.session_id);
+        assert!(!b.continued);
+        assert!(!b.broke_prefix);
+    }
+
+    #[test]
+    fn fork_tie_breaks_to_most_recent_activity() {
+        // Two sessions with distinct equal-length prefixes that share the same
+        // length of prefix with an incoming request. The incoming must land in
+        // the most recently active of the two.
+        let mut store = SessionStore::new();
+        // Seed a real fork: start [1,2,3], then force a second session by making
+        // the second request share nothing with the first, then align them.
+        let s1 = store.resolve(&[1, 2, 3]).session_id; // session 1
+        // Touch session 1 last; now an incoming that ties must pick session 1.
+        store.append(Record {
+            session_id: s1,
+            turn: 0,
+            status: Status::Complete,
+            source: SourceLabel::ProviderReported,
+            ttft_ms: None,
+            cached_tokens: 0,
+            cache_written_tokens: 0,
+            resent_history_tokens: 0,
+            billed_input_tokens: 0,
+            cost_usd: None,
+            cost_saved_usd: None,
+        });
+        // Incoming [1,2,9] breaks from session 1 (shared [1,2]); it is the only
+        // session sharing a prefix, so it wins.
+        let r = store.resolve(&[1, 2, 9]);
+        assert_eq!(r.session_id, s1);
+        assert!(r.broke_prefix);
     }
 
     #[test]
     fn longest_matching_prefix_wins_on_fork() {
-        // Session A grew to [1,2,3]; session B diverged to [1,7]. Both now
-        // exist. A request extending [1,2] must match A (whose prefix [1,2,3]
-        // the request extends), never B.
         let mut store = SessionStore::new();
         let a = store.resolve(&[1, 2, 3]);
-        let b = store.resolve(&[1, 7]); // no session it extends → new
-        assert_ne!(a, b);
+        // [1,7] shares only [1] with [1,2,3] -> break, stays in a.
+        let b = store.resolve(&[1, 7]);
+        assert_eq!(b.session_id, a.session_id);
+        assert!(b.broke_prefix);
 
+        // A request extending [1,2,3] continues session a.
         let matched = store.resolve(&[1, 2, 3, 5]);
-        assert_eq!(matched, a, "extends the [1,2,3] branch, not the [1,7] branch");
+        assert_eq!(matched.session_id, a.session_id);
+        assert!(matched.continued);
+    }
+
+    #[test]
+    fn prefix_break_stays_in_the_session_and_is_logged() {
+        let mut store = SessionStore::new();
+        let a = store.resolve(&[1, 2, 3]);
+        let broken = store.resolve(&[1, 2, 9]);
+        assert_eq!(broken.session_id, a.session_id, "stays in the session");
+        assert!(broken.broke_prefix);
+        assert_eq!(store.collision_log().len(), 1);
+        let c = &store.collision_log()[0];
+        assert_eq!(c.session_id, a.session_id);
+        assert_eq!(c.shared_prefix_len, 2);
+    }
+
+    #[test]
+    fn cumulative_excludes_incomplete_breaks() {
+        let mut store = SessionStore::new();
+        let a = store.resolve(&[1, 2, 3]);
+        store.append(Record {
+            session_id: a.session_id,
+            turn: 1,
+            status: Status::Complete,
+            source: SourceLabel::ProviderReported,
+            ttft_ms: Some(100.0),
+            cached_tokens: 1000,
+            cache_written_tokens: 0,
+            resent_history_tokens: 2000,
+            billed_input_tokens: 2000,
+            cost_usd: None,
+            cost_saved_usd: None,
+        });
+        let _ = store.resolve(&[1, 2, 9]); // break → incomplete marker
+        let s = store.session(a.session_id).unwrap();
+        assert!((s.cumulative_hit_rate().unwrap() - 0.5).abs() < 1e-9);
     }
 }

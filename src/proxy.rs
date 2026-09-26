@@ -54,7 +54,8 @@ pub fn plan_request(
     messages: &[Message],
 ) -> RequestPlan {
     let hashes = tokenizer.prefix_hashes(messages);
-    let session_id = store.resolve(&hashes);
+    let resolution = store.resolve(&hashes);
+    let session_id = resolution.session_id;
     let session = store.session(session_id);
     let turn = session.map(|s| s.records.len() as u32).unwrap_or(0);
     // History is the span prior turns established. On a cold turn (no prior
