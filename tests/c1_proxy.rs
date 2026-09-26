@@ -187,6 +187,130 @@ async fn ttft_is_not_total_time() {
 }
 
 #[tokio::test]
+async fn client_disconnect_still_records_an_incomplete_turn() {
+    // The upstream holds the stream open after one chunk. The client reads that
+    // chunk then drops the response (disconnects). The turn must still be
+    // recorded, as Incomplete — before this fix the finalize lived after the
+    // read loop and never ran on a dropped stream, so nothing was recorded.
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n",
+                ));
+                // Keep the stream open; the client will disconnect.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            };
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let u = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.unwrap();
+    });
+
+    let (proxy_url, sessions) = boot_proxy_with_state(format!("http://{u}")).await;
+    {
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/v1/chat/completions"))
+            .body(request_body())
+            .send()
+            .await
+            .unwrap();
+        let mut s = resp.bytes_stream();
+        // Read one chunk, then drop the response to simulate disconnect.
+        let _ = s.next().await;
+    } // resp dropped here
+
+    // Give the proxy a moment to observe the disconnect and finalize.
+    let mut recorded = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let guard = sessions.lock();
+        if guard.most_recent().map(|s| {
+            s.records
+                .iter()
+                .any(|r| r.status == cachemax::record::Status::Incomplete)
+        }) == Some(true)
+        {
+            recorded = true;
+            break;
+        }
+    }
+    assert!(
+        recorded,
+        "a client disconnect must still record an Incomplete turn"
+    );
+}
+
+#[tokio::test]
+async fn early_usage_survives_large_content_that_exceeds_the_tail_cap() {
+    // Usage arrives first (Anthropic-style), then >64 KB of content evicts the
+    // front of the retained tail. The cache figure must still be observed.
+    let mut events: Vec<Bytes> = vec![
+        Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":2140,\"prompt_tokens_details\":{\"cached_tokens\":1455}}}\n\n",
+        ),
+    ];
+    for _ in 0..8 {
+        events.push(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+            "x".repeat(10_000)
+        )));
+    }
+    events.push(Bytes::from_static(b"data: [DONE]\n\n"));
+
+    let upstream = fake_upstream(events, Duration::from_millis(1)).await;
+    let (proxy_url, sessions) = boot_proxy_with_state(upstream).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/chat/completions"))
+        .body(request_body())
+        .send()
+        .await
+        .unwrap();
+    let mut s = resp.bytes_stream();
+    while let Some(_c) = s.next().await {}
+    // Let finalize run, then inspect the recorded cache figure.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let guard = sessions.lock();
+    let cached: u64 = guard
+        .most_recent()
+        .map(|s| s.records.iter().map(|r| r.cached_tokens).max().unwrap_or(0))
+        .unwrap_or(0);
+    drop(guard);
+    assert_eq!(
+        cached, 1455,
+        "an early usage event must survive tail eviction"
+    );
+}
+
+/// Boot the proxy and also return its session store, for assertions.
+async fn boot_proxy_with_state(upstream: String) -> (String, Arc<SharedSessions>) {
+    let sessions = Arc::new(SharedSessions::new());
+    let state = Arc::new(proxy::AppState {
+        adapter: Arc::new(OpenAiAdapter),
+        tokenizer: Tokenizer::default_encoder().unwrap(),
+        sessions: sessions.clone(),
+        rates: cachemax::rates::Rates::builtin(),
+        upstream_url: upstream,
+        client: reqwest::Client::new(),
+        inject_usage: true,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, proxy::router(state)).await.unwrap();
+    });
+    (format!("http://{addr}"), sessions)
+}
+
+#[tokio::test]
 async fn incomplete_upstream_stream_is_recorded_incomplete() {
     // An upstream that drops mid-stream yields an incomplete record, not a hang
     // and not a crash.
