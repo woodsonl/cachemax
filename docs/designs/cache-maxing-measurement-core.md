@@ -13,7 +13,7 @@ It measures. Repair is a later phase.
 
 ## Who uses it
 
-- **Typical user:** points an app or agent at the proxy instead of directly at a cloud LLM (OpenAI or Anthropic). Wants to know how much prompt-cache reuse they get and what it costs.
+- **Typical user:** points an app or agent at the proxy instead of directly at a cloud LLM (OpenAI, Anthropic, or OpenRouter). Wants to know how much prompt-cache reuse they get and what it costs.
 - **Minority user:** runs a local engine (llama.cpp, mlx-lm, vLLM) and watches TTFT collapse as the cache warms.
 
 Both are first-class targets. Local is where token-space verification is provable: the engine reports real cached-token counts. Cloud is where most users are.
@@ -26,7 +26,7 @@ Every LLM API is stateless, so clients re-send the whole conversation each turn.
 
 | Backend | Hero metric | Why |
 |---|---|---|
-| Cloud (OpenAI, Anthropic) | **Cost**: billed input tokens saved | Warm turns cut billed input; TTFT barely moves when RTT dominates |
+| Cloud (OpenAI, Anthropic, OpenRouter) | **Cost**: billed input tokens saved | Warm turns cut billed input; TTFT barely moves when RTT dominates |
 | Local (llama.cpp, mlx-lm, vLLM) | **Speed**: TTFT collapse cold to warm | The proxy's overhead is a visible share of TTFT |
 
 The dashboard shows both; the hero surface weights by backend.
