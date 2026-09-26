@@ -138,6 +138,8 @@ pub struct DashboardState {
     pub tape_mode: String,
     pub incomplete_count: usize,
     pub session_count: usize,
+    /// The session this view summarizes (0 when empty).
+    pub session_id: u64,
     /// Cloud hero: cost saved (formatted).
     pub cost_saved: String,
     /// Cloud hero: billed input tokens (formatted).
@@ -225,6 +227,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         tape_mode: "hash".to_string(),
         incomplete_count,
         session_count,
+        session_id: records.first().map(|r| r.session_id).unwrap_or(0),
         cost_saved: if has_cost {
             format_usd(Some(cost_saved_sum))
         } else {

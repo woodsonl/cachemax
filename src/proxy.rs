@@ -389,11 +389,11 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 state.adapter.source(),
                 false,
             );
+            crate::export::log_finalize(&record);
             state.sessions.0.lock().unwrap().append(record);
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();
         }
     };
-
     let status = upstream.status();
     let mut upstream_stream = upstream.bytes_stream();
 
@@ -418,6 +418,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             }
         }
         let record = observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete);
+        crate::export::log_finalize(&record);
         sessions.0.lock().unwrap().append(record);
     };
 
