@@ -139,15 +139,15 @@ pub fn build_record(
     }
 }
 
-/// The cache signal an adapter reads from a response, factored out so the proxy
-/// and adapter share one path. `response_body` may be a single JSON document
-/// (non-streaming) or a buffered SSE tail; the usage-bearing event wins.
+/// The cache signal an adapter reads from a response. `response_body` may be a
+/// single JSON document (non-streaming) or a buffered SSE tail; the
+/// usage-bearing event wins. Callers that also need the reduced document (for
+/// billing) reduce the tail once and call [`observe_doc`] directly.
 pub fn observe<A: Adapter>(adapter: &A, response_body: &[u8]) -> (u64, u64, SourceLabel) {
     observe_doc(adapter, &last_json_event(response_body))
 }
 
-/// [`observe`] over an already-reduced JSON document, so a caller that also
-/// needs the document (e.g. for billing) reduces the tail only once.
+/// [`observe`] over an already-reduced JSON document.
 fn observe_doc<A: Adapter>(adapter: &A, doc: &[u8]) -> (u64, u64, SourceLabel) {
     let sig = adapter.cache_signal(doc);
     (
@@ -163,9 +163,7 @@ fn observe_doc<A: Adapter>(adapter: &A, doc: &[u8]) -> (u64, u64, SourceLabel) {
 /// parseable event. Usage arrives in the terminal event, so scanning from the
 /// end is both correct and cheap.
 fn last_json_event(body: &[u8]) -> Vec<u8> {
-    if body.first().map(|&b| b == b'{').unwrap_or(false)
-        && serde_json::from_slice::<serde_json::Value>(body).is_ok()
-    {
+    if body.starts_with(b"{") && serde_json::from_slice::<serde_json::Value>(body).is_ok() {
         return body.to_vec();
     }
     let mut fallback: Option<Vec<u8>> = None;

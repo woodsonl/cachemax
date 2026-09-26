@@ -40,8 +40,6 @@ pub struct Resolution {
 }
 
 /// Optional log sink for prefix collisions (spec: collision log test).
-pub type CollisionLog = Vec<Collision>;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collision {
     pub session_id: u64,
@@ -55,16 +53,12 @@ pub struct SessionStore {
     sessions: HashMap<u64, Session>,
     next_id: u64,
     tick: u64,
-    collision_log: CollisionLog,
+    collision_log: Vec<Collision>,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn sessions(&self) -> impl Iterator<Item = &Session> {
-        self.sessions.values()
     }
 
     pub fn collision_log(&self) -> &[Collision] {
@@ -186,12 +180,8 @@ impl SessionStore {
     }
 
     /// Number of tracked sessions.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.sessions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
     }
 }
 
