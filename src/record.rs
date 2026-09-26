@@ -44,12 +44,17 @@ pub struct Record {
     pub ttft_ms: Option<f64>,
     /// Provider- or engine-reported cached prefix tokens.
     pub cached_tokens: u64,
+    /// Prefix tokens written to cache this turn (Anthropic's creation count).
+    /// 0 where the provider exposes no write/premium distinction.
+    pub cache_written_tokens: u64,
     /// Binding denominator: system + all prior messages, excluding this turn's new content.
     pub resent_history_tokens: u64,
     /// Billed input tokens for this turn.
     pub billed_input_tokens: u64,
     /// Cost in USD at the provider's published rate, if known.
     pub cost_usd: Option<f64>,
+    /// Cost saved versus the no-cache counterfactual, if rates are known.
+    pub cost_saved_usd: Option<f64>,
 }
 
 impl Record {
@@ -98,7 +103,9 @@ mod tests {
             cached_tokens: cached,
             resent_history_tokens: history,
             billed_input_tokens: history + 200,
+            cache_written_tokens: 0,
             cost_usd: None,
+            cost_saved_usd: None,
         }
     }
 

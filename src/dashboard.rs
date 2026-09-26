@@ -52,7 +52,9 @@ mod tests {
             cached_tokens: cached,
             resent_history_tokens: history,
             billed_input_tokens: history + 200,
+            cache_written_tokens: 0,
             cost_usd: None,
+            cost_saved_usd: None,
         }
     }
 

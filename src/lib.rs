@@ -7,6 +7,7 @@ pub mod adapters;
 pub mod dashboard;
 pub mod export;
 pub mod proxy;
+pub mod rates;
 pub mod record;
 pub mod sessions;
 pub mod tokenize;

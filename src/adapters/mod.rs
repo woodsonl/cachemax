@@ -15,6 +15,9 @@ use crate::record::SourceLabel;
 pub struct CacheSignal {
     /// Prefix tokens served from cache, as reported by the provider or engine.
     pub cached_tokens: u64,
+    /// Prefix tokens written to cache this turn (Anthropic's creation count;
+    /// 0 where the provider exposes none).
+    pub written_tokens: u64,
     /// Where the number came from.
     pub source: Option<SourceLabel>,
 }
@@ -23,7 +26,17 @@ impl CacheSignal {
     pub fn reported(cached_tokens: u64, source: SourceLabel) -> Self {
         Self {
             cached_tokens,
+            written_tokens: 0,
             source: Some(source),
+        }
+    }
+
+    /// A reported signal that also carries a cache-write count (Anthropic).
+    pub fn reported_split(cached_tokens: u64, written_tokens: u64) -> Self {
+        Self {
+            cached_tokens,
+            written_tokens,
+            source: Some(SourceLabel::ProviderReported),
         }
     }
 
@@ -31,6 +44,7 @@ impl CacheSignal {
     pub fn none() -> Self {
         Self {
             cached_tokens: 0,
+            written_tokens: 0,
             source: Some(SourceLabel::NoCacheTruth),
         }
     }

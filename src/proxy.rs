@@ -11,6 +11,7 @@
 //! [`observe`], [`finalize`], [`RequestPlan`]) are tested without a socket.
 
 use crate::adapters::Adapter;
+use crate::rates::Rates;
 use crate::record::{Record, SourceLabel, Status};
 use crate::sessions::{SessionStore, SharedSessions};
 use crate::tokenize::{Message, Tokenizer};
@@ -80,18 +81,35 @@ fn shared_prefix_len(a: &[u64], b: &[u64]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// Build a record from the observed response. The pure seam C1 tests against,
-/// independent of the network.
-#[allow(clippy::too_many_arguments)]
+/// The raw observed figures for one turn, before cost is applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Observation {
+    pub ttft_ms: Option<f64>,
+    pub cached_tokens: u64,
+    pub cache_written_tokens: u64,
+    pub billed_input_tokens: u64,
+}
+
+/// Build a record from the observed response. The pure seam C1/C2 test against,
+/// independent of the network. `rates` prices the no-cache counterfactual when
+/// the model is known; unknown models simply carry no cost.
 pub fn build_record(
     plan: &RequestPlan,
-    ttft_ms: Option<f64>,
-    cached_tokens: u64,
-    billed_input_tokens: u64,
-    cost_usd: Option<f64>,
+    obs: Observation,
+    model: &str,
+    rates: &Rates,
     source: SourceLabel,
     complete: bool,
 ) -> Record {
+    let cost_usd = rates
+        .lookup(model)
+        .map(|r| r.input_cost(obs.billed_input_tokens));
+    let cost_saved_usd = rates.cost_saved(
+        model,
+        obs.cached_tokens,
+        plan.resent_history_tokens,
+        obs.cache_written_tokens,
+    );
     Record {
         session_id: plan.session_id,
         turn: plan.turn,
@@ -101,20 +119,26 @@ pub fn build_record(
             Status::Incomplete
         },
         source,
-        ttft_ms,
-        cached_tokens,
+        ttft_ms: obs.ttft_ms,
+        cached_tokens: obs.cached_tokens,
+        cache_written_tokens: obs.cache_written_tokens,
         resent_history_tokens: plan.resent_history_tokens,
-        billed_input_tokens,
+        billed_input_tokens: obs.billed_input_tokens,
         cost_usd,
+        cost_saved_usd,
     }
 }
 
 /// The cache signal an adapter reads from a response, factored out so the proxy
 /// and adapter share one path. `response_body` may be a single JSON document
-/// (non-streaming) or a buffered SSE tail; the last full `data:` event wins.
-pub fn observe<A: Adapter>(adapter: &A, response_body: &[u8]) -> (u64, SourceLabel) {
+/// (non-streaming) or a buffered SSE tail; the usage-bearing event wins.
+pub fn observe<A: Adapter>(adapter: &A, response_body: &[u8]) -> (u64, u64, SourceLabel) {
     let sig = adapter.cache_signal(&last_json_event(response_body));
-    (sig.cached_tokens, sig.source.unwrap_or_else(|| adapter.source()))
+    (
+        sig.cached_tokens,
+        sig.written_tokens,
+        sig.source.unwrap_or_else(|| adapter.source()),
+    )
 }
 
 /// Reduce a body to the most informative JSON document: the whole body if it is
@@ -196,19 +220,19 @@ impl StreamObserver {
         &self,
         plan: &RequestPlan,
         adapter: &A,
+        model: &str,
+        rates: &Rates,
         complete: bool,
     ) -> Record {
-        let (cached_tokens, source) = observe(adapter, &self.tail);
+        let (cached_tokens, cache_written_tokens, source) = observe(adapter, &self.tail);
         let billed = billed_from(&self.tail).unwrap_or(plan.resent_history_tokens);
-        build_record(
-            plan,
-            self.ttft_ms,
+        let obs = Observation {
+            ttft_ms: self.ttft_ms,
             cached_tokens,
-            billed,
-            None,
-            source,
-            complete,
-        )
+            cache_written_tokens,
+            billed_input_tokens: billed,
+        };
+        build_record(plan, obs, model, rates, source, complete)
     }
 }
 
@@ -230,6 +254,7 @@ pub struct AppState<A: Adapter> {
     pub adapter: Arc<A>,
     pub tokenizer: Tokenizer,
     pub sessions: Arc<SharedSessions>,
+    pub rates: Rates,
     pub upstream_url: String,
     pub client: reqwest::Client,
 }
@@ -239,6 +264,7 @@ pub struct AppState<A: Adapter> {
 pub async fn serve<A: Adapter + 'static>(
     adapter: A,
     tokenizer: Tokenizer,
+    rates: Rates,
     upstream_url: String,
     bind: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -246,6 +272,7 @@ pub async fn serve<A: Adapter + 'static>(
         adapter: Arc::new(adapter),
         tokenizer,
         sessions: Arc::new(SharedSessions::new()),
+        rates,
         upstream_url,
         client: reqwest::Client::new(),
     });
@@ -277,6 +304,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
         }
     };
+    let model = model_from(&body);
 
     let plan = {
         let mut guard = state.sessions.0.lock().unwrap();
@@ -297,10 +325,9 @@ pub async fn handle_chat<A: Adapter + 'static>(
         Err(e) => {
             let record = build_record(
                 &plan,
-                None,
-                0,
-                0,
-                None,
+                Observation::default(),
+                &model,
+                &state.rates,
                 state.adapter.source(),
                 false,
             );
@@ -316,6 +343,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // handed to the observer, which never blocks the forward path.
     let adapter = state.adapter.clone();
     let sessions = state.sessions.clone();
+    let rates = state.rates.clone();
     let stream = async_stream::stream! {
         let mut observer = StreamObserver::new();
         let mut complete = true;
@@ -331,7 +359,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 }
             }
         }
-        let record = observer.finalize(&plan, adapter.as_ref(), complete);
+        let record = observer.finalize(&plan, adapter.as_ref(), &model, &rates, complete);
         sessions.0.lock().unwrap().append(record);
     };
 
@@ -354,6 +382,14 @@ fn messages_from(body: &[u8]) -> Option<Vec<Message>> {
         out.push(Message { role: role.to_string(), text });
     }
     Some(out)
+}
+
+/// Extract the model name from a request body (for rate lookup).
+fn model_from(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default()
 }
 
 /// Flatten OpenAI content — a string, or an array of `{type,text}` parts.
@@ -381,15 +417,24 @@ mod tests {
     #[test]
     fn a_dropped_stream_finalizes_incomplete() {
         let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 1550 };
-        let r = build_record(&plan, Some(120.0), 0, 1750, None, SourceLabel::ProviderReported, false);
+        let obs = Observation { ttft_ms: Some(120.0), ..Default::default() };
+        let r = build_record(
+            &plan,
+            obs,
+            "gpt-4o",
+            &Rates::builtin(),
+            SourceLabel::ProviderReported,
+            false,
+        );
         assert_eq!(r.status, Status::Incomplete);
     }
 
     #[test]
     fn observe_routes_through_the_adapter() {
         let body = br#"{"usage":{"prompt_tokens_details":{"cached_tokens":1455}}}"#;
-        let (cached, source) = observe(&OpenAiAdapter, body);
+        let (cached, written, source) = observe(&OpenAiAdapter, body);
         assert_eq!(cached, 1455);
+        assert_eq!(written, 0);
         assert_eq!(source, SourceLabel::ProviderReported);
     }
 
@@ -411,11 +456,12 @@ mod tests {
         o.on_chunk(
             b"data: {\"usage\":{\"prompt_tokens\":2140,\"prompt_tokens_details\":{\"cached_tokens\":1455}}}\n\n",
         );
-        let r = o.finalize(&plan, &OpenAiAdapter, true);
+        let r = o.finalize(&plan, &OpenAiAdapter, "gpt-4o", &Rates::builtin(), true);
         assert_eq!(r.cached_tokens, 1455);
         assert_eq!(r.billed_input_tokens, 2140);
         assert_eq!(r.resent_history_tokens, 1810);
         assert_eq!(r.turn, 2);
+        assert!(r.cost_usd.is_some(), "known model carries cost");
     }
 
     #[test]
@@ -437,7 +483,14 @@ mod tests {
         assert_eq!(p0.resent_history_tokens, 0, "turn 0 has no history");
 
         // Simulate the finalized turn 0 so the next request sees turn 1.
-        let r = build_record(&p0, Some(100.0), 0, 10, None, SourceLabel::ProviderReported, true);
+        let r = build_record(
+            &p0,
+            Observation { ttft_ms: Some(100.0), billed_input_tokens: 10, ..Default::default() },
+            "gpt-4o",
+            &Rates::builtin(),
+            SourceLabel::ProviderReported,
+            true,
+        );
         store.0.lock().unwrap().append(r);
 
         let conv2 = vec![
@@ -453,6 +506,20 @@ mod tests {
             p1.resent_history_tokens > 0,
             "history excludes this turn's new content but includes the prefix"
         );
+    }
+
+    #[test]
+    fn anthropic_write_split_lands_in_the_record() {
+        use crate::adapters::anthropic::AnthropicAdapter;
+        let plan = RequestPlan { session_id: 1, turn: 1, resent_history_tokens: 2000 };
+        let mut o = StreamObserver::new();
+        o.on_chunk(
+            b"data: {\"usage\":{\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":300,\"input_tokens\":2100}}\n\n",
+        );
+        let r = o.finalize(&plan, &AnthropicAdapter, "claude-3-5-sonnet", &Rates::builtin(), true);
+        assert_eq!(r.cached_tokens, 900);
+        assert_eq!(r.cache_written_tokens, 300, "creation split recorded");
+        assert!(r.cost_saved_usd.is_some(), "anthropic rates known");
     }
 
     #[test]

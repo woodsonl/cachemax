@@ -36,7 +36,9 @@ mod tests {
             cached_tokens: 1020,
             resent_history_tokens: 1550,
             billed_input_tokens: 1750,
+            cache_written_tokens: 0,
             cost_usd: Some(0.02),
+            cost_saved_usd: Some(0.01),
         };
         let s = to_jsonl(std::slice::from_ref(&r)).unwrap();
         assert_eq!(s.lines().count(), 1);

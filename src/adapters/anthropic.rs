@@ -23,6 +23,21 @@ impl AnthropicAdapter {
             .unwrap_or(0);
         (read, creation)
     }
+
+    /// The derived cache-hit share shown beside the write/read split:
+    /// `read / (read + creation)`. This is a *secondary* display for Anthropic's
+    /// cache economics — the headline hit-rate stays the binding
+    /// `cached / resent_history` for cross-backend comparability. `None` when
+    /// no cache activity is exposed.
+    pub fn derived_hit_rate(response_body: &[u8]) -> Option<f64> {
+        let (read, creation) = Self::split(response_body);
+        let total = read + creation;
+        if total == 0 {
+            None
+        } else {
+            Some(read as f64 / total as f64)
+        }
+    }
 }
 
 impl Adapter for AnthropicAdapter {
@@ -35,8 +50,8 @@ impl Adapter for AnthropicAdapter {
     }
 
     fn cache_signal(&self, response_body: &[u8]) -> CacheSignal {
-        let (read, _creation) = Self::split(response_body);
-        CacheSignal::reported(read, SourceLabel::ProviderReported)
+        let (read, creation) = Self::split(response_body);
+        CacheSignal::reported_split(read, creation)
     }
 }
 
@@ -48,5 +63,35 @@ mod tests {
     fn split_reads_both_fields() {
         let body = br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
         assert_eq!(AnthropicAdapter::split(body), (900, 300));
+    }
+
+    #[test]
+    fn derived_hit_rate_is_read_over_read_plus_creation() {
+        let body = br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
+        let rate = AnthropicAdapter::derived_hit_rate(body).unwrap();
+        assert!((rate - 0.75).abs() < 1e-9, "900/(900+300) = 0.75");
+    }
+
+    #[test]
+    fn derived_hit_rate_is_none_without_cache_activity() {
+        let body = br#"{"usage":{"input_tokens":100}}"#;
+        assert_eq!(AnthropicAdapter::derived_hit_rate(body), None);
+    }
+
+    #[test]
+    fn signal_carries_the_write_split() {
+        let body = br#"{"usage":{"cache_read_input_tokens":900,"cache_creation_input_tokens":300}}"#;
+        let sig = AnthropicAdapter.cache_signal(body);
+        assert_eq!(sig.cached_tokens, 900);
+        assert_eq!(sig.written_tokens, 300);
+    }
+
+    #[test]
+    fn record_matches_provider_usage_exactly() {
+        // The proxy never re-derives a provider figure: the record's cached and
+        // written counts must equal the provider's own numbers.
+        let body = br#"{"usage":{"cache_read_input_tokens":1234,"cache_creation_input_tokens":567}}"#;
+        let sig = AnthropicAdapter.cache_signal(body);
+        assert_eq!((sig.cached_tokens, sig.written_tokens), (1234, 567));
     }
 }
