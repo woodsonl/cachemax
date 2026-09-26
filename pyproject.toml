@@ -1,7 +1,7 @@
 [project]
 name = "cache-maxing"
 version = "0.1.0"
-description = "Universal cache-maxingimizing inference proxy: normalize prompts so prefix caches hit, with prefix-affinity routing and hit-rate/cost observability"
+description = "OpenAI-compatible prompt-cache measurement proxy: report cache reuse and its cost or speed consequence"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

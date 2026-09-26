@@ -2,7 +2,7 @@
 
 
 def main() -> None:
-    raise SystemExit("cache-maxing proxy not implemented yet — see docs/designs/cache-maxing-proxy.md")
+    raise SystemExit("cache-maxing proxy not implemented yet — see docs/designs/cache-maxing-measurement-core.md")
 
 
 if __name__ == "__main__":
