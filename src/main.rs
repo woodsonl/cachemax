@@ -122,6 +122,12 @@ struct Cli {
     /// Verbose logging. Metadata only — never message content.
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// Do not add `stream_options.include_usage` to OpenAI-dialect streaming
+    /// requests. Injecting it is what lets cachemax see the terminal usage
+    /// chunk (and thus cache figures); disable only for strict pass-through.
+    #[arg(long, global = true)]
+    no_inject_usage: bool,
 }
 
 #[derive(Subcommand)]
@@ -166,7 +172,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .upstream_url
                 .clone()
                 .ok_or_else(Fault::upstream_required)?;
-            dispatch_serve(&cli.backend, tokenizer, rates, upstream, &cli.bind).await
+            dispatch_serve(
+                &cli.backend,
+                tokenizer,
+                rates,
+                upstream,
+                &cli.bind,
+                !cli.no_inject_usage,
+            )
+            .await
         }
         Command::Check => {
             let upstream = cli
@@ -199,13 +213,44 @@ async fn dispatch_serve(
     rates: Rates,
     upstream: String,
     bind: &str,
+    inject_usage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match backend {
-        "openai" => proxy::serve(OpenAiAdapter, tokenizer, rates, upstream, bind).await,
-        "anthropic" => proxy::serve(AnthropicAdapter, tokenizer, rates, upstream, bind).await,
-        "llamacpp" => proxy::serve(LlamaCppAdapter, tokenizer, rates, upstream, bind).await,
-        "vllm" => proxy::serve(VllmAdapter, tokenizer, rates, upstream, bind).await,
-        "mlxlm" => proxy::serve(MlxLmAdapter, tokenizer, rates, upstream, bind).await,
+        "openai" => {
+            proxy::serve(
+                OpenAiAdapter,
+                tokenizer,
+                rates,
+                upstream,
+                bind,
+                inject_usage,
+            )
+            .await
+        }
+        "anthropic" => {
+            proxy::serve(
+                AnthropicAdapter,
+                tokenizer,
+                rates,
+                upstream,
+                bind,
+                inject_usage,
+            )
+            .await
+        }
+        "llamacpp" => {
+            proxy::serve(
+                LlamaCppAdapter,
+                tokenizer,
+                rates,
+                upstream,
+                bind,
+                inject_usage,
+            )
+            .await
+        }
+        "vllm" => proxy::serve(VllmAdapter, tokenizer, rates, upstream, bind, inject_usage).await,
+        "mlxlm" => proxy::serve(MlxLmAdapter, tokenizer, rates, upstream, bind, inject_usage).await,
         other => Err(Fault::unknown_backend(other).into()),
     }
 }

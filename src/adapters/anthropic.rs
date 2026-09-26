@@ -12,18 +12,32 @@ pub struct AnthropicAdapter;
 impl AnthropicAdapter {
     /// The write/read split for display, plus the derived hit-rate inputs.
     /// `None` when neither field is present (no cache activity exposed).
+    ///
+    /// Anthropic reports cache usage in two shapes: a non-streaming message has
+    /// `usage` at the top level; a streamed `message_start` nests it under
+    /// `message.usage`. Read either so both wire shapes are measured.
     pub fn split(response_body: &[u8]) -> Option<(u64, u64)> {
         let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
-        let read = v
-            .pointer("/usage/cache_read_input_tokens")
+        let usage = v.get("usage").or_else(|| v.pointer("/message/usage"))?;
+        let read = usage
+            .get("cache_read_input_tokens")
             .and_then(|n| n.as_u64());
-        let creation = v
-            .pointer("/usage/cache_creation_input_tokens")
+        let creation = usage
+            .get("cache_creation_input_tokens")
             .and_then(|n| n.as_u64());
         match (read, creation) {
             (None, None) => None,
             (r, c) => Some((r.unwrap_or(0), c.unwrap_or(0))),
         }
+    }
+
+    /// The provider-billed input token count: anthropic's `input_tokens` (the
+    /// non-cached prompt tokens), read from either wire shape.
+    pub fn billed_input(response_body: &[u8]) -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
+        v.pointer("/usage/input_tokens")
+            .or_else(|| v.pointer("/message/usage/input_tokens"))
+            .and_then(|n| n.as_u64())
     }
 
     /// The derived cache-hit share shown beside the write/read split:

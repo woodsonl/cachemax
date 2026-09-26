@@ -65,9 +65,14 @@ impl Record {
     /// Per-turn hit rate per the binding formula.
     ///
     /// `turn == 0` is cold and returns `None`. A zero denominator (empty
-    /// history) also returns `None` — rendered as `—`, never `0`.
+    /// history) also returns `None` — rendered as `—`, never `0`. A turn whose
+    /// source exposes no cache truth (e.g. mlx-lm) has no rate to show, so it
+    /// is unexposed (`None`), never a measured `0%`.
     pub fn hit_rate(&self) -> Option<f64> {
         if self.turn == 0 || self.resent_history_tokens == 0 {
+            return None;
+        }
+        if self.source == SourceLabel::NoCacheTruth {
             return None;
         }
         Some(self.cached_tokens as f64 / self.resent_history_tokens as f64)
@@ -76,11 +81,19 @@ impl Record {
 
 /// Session-cumulative hit rate: `Σ cached / Σ resent_history` over complete
 /// turns only (turn ≥ 1). Returns `None` when no complete turn contributes.
+///
+/// Turns that expose no cache truth (e.g. mlx-lm) and turns with a zero
+/// history (nothing re-sent) contribute nothing: counting their `cached_tokens`
+/// against a zero/absent denominator would inflate or fabricate the rate.
 pub fn cumulative_hit_rate(records: &[Record]) -> Option<f64> {
     let mut cached: u64 = 0;
     let mut history: u64 = 0;
     for r in records {
-        if r.status == Status::Incomplete || r.turn == 0 {
+        if r.status == Status::Incomplete
+            || r.turn == 0
+            || r.resent_history_tokens == 0
+            || r.source == SourceLabel::NoCacheTruth
+        {
             continue;
         }
         cached += r.cached_tokens;

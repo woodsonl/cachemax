@@ -83,6 +83,7 @@ async fn proxy_for(upstream: String) -> String {
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
         client: reqwest::Client::new(),
+        inject_usage: true,
     });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();

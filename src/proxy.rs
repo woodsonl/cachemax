@@ -158,14 +158,24 @@ fn observe_doc<A: Adapter>(adapter: &A, doc: &[u8]) -> (u64, u64, SourceLabel) {
 }
 
 /// Reduce a body to the most informative JSON document: the whole body if it is
-/// one JSON object, else the last `data:` SSE event. Prefers an event that
-/// carries `usage` (cache/ billing figures live there); falls back to the last
-/// parseable event. Usage arrives in the terminal event, so scanning from the
-/// end is both correct and cheap.
+/// one JSON object, else the single most informative SSE event.
+///
+/// Selection order matters per provider:
+/// - OpenAI's cache/billing figures arrive in the *terminal* `usage` chunk, so
+///   the last event carrying `usage` wins.
+/// - Anthropic's cache figures arrive on the *first* event (`message_start`,
+///   under `message.usage`); its terminal `message_delta` carries only
+///   `output_tokens`. So an event carrying cache fields is preferred regardless
+///   of position.
+///
+/// Precedence: a whole JSON body; else the last event with a cache field; else
+/// the last event with `usage`; else the last parseable event.
 fn last_json_event(body: &[u8]) -> Vec<u8> {
     if body.starts_with(b"{") && serde_json::from_slice::<serde_json::Value>(body).is_ok() {
         return body.to_vec();
     }
+    let mut cache_event: Option<Vec<u8>> = None;
+    let mut usage_event: Option<Vec<u8>> = None;
     let mut fallback: Option<Vec<u8>> = None;
     for line in body.split(|&b| b == b'\n').rev() {
         // SSE allows `data:` with or without the space.
@@ -179,8 +189,11 @@ fn last_json_event(body: &[u8]) -> Vec<u8> {
         }
         match serde_json::from_slice::<serde_json::Value>(line) {
             Ok(v) => {
-                if v.get("usage").is_some() {
-                    return line.to_vec();
+                if has_cache_field(&v) {
+                    cache_event.get_or_insert_with(|| line.to_vec());
+                }
+                if v.get("usage").is_some() || v.pointer("/message/usage").is_some() {
+                    usage_event.get_or_insert_with(|| line.to_vec());
                 }
                 if fallback.is_none() {
                     fallback = Some(line.to_vec());
@@ -189,7 +202,22 @@ fn last_json_event(body: &[u8]) -> Vec<u8> {
             Err(_) => continue,
         }
     }
-    fallback.unwrap_or_default()
+    cache_event.or(usage_event).or(fallback).unwrap_or_default()
+}
+
+/// Whether a reduced event exposes any cache figure, in either provider's shape
+/// (`usage.*` or Anthropic's nested `message.usage.*`).
+fn has_cache_field(v: &serde_json::Value) -> bool {
+    let paths = [
+        "/usage/cache_read_input_tokens",
+        "/usage/cache_creation_input_tokens",
+        "/usage/prompt_tokens_details/cached_tokens",
+        "/message/usage/cache_read_input_tokens",
+        "/message/usage/cache_creation_input_tokens",
+    ];
+    paths
+        .iter()
+        .any(|p| v.pointer(p).map(|n| !n.is_null()).unwrap_or(false))
 }
 
 /// Incremental stream observer. Fed each forwarded chunk in order, untouched;
@@ -263,10 +291,17 @@ impl Default for StreamObserver {
     }
 }
 
-/// Read `billed_input_tokens` from an already-reduced JSON document.
+/// Read `billed_input_tokens` from an already-reduced JSON document, across
+/// dialects: OpenAI reports `usage.prompt_tokens`; Anthropic reports
+/// `usage.input_tokens` (flat for a whole message, or under `message.usage`
+/// for a streamed `message_start`). The provider's own count is authoritative;
+/// the caller falls back to the local denominator only when none is present.
 fn billed_from_doc(doc: &[u8]) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_slice(doc).ok()?;
-    v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64())
+    v.pointer("/usage/prompt_tokens")
+        .or_else(|| v.pointer("/usage/input_tokens"))
+        .or_else(|| v.pointer("/message/usage/input_tokens"))
+        .and_then(|n| n.as_u64())
 }
 
 /// State shared by every request handler.
@@ -277,6 +312,10 @@ pub struct AppState<A: Adapter> {
     pub rates: Rates,
     pub upstream_url: String,
     pub client: reqwest::Client,
+    /// Set `stream_options.include_usage` on OpenAI-dialect streaming requests
+    /// so the terminal usage chunk (cache figures) is emitted. On by default;
+    /// disable with `--no-inject-usage` for strict pass-through.
+    pub inject_usage: bool,
 }
 
 /// Run the proxy. Forwards to `upstream_url`, streams the response through
@@ -287,6 +326,7 @@ pub async fn serve<A: Adapter + 'static>(
     rates: Rates,
     upstream_url: String,
     bind: &str,
+    inject_usage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend = adapter.name();
     let tokenizer_label = tokenizer.label().to_string();
@@ -296,6 +336,7 @@ pub async fn serve<A: Adapter + 'static>(
         sessions: Arc::new(SharedSessions::new()),
         rates,
         upstream_url,
+        inject_usage,
         // A connect timeout fails fast on an unreachable upstream without
         // capping a legitimate long-lived SSE stream. No total request timeout:
         // streams are open-ended by design.
@@ -418,6 +459,45 @@ fn upstream_chat_url(base: &str) -> String {
     format!("{}/chat/completions", versioned_base(base))
 }
 
+/// Ensure an OpenAI-dialect streaming request reports usage.
+///
+/// OpenAI only emits the terminal `usage` chunk (where `cached_tokens` lives)
+/// when the request sets `stream_options.include_usage`. The proxy measures
+/// cache reuse, so it asks for usage on the client's behalf: if the body is a
+/// JSON object with `"stream": true` and no `stream_options.include_usage`, set
+/// it. Non-streaming bodies, non-OpenAI dialects, and bodies already opting in
+/// are returned unchanged.
+fn with_usage_requested(body: &Bytes, inject: bool) -> Bytes {
+    if !inject {
+        return body.clone();
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    if v.get("stream").and_then(|s| s.as_bool()) != Some(true) {
+        return body.clone();
+    }
+    let already = v
+        .pointer("/stream_options/include_usage")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    if already {
+        return body.clone();
+    }
+    if !v
+        .get("stream_options")
+        .map(|s| s.is_object())
+        .unwrap_or(false)
+    {
+        v["stream_options"] = serde_json::json!({});
+    }
+    v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
+    match serde_json::to_vec(&v) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => body.clone(),
+    }
+}
+
 /// The request handler: plan, forward, stream through, observe, finalize.
 pub async fn handle_chat<A: Adapter + 'static>(
     State(state): State<Arc<AppState<A>>>,
@@ -449,7 +529,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
             req = req.header(*name, value);
         }
     }
-    let upstream = match req.body(body).send().await {
+    // Only the OpenAI dialect understands `stream_options`; Anthropic's
+    // Messages API would reject it, so never inject there.
+    let inject = state.inject_usage && matches!(state.adapter.name(), "openai" | "vllm");
+    let upstream = match req.body(with_usage_requested(&body, inject)).send().await {
         Ok(r) => r,
         Err(e) => {
             let record = build_record(
@@ -561,6 +644,56 @@ mod tests {
             role: role.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn anthropic_streaming_picks_the_event_with_cache_fields() {
+        // Real Anthropic SSE: cache fields live on message_start (nested under
+        // message.usage); the terminal message_delta has only output_tokens.
+        let body = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2100,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":300,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let picked = last_json_event(body);
+        let (read, creation) =
+            crate::adapters::anthropic::AnthropicAdapter::split(&picked).expect("cache fields");
+        assert_eq!((read, creation), (900, 300));
+    }
+
+    #[test]
+    fn openai_streaming_still_picks_the_terminal_usage_chunk() {
+        // OpenAI's cache figure is in the last usage-bearing chunk; unchanged.
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":2140,\"prompt_tokens_details\":{\"cached_tokens\":1455}}}\n\ndata: [DONE]\n\n";
+        let picked = last_json_event(body);
+        assert_eq!(billed_from_doc(&picked), Some(2140));
+    }
+
+    #[test]
+    fn anthropic_billed_input_reads_input_tokens_both_shapes() {
+        let flat = br#"{"usage":{"input_tokens":2100,"cache_read_input_tokens":900}}"#;
+        assert_eq!(billed_from_doc(flat), Some(2100));
+        let nested = br#"{"type":"message_start","message":{"usage":{"input_tokens":2100}}}"#;
+        assert_eq!(billed_from_doc(nested), Some(2100));
+    }
+
+    #[test]
+    fn usage_is_requested_on_openai_streaming_only() {
+        let stream = Bytes::from_static(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+        let out: serde_json::Value =
+            serde_json::from_slice(&with_usage_requested(&stream, true)).unwrap();
+        assert_eq!(out["stream_options"]["include_usage"], true);
+
+        // Non-streaming untouched.
+        let nonstream = Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#);
+        let out = with_usage_requested(&nonstream, true);
+        assert_eq!(&out[..], &nonstream[..]);
+
+        // Opt-out untouched.
+        let out = with_usage_requested(&stream, false);
+        assert_eq!(&out[..], &stream[..]);
+
+        // Already opted in: unchanged, not duplicated.
+        let opted =
+            Bytes::from_static(br#"{"stream":true,"stream_options":{"include_usage":true}}"#);
+        let out = with_usage_requested(&opted, true);
+        assert_eq!(&out[..], &opted[..]);
     }
 
     #[test]
