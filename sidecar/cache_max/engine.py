@@ -89,10 +89,11 @@ class MlxEngine:
         try:
             from mlx_lm import load  # type: ignore[import-not-found]
         except ImportError as e:  # pragma: no cover - platform dependent
-            raise RuntimeError(
-                "mlx-lm is not installed. The mlx-lm backend is macOS / Apple "
-                "Silicon only; install it with `uv pip install mlx-lm`."
-            ) from e
+                raise RuntimeError(
+                    "mlx-lm is not installed. The mlx-lm backend is macOS / Apple "
+                    "Silicon (arm64) only; install it with "
+                    "`uv sync --project sidecar --extra mlx`."
+                ) from e
         self._model, self._tokenizer = load(self.model_name)
 
     def generate(self, messages: list[dict], max_tokens: int) -> Completion:
