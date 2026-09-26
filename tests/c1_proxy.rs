@@ -373,8 +373,28 @@ async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
         .unwrap();
     let _ = resp.bytes().await.unwrap(); // drain so the observer finalizes
 
-    // Give the stream task a beat to append.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Poll for the record instead of sleeping a fixed beat: a fixed sleep can
+    // lose the race on a loaded CI runner. Wait on the exact condition the
+    // test asserts, bounded by a deadline so a genuinely missing record fails
+    // loudly rather than hanging.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let recorded_incomplete = || {
+        sessions
+            .0
+            .lock()
+            .unwrap()
+            .most_recent()
+            .and_then(|s| s.records.last())
+            .map(|r| r.status == cachemax::record::Status::Incomplete)
+            .unwrap_or(false)
+    };
+    while !recorded_incomplete() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failed request was never recorded as incomplete within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let guard = sessions.0.lock().unwrap();
     let s = guard.most_recent().expect("a session was created");
