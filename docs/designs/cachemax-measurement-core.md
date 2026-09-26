@@ -112,7 +112,7 @@ Edge cases: empty messages → `—` (zero denominator, not 0); oversized prompt
 ## Stack
 
 - **Core: Rust** (axum/tokio, hyper unbuffered SSE, reqwest, `tiktoken-rs` for token-prefix hashing). Live at the repo root (`Cargo.toml`, `src/*.rs`). Single binary, cross-platform (macOS Intel/AS, Linux x86_64/aarch64, Windows MSVC).
-- **Prefix hashing is token-level from the start.** `tiktoken-rs` embeds the vocabulary, so no external asset ships. Default encoding is `cl100k_base` (the OpenAI-family lingua franca); `--tokenizer <name|path>` overrides (`o200k_base`, `p50k_base`, or a model name via `bpe_for_model`).
+- **Prefix hashing is token-level from the start.** `tiktoken-rs` embeds the vocabulary, so no external asset ships. Default encoding is `cl100k_base` (the OpenAI-family lingua franca); `--tokenizer <name|model>` overrides (`o200k_base`, `p50k_base`, or a model name via `bpe_for_model`).
 - **Local mlx-lm precision path: Python sidecar** (subprocess, off the hot path). Lives under `sidecar/`. Never imported by the core.
 - **No user-supplied tokenizer and no Python are required to run and show a curve.** The bundled tokenizer always drives the tape's prefix hashing; token counting on the cloud path stays provider-reported, never locally re-derived. The sidecar is an opt-in precision layer.
 - Repo scaffolding (uv project under `sidecar/`) remains only for the Python sidecar and dev tooling.

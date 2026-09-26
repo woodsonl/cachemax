@@ -111,7 +111,7 @@ struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_BIND)]
     bind: String,
 
-    /// Prefix-hash tokenizer: an encoding name, a model name, or a vocab path.
+    /// Prefix-hash tokenizer: an encoding name or a model name.
     #[arg(long, global = true, default_value = "cl100k_base")]
     tokenizer: String,
 

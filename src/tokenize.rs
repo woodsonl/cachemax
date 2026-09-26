@@ -3,7 +3,8 @@
 //! The tape's prefix map needs token-level hashes so continuity means the same
 //! thing the provider's cache means. `tiktoken-rs` embeds the vocabulary, so no
 //! external asset ships. Default encoding is `cl100k_base`; `--tokenizer`
-//! overrides with another encoding name, a model name, or a vocab path.
+//! overrides with another encoding name (`o200k_base`, `p50k_base`, `r50k_base`)
+//! or a model name routed through `bpe_for_model`.
 //!
 //! Cloud token counting stays provider-reported — this module never re-derives
 //! a provider's token counts; it only hashes prefixes (always) and, on the

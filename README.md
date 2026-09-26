@@ -116,7 +116,7 @@ or click **export** on the dashboard to download the same JSONL. It is
 metrics-only — never message content.
 
 ```json
-{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"cost_usd":0.02,"cost_saved_usd":0.01}
+{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"broke_prefix":false,"cost_usd":0.02,"cost_saved_usd":0.01}
 ```
 
 ## Commands

@@ -107,3 +107,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod readme_sample {
+    use super::*;
+    #[test]
+    fn readme_sample_is_byte_exact() {
+        let r = Record {
+            session_id: 1,
+            turn: 1,
+            status: crate::record::Status::Complete,
+            source: crate::record::SourceLabel::ProviderReported,
+            ttft_ms: Some(120.0),
+            cached_tokens: 1020,
+            cache_written_tokens: 0,
+            resent_history_tokens: 1550,
+            billed_input_tokens: 1750,
+            broke_prefix: false,
+            cost_usd: Some(0.02),
+            cost_saved_usd: Some(0.01),
+        };
+        let line = to_jsonl(&[r]).unwrap();
+        let expected = "{\"session_id\":1,\"turn\":1,\"status\":\"complete\",\"source\":\"provider_reported\",\"ttft_ms\":120.0,\"cached_tokens\":1020,\"cache_written_tokens\":0,\"resent_history_tokens\":1550,\"billed_input_tokens\":1750,\"broke_prefix\":false,\"cost_usd\":0.02,\"cost_saved_usd\":0.01}\n";
+        assert_eq!(line, expected, "README sample must match the serializer");
+    }
+}
