@@ -78,13 +78,12 @@ final class StatusController: NSObject {
         status.isEnabled = false
         m.addItem(status)
         m.addItem(.separator())
-        m.addItem(NSMenuItem(
-            title: "Open dashboard", action: #selector(openDashboard), keyEquivalent: "d"))
+        let open = NSMenuItem(
+            title: "Open dashboard", action: #selector(openDashboard), keyEquivalent: "d")
+        open.target = self
+        m.addItem(open)
         m.addItem(NSMenuItem(
             title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        for it in m.items where it.action == #selector(openDashboard) {
-            it.target = self
-        }
         return m
     }
 
