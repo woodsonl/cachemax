@@ -38,6 +38,19 @@ and OpenRouter; `anthropic` covers the Anthropic Messages API; `llamacpp`,
 design — it shows TTFT warm/cold discrimination only, and `—` for the hit rate,
 which is correct, not a bug.
 
+## mlx-sidecar-unavailable
+
+**Problem:** `--backend mlxlm` reaches nothing, or the sidecar exits at start.
+
+**Cause:** the mlx-lm sidecar is macOS / Apple Silicon only and mlx-lm is an
+opt-in extra.
+
+**Fix:** on Apple Silicon,
+`uv sync --project sidecar --extra mlx`, then
+`uv run --project sidecar cachemax-sidecar serve`, then point the proxy at it
+with `--upstream-url http://127.0.0.1:8080/v1`. On Linux/Windows the mlx-lm
+backend cannot run; use `llamacpp` or `vllm` instead.
+
 ## key-rejected
 
 **Problem:** the upstream returns `401` / `403` to your client's requests.

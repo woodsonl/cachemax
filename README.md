@@ -162,6 +162,25 @@ required to run cachemax.
 - repo root — the Rust core (`Cargo.toml`, `src/*.rs`) and the embedded dashboard
 - `sidecar/` — the Python mlx-lm sidecar and its uv project
 
+### mlx-lm sidecar (macOS / Apple Silicon)
+
+mlx-lm exposes no cache truth: it produces no hit-rate number, only per-turn
+TTFT. The sidecar serves mlx-lm behind the OpenAI wire shape so the proxy can
+point at it like any other upstream:
+
+```bash
+uv sync --project sidecar --extra mlx        # installs mlx-lm (Apple Silicon)
+uv run --project sidecar cachemax-sidecar serve --model mlx-community/Qwen2.5-0.5B-Instruct-4bit
+# in another shell:
+cachemax serve --backend mlxlm --upstream-url http://127.0.0.1:8080/v1
+```
+
+The dashboard shows no hit rate for mlx-lm (`—`, source `no_cache_truth`); the
+signal is the TTFT cold→warm readout. To print the warm/cold comparison
+directly, run `cachemax-sidecar measure`. It reports the ratio; it asserts no
+speed threshold, because real mlx-lm clusters near 1.0x (prefill is a small
+share of first-token latency at small sizes).
+
 ## Development
 
 ```bash
@@ -169,6 +188,7 @@ cargo test                 # Rust core
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 
-uv sync --project sidecar  # Python sidecar
+uv sync --project sidecar  # Python sidecar (fake engine; no mlx-lm needed)
 uv run --project sidecar pytest
+CACHEMAX_MLX_REAL=1 uv run --project sidecar pytest tests/test_real_mlx.py -s  # real mlx-lm, opt-in
 ```
