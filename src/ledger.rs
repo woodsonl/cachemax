@@ -36,8 +36,8 @@ use std::sync::Mutex;
 
 /// Cap on distinct sessions held in memory. The in-memory ledger keeps one
 /// turn (the latest, per model) per session, so the bound is on *sessions*,
-/// not turns. Oldest-created sessions are evicted first; a single-user proxy
-/// interleaves at most a handful of live conversations.
+/// not turns. When a capped reload must evict, eviction follows the
+/// directory's file-name order.
 const SESSIONS_CAP: usize = 64;
 
 /// Cap on a retained non-streaming response body. A whole-JSON response is
@@ -122,6 +122,8 @@ impl Ledger {
     /// A ledger persisted as JSONL under `dir`, reloading what is already
     /// there. Torn trailing lines (a crash mid-append) are skipped, not
     /// fatal: a lost line loses one turn of audit, never correctness.
+    /// Files are read in file-name order, so a capped reload's eviction
+    /// is deterministic for a given directory listing.
     pub fn on_disk(dir: PathBuf) -> std::io::Result<Self> {
         let mut ledger = Self {
             sessions: HashMap::new(),
@@ -130,19 +132,14 @@ impl Ledger {
             dir: Some(dir.clone()),
         };
         std::fs::create_dir_all(&dir)?;
-        // Reload oldest files first so, if the session cap is exceeded, the
-        // most recently written sessions are the ones that survive.
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)?
+        let mut files: Vec<String> = std::fs::read_dir(&dir)?
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .filter_map(|p| {
-                let m = p.metadata().ok()?;
-                m.modified().ok().map(|m| (m, p))
-            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
             .collect();
-        files.sort_by_key(|(m, _)| *m);
-        for (_, path) in files {
+        files.sort();
+        for name in files {
+            let path = dir.join(name);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -274,6 +271,47 @@ impl Ledger {
             .is_some_and(|per_model| !per_model.is_empty())
     }
 
+    /// Replay a recorded ledger directory: for every session+model chain on
+    /// disk, emit the request body that extends that chain (the canonical
+    /// request plus a fresh user turn), in original turn order. The bench
+    /// A/B driver builds both variants from these: the drifted form (what
+    /// a re-serializing client sends) and the canonical form (what repair
+    /// would forward).
+    ///
+    /// Untrusted disk: a chain whose stored messages are not an array is
+    /// skipped, never emitted — a pair must be a real request the provider
+    /// could have cached.
+    pub fn replay_requests(dir: &std::path::Path) -> std::io::Result<Vec<ReplayRequest>> {
+        let ledger = Ledger::on_disk(dir.to_path_buf())?;
+        let mut out: Vec<ReplayRequest> = ledger
+            .sessions
+            .iter()
+            .flat_map(|(session_id, per_model)| {
+                per_model.iter().filter_map(move |(model, turn)| {
+                    // A chain only extends a request that is a message
+                    // array; anything else on disk is not a chain.
+                    turn.request_messages.as_array()?;
+                    let mut chain = turn.request_messages.clone();
+                    if let Some(arr) = chain.as_array_mut() {
+                        arr.push(serde_json::json!(
+                            {"role": "user", "content": "Continue."}
+                        ));
+                    }
+                    Some(ReplayRequest {
+                        session_id: *session_id,
+                        turn: turn.turn,
+                        model: model.clone(),
+                        messages: chain,
+                    })
+                })
+            })
+            .collect();
+        // A total order: two models can share a session+turn, and the
+        // output must be identical across runs.
+        out.sort_by_key(|r| (r.session_id, r.turn, r.model.clone()));
+        Ok(out)
+    }
+
     /// The most recently appended-to session that has a chain for `model`.
     /// A request whose leading history was truncated or re-based resolves
     /// to a *new* session (no shared prefix-hash), and this finds the
@@ -310,6 +348,20 @@ impl Ledger {
 /// `.await`; poisoning is recovered from because the ledger has no invariant
 /// a panicked handler could break.
 pub struct SharedLedger(pub Mutex<Ledger>);
+
+/// One replayable request reconstructed from the on-disk ledger: the
+/// canonical chain plus a fresh tail. The replay bench drives a
+/// stub/provider with the drifted and canonical serializations of this
+/// body to measure the repair delta.
+#[derive(Debug)]
+pub struct ReplayRequest {
+    pub session_id: u64,
+    pub turn: u32,
+    pub model: String,
+    /// The request body's `messages`: the chain as forwarded, extended by
+    /// a fresh user turn.
+    pub messages: serde_json::Value,
+}
 
 impl SharedLedger {
     /// An in-memory ledger (no disk). The default for tests and `--no-ledger`.

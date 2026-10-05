@@ -130,7 +130,7 @@ impl DriftReport {
 }
 
 /// Full classification result. Everything the dry-run report shows, plus the
-/// alignment facts the rewriting path (next batch) will consume.
+/// alignment facts the rewriting path consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub report_matches: bool,
@@ -646,6 +646,86 @@ fn tokens_of(tokenizer: &Tokenizer, elements: &[Value]) -> u64 {
         .filter_map(|e| serde_json::to_string(e).ok())
         .map(|s| tokenizer.count(&s) as u64)
         .sum()
+}
+
+/// The A/B replay pair for one recorded chain: the same request in the
+/// form a re-serializing client drifts into, and in the canonical form
+/// repair forwards. The drift applies the classifier's own tolerances in
+/// reverse — reordered tool-argument keys, collapsed interior whitespace
+/// runs — so both bodies are semantically identical and differ only in
+/// the bytes a provider's cache keys on. That delta is what the A/B
+/// measurement prices.
+///
+/// The drift is gated exactly where the classifier's tolerance is gated:
+/// only tool-call `arguments` strings with a sibling `name`, and only
+/// `content` strings on messages with a `role`. An ungated transformation
+/// would produce a pair the classifier itself reads as semantically
+/// different — a fabricated measurement.
+pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
+    fn drift_value(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut out = Map::new();
+                for (k, val) in map {
+                    let value = drift_value(val);
+                    out.insert(
+                        k.clone(),
+                        if k == "arguments" && val.is_string() && map.contains_key("name") {
+                            match serde_json::from_str::<Value>(val.as_str().unwrap_or_default()) {
+                                // Re-serialized by a different serializer:
+                                // keys sorted, spacing compacted — the
+                                // same parsed JSON, still a wire string.
+                                Ok(parsed) => {
+                                    let resorted = compact(&parsed);
+                                    Value::String(
+                                        serde_json::to_string(&resorted).unwrap_or_default(),
+                                    )
+                                }
+                                Err(_) => value,
+                            }
+                        } else if k == "content" && val.is_string() && map.contains_key("role") {
+                            collapse_ws(val)
+                        } else {
+                            value
+                        },
+                    );
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(drift_value).collect()),
+            _ => v.clone(),
+        }
+    }
+    // Compact re-serialization: sort object keys — the canonical
+    // drift this proxy exists to repair.
+    fn compact(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+                Value::Object(
+                    sorted
+                        .into_iter()
+                        .map(|(k, val)| (k.clone(), compact(val)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(compact).collect()),
+            _ => v.clone(),
+        }
+    }
+
+    let canonical = serde_json::json!({
+        "model": request.model,
+        "messages": request.messages,
+    });
+    let drifted = drift_value(&canonical);
+    serde_json::json!({
+        "session_id": request.session_id,
+        "turn": request.turn,
+        "model": request.model,
+        "a_drifted": drifted,
+        "b_canonical": canonical,
+    })
 }
 
 #[cfg(test)]

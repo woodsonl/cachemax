@@ -221,6 +221,10 @@ enum Command {
     /// directory itself stay; a running proxy's in-memory ledger is not
     /// touched — restart to drop it.
     Purge,
+    /// Replay the recorded ledger: print per-chain, A/B request bodies
+    /// (drifted vs canonical) and the tokens each costs, as JSONL — the
+    /// input for an A/B cache measurement against any endpoint.
+    Replay,
 }
 
 #[tokio::main]
@@ -239,10 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ignores --no-ledger by design: it targets what a previous `serve`
     // (with or without the flag) may have written, on disk.
     if matches!(cli.command, Some(Command::Purge)) {
-        let dir = cli
-            .ledger_dir
-            .clone()
-            .map_or_else(default_ledger_dir, std::path::PathBuf::from);
+        let dir = ledger_dir_of(&cli);
         let report = match purge_ledger(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -251,6 +252,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         print_purge(&dir, &report);
+        return Ok(());
+    }
+
+    // Replay reads the ledger directory directly: it has no use for a
+    // tokenizer (token columns come from the line's own counts) and must
+    // not touch the running proxy — or create the directory by running.
+    if matches!(cli.command, Some(Command::Replay)) {
+        let dir = ledger_dir_of(&cli);
+        if !dir.is_dir() {
+            return Err(Fault::ledger_unavailable(
+                &dir.display().to_string(),
+                "the directory does not exist".to_string(),
+            )
+            .into());
+        }
+        let requests = cachemax::ledger::Ledger::replay_requests(&dir)
+            .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
+        if requests.is_empty() {
+            println!(
+                "no chains recorded in {}; send traffic through `cachemax serve` first",
+                dir.display()
+            );
+            return Ok(());
+        }
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        use std::io::Write;
+        for request in &requests {
+            let line = cachemax::repair::replay_pair(request);
+            // A closed pipe (`| head`) is a normal end for a stdout
+            // stream, not an error to report. serde_json wraps io errors
+            // — check the cause chain, not the top-level kind.
+            let io_kind =
+                |e: &serde_json::Error| e.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe);
+            if let Err(e) = serde_json::to_writer(&mut out, &line) {
+                if io_kind(&e) {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+            if let Err(e) = out.write_all(b"\n") {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        }
         return Ok(());
     }
     if let Err(e) = run(cli).await {
@@ -428,20 +476,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {path}");
             Ok(())
         }
-        // Handled before `run` (it needs no tokenizer or upstream); the
-        // compiler still wants the arm here.
-        Command::Purge => Ok(()),
+        // Handled before `run` (they need no tokenizer or upstream); the
+        // compiler still wants the arms here.
+        Command::Purge | Command::Replay => Ok(()),
     }
+}
+
+/// The ledger directory the command targets: `--ledger-dir` or the
+/// default. Shared by `serve`, `purge`, and `replay` so all three agree
+/// on the location.
+fn ledger_dir_of(cli: &Cli) -> std::path::PathBuf {
+    cli.ledger_dir
+        .clone()
+        .map_or_else(default_ledger_dir, std::path::PathBuf::from)
 }
 
 /// Build the canonical ledger from `--ledger-dir` / `--no-ledger`. Default:
 /// persisted under the user's cache directory, so the canonical chain
 /// survives a proxy restart. `--no-ledger` keeps it in memory only.
 fn build_ledger(cli: &Cli) -> Result<Arc<SharedLedger>, Box<dyn std::error::Error>> {
-    let dir = match &cli.ledger_dir {
-        Some(p) => std::path::PathBuf::from(p),
-        None => default_ledger_dir(),
-    };
+    let dir = ledger_dir_of(cli);
     let ledger = if cli.no_ledger {
         SharedLedger::new()
     } else {

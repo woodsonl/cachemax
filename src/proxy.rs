@@ -534,7 +534,8 @@ pub struct AppState<A: Adapter> {
     /// disable with `--no-inject-usage` for strict pass-through.
     pub inject_usage: bool,
     /// The repair mode. Dry-run is the product default; `off` restores the
-    /// pure-measurement behavior. `on` (rewriting) lands with the next batch.
+    /// pure-measurement behavior. `on` rewrites drifted history to the
+    /// canonical chain (see `crate::repair`).
     pub repair: RepairMode,
     /// Anthropic-only, opt-in (`--manage-breakpoints`): place
     /// `cache_control` breakpoints per the incremental-breakpoint guidance.
