@@ -253,11 +253,6 @@ impl Ledger {
         chain.extend(last.response_messages.iter().cloned());
         Some(chain)
     }
-
-    /// Number of sessions held in memory (the eviction bound's observable).
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
-    }
 }
 
 /// Thread-safe wrapper, mirroring [`crate::sessions::SharedSessions`]: the
@@ -439,11 +434,12 @@ impl ResponseAssembler {
             return;
         }
         // Prefilter: content-bearing events mention deltas, blocks, or
-        // choices. Usage-only chunks and anything else skip the parse.
-        if !(contains(payload, b"delta")
-            || contains(payload, b"block")
-            || contains(payload, b"choices"))
-        {
+        // choices. Usage-only chunks and anything else skip the parse. Not
+        // valid UTF-8? Then not JSON; skip the parse too.
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        if !(text.contains("delta") || text.contains("block") || text.contains("choices")) {
             return;
         }
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
@@ -492,10 +488,6 @@ impl ResponseAssembler {
         self.oa = OpenAiAcc::default();
         self.an = AnthropicAcc::default();
     }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// OpenAI-dialect accumulation: role/content deltas plus tool calls merged by
@@ -879,20 +871,19 @@ mod tests {
     #[test]
     fn the_session_bound_evicts_oldest_first() {
         let mut ledger = Ledger::in_memory();
-        for s in 0..(SESSIONS_CAP as u64 + 8) {
-            ledger.append(s + 1, turn(0, "x"));
+        let total = SESSIONS_CAP as u64 + 8;
+        for s in 1..=total {
+            ledger.append(s, turn(0, "x"));
         }
-        assert_eq!(ledger.session_count(), SESSIONS_CAP);
-        assert!(
-            ledger.last_turn(1, "gpt-4o").is_none(),
-            "the first-created session was evicted"
-        );
-        assert!(
-            ledger
-                .last_turn(SESSIONS_CAP as u64 + 8, "gpt-4o")
-                .is_some(),
-            "the newest session survives"
-        );
+        // Exactly the newest SESSIONS_CAP sessions survive; the first eight
+        // created are gone.
+        for s in 1..=total {
+            assert_eq!(
+                ledger.last_turn(s, "gpt-4o").is_some(),
+                s > total - SESSIONS_CAP as u64,
+                "session {s} eviction state wrong"
+            );
+        }
     }
 
     #[test]
