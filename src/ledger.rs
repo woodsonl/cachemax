@@ -242,6 +242,15 @@ impl Ledger {
         self.sessions.get(&session_id)?.get(model)
     }
 
+    /// The models this session has canonical turns under. Distinguishes a
+    /// model switch (chains exist, none for this model) from a first turn.
+    pub fn session_models(&self, session_id: u64) -> Vec<String> {
+        self.sessions
+            .get(&session_id)
+            .map(|per_model| per_model.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// The canonical message chain for a session+model: the messages of the
     /// latest turn exactly as forwarded, extended by the assistant message(s)
     /// exactly as received. This is what the next request should

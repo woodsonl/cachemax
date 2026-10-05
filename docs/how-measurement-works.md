@@ -35,6 +35,11 @@ One record per request. Nothing about message content is in it — metrics only:
 | `broke_prefix` | `true` when this turn's prompt diverged from the tracked session's prefix (a prefix break). |
 | `cost_usd` | Cost at the provider's published rate, if the model is known. `null` for an incomplete turn. |
 | `cost_saved_usd` | The no-cache counterfactual minus the actual cost, if rates are known. `null` for an incomplete turn. |
+| `repair_mode` | Whether drift classification ran: `off`, `dry_run` (the default), or `on`. |
+| `repaired` | `true` only when the outgoing history was rewritten (`on` mode). |
+| `matches_canonical` | `null` when not examined; else whether the re-sent history byte-matched the canonical chain. |
+| `drift_kind` | The classified drift flavor, when there was one. |
+| `canonicalized_tokens` | Tokens of drifted history that would be (`dry_run`) or were (`on`) canonicalized. An estimate for annotation. |
 
 ## The hit-rate formula
 

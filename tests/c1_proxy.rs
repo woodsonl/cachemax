@@ -96,6 +96,7 @@ async fn boot_proxy(upstream: String) -> String {
         upstream_url: upstream,
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -303,6 +304,7 @@ async fn boot_proxy_with_state(upstream: String) -> (String, Arc<SharedSessions>
         upstream_url: upstream,
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -532,6 +534,7 @@ async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
         upstream_url: format!("http://{addr}"),
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let sessions = state.sessions.clone();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -640,6 +643,7 @@ async fn vllm_metrics_delta_is_wired_into_the_record() {
         upstream_url: format!("http://{u}/v1"),
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();

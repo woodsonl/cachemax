@@ -1,0 +1,723 @@
+//! Drift detection: does the client's re-sent history extend the canonical
+//! chain, and if not, what kind of drift is it?
+//!
+//! The match model mirrors what a provider's cache actually sees. Providers
+//! parse the request JSON and tokenize the *content* — so JSON envelope key
+//! order never matters (object equality is order-insensitive here), while
+//! string leaves always matter byte-for-byte. Drift that matters is therefore
+//! drift inside strings: a tool-call `arguments` blob re-serialized with
+//! different key order or spacing, text re-wrapped with different whitespace,
+//! content reshaped between string and parts-array form.
+//!
+//! The equivalence ladder, per element pair:
+//! 1. **Exact** — `serde_json::Value` equality (semantic JSON equality:
+//!    object order-insensitive, strings exact). The provider sees the same
+//!    tokens. Not drift.
+//! 2. **ToolArgReserialization** — equal after parsing tool-call `arguments`
+//!    strings as JSON on both sides. Same call, different serialization:
+//!    repairable, because rewriting to the canonical serialization changes
+//!    no semantics the model sees.
+//! 3. **TextNormalization** — equal after collapsing whitespace runs in
+//!    text-bearing strings (`content` strings, `text`/`thinking` parts).
+//!    Repairable for the same reason.
+//! 4. **RoleContentReshaped** — same role, same flattened text, different
+//!    content shape (string ↔ parts array). Repairable.
+//! 5. Otherwise — **semantic inequality**: the history means something
+//!    different. Never rewritten. Repair rewrites the prefix up to (not
+//!    including) that element and passes the rest through untouched
+//!    (plan §3.3), flagged as drift it could not fix.
+//!
+//! Hard stops (never classify further, never rewrite): system prompt
+//! changed, model switched, first turn of a session (nothing canonical to
+//! extend). Turn 0 of the *ledger* is not turn 0 of the record store: an
+//! incomplete attempt consumes a record turn but never enters the chain, so
+//! a retry classifies against the pre-failure chain.
+//!
+//! Token counts appear only as *quantification* (`tokens_at_risk`): an
+//! estimate of what the drift endangers, for the dry-run annotation and the
+//! dashboard. No repair decision ever consults them.
+
+use crate::tokenize::Tokenizer;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Whether repair touches traffic at all, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairMode {
+    /// Today's behavior: no classification, no annotation, no rewriting.
+    Off,
+    /// DEFAULT. Classify and annotate every turn; never mutate the request.
+    DryRun,
+    /// Rewrite drifted history to the canonical serialization. (Lands with
+    /// the repair batch; the classification here is the gate it trusts.)
+    On,
+}
+
+impl Default for RepairMode {
+    /// `Off` — the *record's* neutral default meaning "not examined". The
+    /// proxy's *operating* default is `DryRun` (set in `main`); this default
+    /// exists only so a `Record` can be constructed without a report.
+    fn default() -> Self {
+        RepairMode::Off
+    }
+}
+
+/// The flavor of a repairable divergence between the client's re-sent
+/// history and the canonical chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftKind {
+    /// Tool-call `arguments` re-serialized (key order/whitespace) with the
+    /// same parsed JSON. The classic agent-framework cache breaker.
+    ToolArgReserialization,
+    /// Text content differing only in whitespace runs.
+    TextNormalization,
+    /// The client dropped leading history (old turns) and re-sent the rest;
+    /// the canonical prefix restarts deeper in the conversation.
+    TruncatedHistory,
+    /// Content shape changed (string ↔ parts array) with identical text.
+    RoleContentReshaped,
+    /// More than one of the above in one turn.
+    Mixed,
+}
+
+/// Why repair refused to touch this turn at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unrepairable {
+    /// The system message changed. Everything downstream re-bases; rewriting
+    /// history under a new system prompt would fabricate consent.
+    SystemPromptChanged,
+    /// The session's canonical chain is per model; this request switched.
+    ModelSwitched,
+    /// Nothing canonical to extend yet (first turn, or a purged ledger).
+    FirstTurn,
+}
+
+/// The dry-run report for one turn: what drifted, how much is at risk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftReport {
+    pub mode: RepairMode,
+    /// True when the whole re-sent span is exactly the canonical chain.
+    pub matches_canonical: bool,
+    pub drift_kind: Option<DriftKind>,
+    /// Re-sent history elements not byte-equal to their canonical
+    /// counterparts (dropped leading elements count too).
+    pub turns_affected: usize,
+    /// Estimated tokens the drift endangers: the canonical elements that
+    /// would be canonicalized, the truncated prefix, and — when semantic
+    /// inequality stopped the match — the residual span that will not be
+    /// served from cache. An estimate for annotation; never a repair input.
+    pub tokens_at_risk: u64,
+    pub unrepairable: Option<Unrepairable>,
+}
+
+impl DriftReport {
+    /// The report for a turn repair did not examine (mode off).
+    pub fn unexamined(mode: RepairMode) -> Self {
+        Self {
+            mode,
+            matches_canonical: false,
+            drift_kind: None,
+            turns_affected: 0,
+            tokens_at_risk: 0,
+            unrepairable: None,
+        }
+    }
+}
+
+/// Full classification result. Everything the dry-run report shows, plus the
+/// alignment facts the rewriting path (next batch) will consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classification {
+    pub report_matches: bool,
+    pub drift_kind: Option<DriftKind>,
+    pub turns_affected: usize,
+    pub tokens_at_risk: u64,
+    pub unrepairable: Option<Unrepairable>,
+    /// Where the client's history starts inside the canonical chain.
+    /// `> 0` is leading truncation (the client dropped old turns).
+    pub canonical_offset: usize,
+    /// How many leading client elements are exact-or-equivalent under that
+    /// alignment. The rewriting path may canonicalize exactly these.
+    pub equivalent_run: usize,
+    /// Index into the client's messages where semantic inequality stopped
+    /// the match. Elements from here on pass through untouched.
+    pub semantic_break: Option<usize>,
+}
+
+/// Classify one incoming request against the session's canonical chain.
+///
+/// `chain` is the canonical message chain for (session, model) — `None`
+/// when the ledger holds nothing for the session. `session_has_other_model`
+/// distinguishes a model switch (chain exists under another model) from a
+/// genuine first turn.
+pub fn classify_turn(
+    client: &[Value],
+    chain: Option<&[Value]>,
+    session_has_other_model: bool,
+    tokenizer: &Tokenizer,
+) -> Classification {
+    let Some(canonical) = chain else {
+        return Classification {
+            report_matches: false,
+            drift_kind: None,
+            turns_affected: 0,
+            tokens_at_risk: 0,
+            unrepairable: Some(if session_has_other_model {
+                Unrepairable::ModelSwitched
+            } else {
+                Unrepairable::FirstTurn
+            }),
+            canonical_offset: 0,
+            equivalent_run: 0,
+            semantic_break: None,
+        };
+    };
+    if canonical.is_empty() || client.is_empty() {
+        return Classification {
+            report_matches: false,
+            drift_kind: None,
+            turns_affected: 0,
+            tokens_at_risk: 0,
+            unrepairable: Some(Unrepairable::FirstTurn),
+            canonical_offset: 0,
+            equivalent_run: 0,
+            semantic_break: None,
+        };
+    }
+
+    // Hard stop: a changed system message re-bases everything. Compare the
+    // leading elements only when both are system-role messages.
+    let both_system = client[0].get("role").and_then(Value::as_str) == Some("system")
+        && canonical[0].get("role").and_then(Value::as_str) == Some("system");
+    if both_system && relation(&client[0], &canonical[0]) == Rel::Different {
+        return Classification {
+            report_matches: false,
+            drift_kind: None,
+            turns_affected: 1,
+            tokens_at_risk: tokens_of(tokenizer, canonical),
+            unrepairable: Some(Unrepairable::SystemPromptChanged),
+            canonical_offset: 0,
+            equivalent_run: 0,
+            semantic_break: Some(0),
+        };
+    }
+
+    // Find the best alignment: the offset d into the canonical chain that
+    // the client's history extends. The common clean case (d = 0) is tried
+    // first and usually wins immediately; the offset scan only runs when the
+    // head-on comparison breaks early (truncation or drift).
+    let mut best: Option<Aligned> = None;
+    for d in 0..canonical.len() {
+        let aligned = align_at(client, canonical, d);
+        let better = match &best {
+            None => true,
+            Some(b) => aligned.run > b.run || (aligned.run == b.run && aligned.offset < b.offset),
+        };
+        if better {
+            best = Some(aligned);
+        }
+        // The head-on clean case can't be beaten by a deeper offset.
+        if d == 0 {
+            if let Some(a) = &best {
+                if a.run == canonical.len().min(client.len()) && a.semantic_break.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    let a = best.unwrap_or_else(|| align_at(client, canonical, 0));
+
+    // Assemble the report from the winning alignment.
+    let compared = canonical.len().min(client.len());
+    let mut kinds: Vec<DriftKind> = Vec::new();
+    let mut nonexact = 0usize;
+    for i in 0..a.run {
+        match relation(&client[i], &canonical[a.offset + i]) {
+            Rel::Exact => {}
+            Rel::Equivalent(k) => {
+                nonexact += 1;
+                if !kinds.contains(&k) {
+                    kinds.push(k);
+                }
+            }
+            Rel::Different => unreachable!("run stops before Different"),
+        }
+    }
+    if a.offset > 0 && !kinds.contains(&DriftKind::TruncatedHistory) {
+        kinds.push(DriftKind::TruncatedHistory);
+    }
+    let drift_kind = match kinds.len() {
+        0 => None,
+        1 => Some(kinds[0]),
+        _ => Some(DriftKind::Mixed),
+    };
+
+    // The residual span the semantic break leaves unmatchable: canonical
+    // elements positionally claimed by client elements from the break on.
+    let residual = match a.semantic_break {
+        Some(k) => canonical
+            .len()
+            .saturating_sub(a.offset + k)
+            .min(client.len() - k),
+        None => 0,
+    };
+    let turns_affected = a.offset + nonexact + residual;
+    let mut tokens_at_risk = tokens_of(tokenizer, &canonical[..a.offset]);
+    for i in 0..a.run {
+        if relation(&client[i], &canonical[a.offset + i]) != Rel::Exact {
+            tokens_at_risk += tokens_of(tokenizer, std::slice::from_ref(&canonical[a.offset + i]));
+        }
+    }
+    if residual > 0 {
+        let k = a.semantic_break.unwrap();
+        tokens_at_risk += tokens_of(tokenizer, &canonical[a.offset + k..a.offset + k + residual]);
+    }
+
+    Classification {
+        report_matches: a.offset == 0
+            && nonexact == 0
+            && a.semantic_break.is_none()
+            && a.run == compared,
+        drift_kind,
+        turns_affected,
+        tokens_at_risk,
+        unrepairable: None,
+        canonical_offset: a.offset,
+        equivalent_run: a.run,
+        semantic_break: a.semantic_break,
+    }
+}
+
+/// Turn a classification into the record-facing report under `mode`.
+pub fn report(classification: &Classification, mode: RepairMode) -> DriftReport {
+    DriftReport {
+        mode,
+        matches_canonical: classification.unrepairable.is_none() && classification.report_matches,
+        drift_kind: classification.drift_kind,
+        turns_affected: classification.turns_affected,
+        tokens_at_risk: classification.tokens_at_risk,
+        unrepairable: classification.unrepairable,
+    }
+}
+
+/// One alignment attempt: client history starting at `offset` in canonical.
+#[derive(Debug, Clone, Copy)]
+struct Aligned {
+    offset: usize,
+    run: usize,
+    semantic_break: Option<usize>,
+}
+
+fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
+    let mut run = 0usize;
+    let mut semantic_break = None;
+    while offset + run < canonical.len() && run < client.len() {
+        match relation(&client[run], &canonical[offset + run]) {
+            Rel::Different => {
+                semantic_break = Some(run);
+                break;
+            }
+            _ => run += 1,
+        }
+    }
+    Aligned {
+        offset,
+        run,
+        semantic_break,
+    }
+}
+
+/// The element-relation ladder (see module docs). Ordered cheapest-first;
+/// the first equality that holds names the relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rel {
+    Exact,
+    Equivalent(DriftKind),
+    Different,
+}
+
+fn relation(a: &Value, b: &Value) -> Rel {
+    if a == b {
+        return Rel::Exact;
+    }
+    if tool_args_normalized(a) == tool_args_normalized(b) {
+        return Rel::Equivalent(DriftKind::ToolArgReserialization);
+    }
+    if text_normalized(a) == text_normalized(b) {
+        return Rel::Equivalent(DriftKind::TextNormalization);
+    }
+    if reshaped(a) == reshaped(b) {
+        return Rel::Equivalent(DriftKind::RoleContentReshaped);
+    }
+    Rel::Different
+}
+
+/// Rewrite every tool-call `arguments` string as its parsed JSON value, so
+/// two serializations of the same arguments compare equal. Covers the
+/// current OpenAI shape (`tool_calls[].function.arguments`) and the legacy
+/// `function_call.arguments`. Anthropic's `tool_use.input` is already an
+/// object on the wire and needs no tolerance.
+fn tool_args_normalized(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, val) in map {
+                out.insert(
+                    k.clone(),
+                    if (k == "arguments" || k == "partial_json") && val.is_string() {
+                        parsed_or_self(val)
+                    } else {
+                        tool_args_normalized(val)
+                    },
+                );
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(tool_args_normalized).collect()),
+        _ => v.clone(),
+    }
+}
+
+/// A string treated as its parsed JSON when it parses, else itself.
+fn parsed_or_self(v: &Value) -> Value {
+    let s = v.as_str().unwrap_or_default();
+    serde_json::from_str(s).unwrap_or_else(|_| v.clone())
+}
+
+/// Collapse whitespace runs in text-bearing strings: `content` when a
+/// string, and `text`/`thinking` part fields. Other strings (ids, names,
+/// signatures, argument blobs) are compared exactly — they are not prose.
+fn text_normalized(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, val) in map {
+                out.insert(
+                    k.clone(),
+                    if k == "text" || k == "thinking" {
+                        collapse_ws(val)
+                    } else if k == "content" {
+                        match val {
+                            Value::String(_) => collapse_ws(val),
+                            Value::Array(parts) => {
+                                Value::Array(parts.iter().map(text_normalized).collect())
+                            }
+                            _ => val.clone(),
+                        }
+                    } else {
+                        text_normalized(val)
+                    },
+                );
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(text_normalized).collect()),
+        _ => v.clone(),
+    }
+}
+
+fn collapse_ws(v: &Value) -> Value {
+    match v.as_str() {
+        Some(s) => Value::String(s.split_whitespace().collect::<Vec<_>>().join(" ")),
+        None => v.clone(),
+    }
+}
+
+/// Flatten `content` to its text on both sides, so a string and an
+/// equivalent parts-array compare equal. Text must then match exactly.
+fn reshaped(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, val) in map {
+                out.insert(
+                    k.clone(),
+                    if k == "content" {
+                        match crate::proxy::flatten_content(Some(val)) {
+                            s if s.is_empty() && !matches!(val, Value::String(_)) => val.clone(),
+                            s => Value::String(s),
+                        }
+                    } else {
+                        reshaped(val)
+                    },
+                );
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(reshaped).collect()),
+        _ => v.clone(),
+    }
+}
+
+/// Serialized token count of the given canonical elements — the at-risk
+/// estimate. Reporting only.
+fn tokens_of(tokenizer: &Tokenizer, elements: &[Value]) -> u64 {
+    let mut n = 0u64;
+    for e in elements {
+        if let Ok(s) = serde_json::to_string(e) {
+            n += tokenizer.count(&s) as u64;
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tok() -> Tokenizer {
+        Tokenizer::default_encoder().unwrap()
+    }
+
+    fn classify(client: &[Value], canonical: &[Value]) -> Classification {
+        classify_turn(client, Some(canonical), false, &tok())
+    }
+
+    fn msgs(pairs: &[(&str, &str)]) -> Vec<Value> {
+        pairs
+            .iter()
+            .map(|(role, text)| json!({"role": role, "content": text}))
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_continuation_matches_exactly() {
+        let canonical = msgs(&[
+            ("system", "Be terse."),
+            ("user", "Hi"),
+            ("assistant", "Hello"),
+        ]);
+        let mut client = canonical.clone();
+        client.push(json!({"role": "user", "content": "More"}));
+        let c = classify(&client, &canonical);
+        assert!(c.report_matches, "clean extension of the chain");
+        assert_eq!(c.drift_kind, None);
+        assert_eq!(c.tokens_at_risk, 0);
+        assert_eq!(c.unrepairable, None);
+        assert_eq!(c.canonical_offset, 0);
+        assert_eq!(c.equivalent_run, 3, "the run covers the whole chain");
+        assert_eq!(c.semantic_break, None);
+    }
+
+    #[test]
+    fn a_regenerate_request_with_no_new_tail_still_matches() {
+        let canonical = msgs(&[("system", "sys"), ("user", "Hi"), ("assistant", "Hello")]);
+        let c = classify(&canonical, &canonical);
+        assert!(c.report_matches, "resent == chain is a clean prefix");
+    }
+
+    #[test]
+    fn tool_args_key_reorder_is_tool_arg_reserialization() {
+        let canonical = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "c1", "type": "function", "function":
+                {"name": "f", "arguments": "{\"a\": 1, \"b\": 2}"}}],
+        })];
+        let client = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "c1", "type": "function", "function":
+                {"name": "f", "arguments": "{\"b\":2,\"a\":1}"}}],
+        })];
+        let c = classify(&client, &canonical);
+        assert!(!c.report_matches);
+        assert_eq!(c.drift_kind, Some(DriftKind::ToolArgReserialization));
+        assert_eq!(c.turns_affected, 1);
+        assert!(c.tokens_at_risk > 0, "the drift is quantified");
+        assert_eq!(c.semantic_break, None, "equivalence holds — repairable");
+    }
+
+    #[test]
+    fn a_changed_argument_value_is_semantic_inequality() {
+        let canonical = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function", "function":
+                {"name": "f", "arguments": "{\"a\": 1}"}}],
+        })];
+        let client = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function", "function":
+                {"name": "f", "arguments": "{\"a\": 2}"}}],
+        })];
+        let c = classify(&client, &canonical);
+        assert!(!c.report_matches);
+        assert_eq!(c.semantic_break, Some(0), "equivalence fails at element 0");
+        assert_eq!(
+            c.drift_kind, None,
+            "semantic inequality carries no repairable kind"
+        );
+        assert_eq!(c.turns_affected, 1);
+        assert!(c.tokens_at_risk > 0, "the unmatchable span is quantified");
+    }
+
+    #[test]
+    fn whitespace_normalization_is_detected() {
+        let canonical = msgs(&[("user", "Please   summarize\nthe   results.")]);
+        let client = msgs(&[("user", "Please summarize the results.")]);
+        let c = classify(&client, &canonical);
+        assert!(!c.report_matches);
+        assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn content_reshaped_between_string_and_parts_is_detected() {
+        let canonical = msgs(&[("user", "hello world")]);
+        let client = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world"}],
+        })];
+        let c = classify(&client, &canonical);
+        assert!(!c.report_matches);
+        assert_eq!(c.drift_kind, Some(DriftKind::RoleContentReshaped));
+    }
+
+    #[test]
+    fn leading_truncation_aligns_deeper_and_is_truncated_history() {
+        let canonical = msgs(&[
+            ("system", "sys"),
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("assistant", "a2"),
+        ]);
+        // Client drops the first two turns and adds a new tail.
+        let mut client = canonical[4..].to_vec();
+        client.push(json!({"role": "user", "content": "q3"}));
+        let c = classify(&client, &canonical);
+        assert!(!c.report_matches);
+        assert_eq!(c.drift_kind, Some(DriftKind::TruncatedHistory));
+        assert_eq!(c.canonical_offset, 4, "alignment starts deeper");
+        assert_eq!(c.equivalent_run, 1, "the kept assistant element matches");
+        assert_eq!(c.turns_affected, 4, "the four dropped elements");
+        assert!(c.tokens_at_risk > 0);
+    }
+
+    #[test]
+    fn truncation_plus_tool_args_is_mixed() {
+        let canonical = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                "type": "function", "function": {"name": "f", "arguments": "{\"a\": 1, \"b\": 2}"}}]}),
+        ];
+        let client = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                "type": "function", "function": {"name": "f", "arguments": "{\"b\":2,\"a\":1}"}}]}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.drift_kind, Some(DriftKind::Mixed));
+        assert_eq!(
+            c.canonical_offset, 2,
+            "the leading system+user were dropped"
+        );
+    }
+
+    #[test]
+    fn a_changed_system_prompt_is_a_hard_stop() {
+        let canonical = msgs(&[("system", "Be terse."), ("user", "Hi")]);
+        let client = msgs(&[("system", "Be verbose."), ("user", "Hi")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.unrepairable, Some(Unrepairable::SystemPromptChanged));
+        assert!(!c.report_matches);
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn an_equivalent_system_prompt_change_is_not_a_hard_stop() {
+        // Whitespace-only system drift is repairable, not a re-base.
+        let canonical = msgs(&[("system", "Be   terse."), ("user", "Hi")]);
+        let client = msgs(&[("system", "Be terse."), ("user", "Hi")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.unrepairable, None);
+        assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn no_chain_is_first_turn_or_model_switch() {
+        let c = classify_turn(&msgs(&[("user", "hi")]), None, false, &tok());
+        assert_eq!(c.unrepairable, Some(Unrepairable::FirstTurn));
+        let c = classify_turn(&msgs(&[("user", "hi")]), None, true, &tok());
+        assert_eq!(c.unrepairable, Some(Unrepairable::ModelSwitched));
+    }
+
+    #[test]
+    fn envelope_key_order_alone_is_not_drift() {
+        // Providers tokenize parsed content, not envelope bytes: a key
+        // reorder anywhere in the message object is exact, not drift.
+        let canonical = vec![json!({"role": "user", "content": "hi", "extra": 1})];
+        let client = vec![json!({"extra": 1, "content": "hi", "role": "user"})];
+        let c = classify(&client, &canonical);
+        assert!(c.report_matches);
+    }
+
+    #[test]
+    fn a_changed_role_is_semantic_inequality() {
+        let canonical = msgs(&[("user", "hi")]);
+        let client = msgs(&[("assistant", "hi")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn drift_after_a_clean_prefix_is_located_not_global() {
+        let canonical = msgs(&[
+            ("system", "sys"),
+            ("user", "q1"),
+            ("assistant", "a1  spaced"),
+            ("user", "q2"),
+        ]);
+        let client = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1 spaced"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.canonical_offset, 0);
+        assert_eq!(c.equivalent_run, 4);
+        assert_eq!(c.turns_affected, 1, "only the drifted element counts");
+        assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn semantic_inequality_mid_history_stops_the_run() {
+        let canonical = msgs(&[
+            ("system", "sys"),
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+        ]);
+        // Element 1 differs semantically; element 2+ would have matched.
+        let client = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "DIFFERENT"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(1));
+        assert_eq!(c.equivalent_run, 1, "rewrite prefix is [0..1) only");
+        // The residual (client[1..] positionally claiming canonical[1..4])
+        // is counted at risk.
+        assert_eq!(c.turns_affected, 3);
+    }
+
+    #[test]
+    fn report_carries_mode_and_matches() {
+        let canonical = msgs(&[("user", "hi"), ("assistant", "yo")]);
+        let client = msgs(&[("user", "hi  "), ("assistant", "yo")]);
+        let c = classify(&client, &canonical);
+        let r = report(&c, RepairMode::DryRun);
+        assert_eq!(r.mode, RepairMode::DryRun);
+        assert!(!r.matches_canonical);
+        assert_eq!(r.drift_kind, Some(DriftKind::TextNormalization));
+        assert_eq!(r.tokens_at_risk, c.tokens_at_risk);
+    }
+}

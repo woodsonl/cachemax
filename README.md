@@ -116,8 +116,14 @@ or click **export** on the dashboard to download the same JSONL. It is
 metrics-only — never message content.
 
 ```json
-{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"broke_prefix":false,"cost_usd":0.02,"cost_saved_usd":0.01}
+{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"broke_prefix":false,"cost_usd":0.02,"cost_saved_usd":0.01,"repair_mode":"dry_run","repaired":false,"matches_canonical":false,"drift_kind":"tool_arg_reserialization","canonicalized_tokens":312}
 ```
+
+The last five fields are the drift annotation: `repair_mode` (`off` |
+`dry_run` | `on`), `repaired` (true only when a rewrite happened), and — when
+the turn was examined — whether the re-sent history byte-matched the canonical
+chain, the classified drift flavor, and the tokens at risk. Still metrics
+only: never message content.
 
 ## Commands
 

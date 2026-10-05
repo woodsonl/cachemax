@@ -52,6 +52,7 @@ async fn boot(upstream: String) -> String {
         upstream_url: upstream,
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
@@ -158,6 +159,11 @@ fn rec(turn: u32, cached: u64, history: u64) -> Record {
         broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
+        repair_mode: cachemax::repair::RepairMode::Off,
+        repaired: false,
+        matches_canonical: None,
+        drift_kind: None,
+        canonicalized_tokens: 0,
     }
 }
 
@@ -176,6 +182,11 @@ fn hash_level_mode_prints_no_fake_byte_detail() {
         broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
+        repair_mode: cachemax::repair::RepairMode::Off,
+        repaired: false,
+        matches_canonical: None,
+        drift_kind: None,
+        canonicalized_tokens: 0,
     };
     let v = dashboard::view(std::slice::from_ref(&r), true, 1);
     assert_eq!(v.tape_mode, "hash");

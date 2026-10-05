@@ -10,5 +10,6 @@ pub mod ledger;
 pub mod proxy;
 pub mod rates;
 pub mod record;
+pub mod repair;
 pub mod sessions;
 pub mod tokenize;

@@ -41,6 +41,11 @@ pub enum TapeState {
     Miss,
     Break,
     Incomplete,
+    /// The resent history drifted from the canonical chain (repairable
+    /// flavor). Dry-run annotation.
+    Drift,
+    /// Drift repair refused to touch: hard stop or semantic inequality.
+    Unrepairable,
 }
 
 impl TapeState {
@@ -53,6 +58,8 @@ impl TapeState {
             TapeState::Miss => "▚",
             TapeState::Break => "┊",
             TapeState::Incomplete => "?",
+            TapeState::Drift => "~",
+            TapeState::Unrepairable => "!",
         }
     }
 }
@@ -140,6 +147,14 @@ pub struct TurnRow {
     pub cost: String,
     pub cold: bool,
     pub incomplete: bool,
+    /// Dry-run drift annotation, when the turn was examined and drifted:
+    /// a short tag naming the drift flavor (`tool_args`, `whitespace`,
+    /// `truncated`, `reshaped`, `mixed`) or `unrepairable` /
+    /// `first-turn` when the chain could not be extended at all.
+    pub drift: Option<String>,
+    /// At-risk tokens behind the drift annotation, formatted (`1,2xx tk`),
+    /// when the turn was examined and drifted.
+    pub drift_tokens: Option<String>,
 }
 
 /// The cumulative summary row.
@@ -326,6 +341,29 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
 fn turn_row(r: &Record) -> TurnRow {
     let incomplete = r.status == Status::Incomplete;
     let cold = r.turn == 0;
+    // The dry-run annotation. Mode off = not examined: no claim rendered.
+    // Clean turns render nothing (the absence of drift is not news).
+    let examined =
+        r.repair_mode != crate::repair::RepairMode::Off && r.matches_canonical == Some(false);
+    let (drift, drift_tokens) = if !examined {
+        (None, None)
+    } else {
+        let tag = match r.drift_kind {
+            Some(crate::repair::DriftKind::ToolArgReserialization) => "tool_args",
+            Some(crate::repair::DriftKind::TextNormalization) => "whitespace",
+            Some(crate::repair::DriftKind::TruncatedHistory) => "truncated",
+            Some(crate::repair::DriftKind::RoleContentReshaped) => "reshaped",
+            Some(crate::repair::DriftKind::Mixed) => "mixed",
+            // No kind: either a hard stop (tokens at risk were quantified)
+            // or nothing canonical to extend (first turn / model switch).
+            None if r.canonicalized_tokens > 0 => "unrepairable",
+            None => "first-turn",
+        };
+        (
+            Some(tag.to_string()),
+            Some(format!("{} tk", format_tokens(r.canonicalized_tokens))),
+        )
+    };
     TurnRow {
         turn: r.turn,
         hit: if cold || incomplete {
@@ -349,6 +387,8 @@ fn turn_row(r: &Record) -> TurnRow {
         },
         cold,
         incomplete,
+        drift,
+        drift_tokens,
     }
 }
 
@@ -375,6 +415,19 @@ fn tape_row(r: &Record) -> TapeRow {
     if r.broke_prefix && !incomplete {
         cells.insert(0, TapeState::Break);
         cells.insert(1, TapeState::Miss);
+    }
+    // The dry-run drift annotation leads the tape the same way: `~` when the
+    // drift has a repairable flavor, `!` when repair would refuse it. Both
+    // are glyph-legible without color (DESIGN.md tape-cell rule).
+    if !incomplete
+        && r.repair_mode != crate::repair::RepairMode::Off
+        && r.matches_canonical == Some(false)
+    {
+        let state = match r.drift_kind {
+            Some(_) => TapeState::Drift,
+            None => TapeState::Unrepairable,
+        };
+        cells.insert(0, state);
     }
     TapeRow {
         turn: r.turn,
@@ -412,6 +465,11 @@ mod tests {
             broke_prefix: false,
             cost_usd: Some(0.01),
             cost_saved_usd: Some(0.005),
+            repair_mode: crate::repair::RepairMode::Off,
+            repaired: false,
+            matches_canonical: None,
+            drift_kind: None,
+            canonicalized_tokens: 0,
         }
     }
 
@@ -511,6 +569,8 @@ mod tests {
             TapeState::Miss,
             TapeState::Break,
             TapeState::Incomplete,
+            TapeState::Drift,
+            TapeState::Unrepairable,
         ];
         let mut glyphs: Vec<&str> = states.iter().map(|s| s.glyph()).collect();
         glyphs.sort();
@@ -520,6 +580,61 @@ mod tests {
             states.len(),
             "each state needs a unique glyph"
         );
+    }
+
+    /// A record examined in dry-run with the given drift claim.
+    fn drifted(turn: u32, kind: Option<crate::repair::DriftKind>, tokens: u64) -> Record {
+        let mut r = rec(turn, 100, 200);
+        r.repair_mode = crate::repair::RepairMode::DryRun;
+        r.matches_canonical = Some(false);
+        r.drift_kind = kind;
+        r.canonicalized_tokens = tokens;
+        r
+    }
+
+    #[test]
+    fn a_drifted_turn_row_carries_the_annotation_tag() {
+        let r = drifted(
+            3,
+            Some(crate::repair::DriftKind::ToolArgReserialization),
+            312,
+        );
+        let row = turn_row(&r);
+        assert_eq!(row.drift.as_deref(), Some("tool_args"));
+        assert_eq!(row.drift_tokens.as_deref(), Some("312 tk"));
+        // And the tape leads with the drift glyph.
+        let tape = tape_row(&r);
+        assert_eq!(tape.cells[0], TapeState::Drift);
+    }
+
+    #[test]
+    fn an_unrepairable_turn_is_tagged_and_banged() {
+        // No kind + tokens at risk = the hard-stop / semantic-inequality case.
+        let r = drifted(2, None, 900);
+        let row = turn_row(&r);
+        assert_eq!(row.drift.as_deref(), Some("unrepairable"));
+        let tape = tape_row(&r);
+        assert_eq!(tape.cells[0], TapeState::Unrepairable);
+    }
+
+    #[test]
+    fn a_first_turn_or_model_switch_carries_no_at_risk_claim() {
+        let r = drifted(1, None, 0);
+        assert_eq!(turn_row(&r).drift.as_deref(), Some("first-turn"));
+        assert_eq!(turn_row(&r).drift_tokens.as_deref(), Some("0 tk"));
+    }
+
+    #[test]
+    fn clean_and_unexamined_turns_carry_no_annotation() {
+        // A clean match: nothing to say.
+        let mut clean = rec(1, 100, 200);
+        clean.repair_mode = crate::repair::RepairMode::DryRun;
+        clean.matches_canonical = Some(true);
+        assert!(turn_row(&clean).drift.is_none());
+        // Unexamined (mode off): no claim at all.
+        let off = rec(2, 100, 200);
+        assert!(turn_row(&off).drift.is_none());
+        assert_eq!(off.matches_canonical, None);
     }
 
     #[test]

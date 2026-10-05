@@ -14,6 +14,7 @@ use crate::adapters::Adapter;
 use crate::ledger::{CanonicalTurn, Dialect, ResponseAssembler, SharedLedger};
 use crate::rates::Rates;
 use crate::record::{Record, SourceLabel, Status};
+use crate::repair::{self, DriftReport, RepairMode};
 use crate::sessions::{SessionStore, SharedSessions};
 use crate::tokenize::{Message, Tokenizer};
 
@@ -150,6 +151,13 @@ pub fn build_record(
         broke_prefix: plan.broke_prefix,
         cost_usd,
         cost_saved_usd,
+        // The pure seam carries no repair claim; the finalizer patches these
+        // from the drift report computed on the request path.
+        repair_mode: RepairMode::Off,
+        repaired: false,
+        matches_canonical: None,
+        drift_kind: None,
+        canonicalized_tokens: 0,
     }
 }
 
@@ -374,6 +382,9 @@ struct Finalizer<A: Adapter> {
     /// The `messages` array exactly as forwarded upstream this turn (already
     /// reflecting any proxy-side injection). Captured before forwarding.
     as_sent_messages: serde_json::Value,
+    /// The drift report computed on the request path. Patched into the
+    /// record at finalize; dry-run never lets it touch the request.
+    drift_report: DriftReport,
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
@@ -410,7 +421,7 @@ impl<A: Adapter> Finalizer<A> {
             return;
         }
         self.done = true;
-        let record = self.observer.finalize(
+        let mut record = self.observer.finalize(
             &self.plan,
             self.adapter.as_ref(),
             &self.model,
@@ -418,6 +429,22 @@ impl<A: Adapter> Finalizer<A> {
             complete,
             engine_cached,
         );
+        // The repair claim rides on the record; the request itself was
+        // untouched in every mode except `on`.
+        record.repair_mode = self.drift_report.mode;
+        record.matches_canonical = if self.drift_report.mode == RepairMode::Off {
+            None
+        } else {
+            Some(self.drift_report.matches_canonical)
+        };
+        record.drift_kind = self.drift_report.drift_kind;
+        // Dry-run: the would-be count is the at-risk estimate. `on` mode
+        // (next batch) sets the actual count when it rewrites.
+        record.canonicalized_tokens = if self.drift_report.mode == RepairMode::On {
+            0
+        } else {
+            self.drift_report.tokens_at_risk
+        };
         if complete {
             // The canonical turn: the messages exactly as forwarded, extended
             // by the assistant message(s) exactly as received. Only complete
@@ -482,18 +509,31 @@ pub struct AppState<A: Adapter> {
     /// so the terminal usage chunk (cache figures) is emitted. On by default;
     /// disable with `--no-inject-usage` for strict pass-through.
     pub inject_usage: bool,
+    /// The repair mode. Dry-run is the product default; `off` restores the
+    /// pure-measurement behavior. `on` (rewriting) lands with the next batch.
+    pub repair: RepairMode,
 }
 
-/// Run the proxy. Forwards to `upstream_url`, streams the response through
+/// The proxy's operating configuration (everything the CLI tunes).
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    /// Provider endpoint to forward to.
+    pub upstream_url: String,
+    /// Inject `stream_options.include_usage` on OpenAI-dialect streams.
+    pub inject_usage: bool,
+    /// The repair mode (dry-run is the product default).
+    pub repair: RepairMode,
+}
+
+/// Run the proxy. Forwards to the upstream, streams the response through
 /// unbuffered, and finalizes one record per request.
 pub async fn serve<A: Adapter + 'static>(
     adapter: A,
     tokenizer: Tokenizer,
     rates: Rates,
     ledger: Arc<SharedLedger>,
-    upstream_url: String,
+    options: ServeOptions,
     listener: tokio::net::TcpListener,
-    inject_usage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend = adapter.name();
     let tokenizer_label = tokenizer.label().to_string();
@@ -503,8 +543,9 @@ pub async fn serve<A: Adapter + 'static>(
         sessions: Arc::new(SharedSessions::new()),
         ledger,
         rates,
-        upstream_url,
-        inject_usage,
+        upstream_url: options.upstream_url,
+        repair: options.repair,
+        inject_usage: options.inject_usage,
         // A connect timeout fails fast on an unreachable upstream without
         // capping a legitimate long-lived SSE stream. No total request timeout:
         // streams are open-ended by design.
@@ -718,6 +759,33 @@ pub async fn handle_chat<A: Adapter + 'static>(
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
+    // Drift classification (dry-run default): does this request extend the
+    // canonical chain we forwarded last time? Never mutates the request in
+    // any mode except `on` (which lands with the repair batch); dry-run only
+    // produces the report the record carries.
+    let drift_report = if state.repair == RepairMode::Off {
+        DriftReport::unexamined(RepairMode::Off)
+    } else {
+        let (chain, other_models) = {
+            let ledger = state.ledger.lock();
+            let chain = ledger.canonical_messages(plan.session_id, &model);
+            let other_models = !ledger.session_models(plan.session_id).is_empty();
+            (chain, other_models)
+        };
+        let client_values = doc
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let classification = repair::classify_turn(
+            &client_values,
+            chain.as_deref(),
+            other_models,
+            &state.tokenizer,
+        );
+        repair::report(&classification, state.repair)
+    };
+
     // Forward first. The request body is passed through untouched unless
     // usage injection applies; auth and provider-identification headers are
     // forwarded so cloud keys keep working.
@@ -805,6 +873,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             sessions,
             ledger,
             as_sent_messages,
+            drift_report,
             complete: true,
             done: false,
             metrics,
@@ -859,7 +928,8 @@ fn model_from_doc(doc: &serde_json::Value) -> String {
 }
 
 /// Flatten OpenAI content — a string, or an array of `{type,text}` parts.
-fn flatten_content(content: Option<&serde_json::Value>) -> String {
+/// Shared with the repair classifier (content-shape equivalence).
+pub(crate) fn flatten_content(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
