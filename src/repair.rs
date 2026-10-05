@@ -7,7 +7,9 @@
 //! string leaves always matter byte-for-byte. Drift that matters is therefore
 //! drift inside strings: a tool-call `arguments` blob re-serialized with
 //! different key order or spacing, text re-wrapped with different whitespace,
-//! content reshaped between string and parts-array form.
+//! content reshaped between string and parts-array form. `cache_control`
+//! hints are the one exception: the provider does not tokenize them as
+//! content, so their presence and placement are ignored on both sides.
 //!
 //! The equivalence ladder, per element pair:
 //! 1. **Exact** — `serde_json::Value` equality (semantic JSON equality:
@@ -345,11 +347,15 @@ pub fn apply_canonical(
             break;
         };
         // Recompute the relation: only equivalent-but-not-exact elements are
-        // replaced, and only with the byte-stable canonical form.
+        // replaced, and only with the byte-stable canonical form — its
+        // content, never its cache hints. Hints are placement policy:
+        // breakpoint management re-derives them, and under a client-managed
+        // request, inheriting the canonical side's would push the total
+        // past the provider's limit.
         match relation(element, canonical_element) {
             Rel::Equivalent(_) => {
                 tokens += tokens_of(tokenizer, std::slice::from_ref(canonical_element));
-                *element = canonical_element.clone();
+                *element = strip_cache_control(canonical_element).into_owned();
                 replaced += 1;
             }
             Rel::Exact | Rel::Different => {}
@@ -389,7 +395,10 @@ fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
 }
 
 /// The element-relation ladder (see module docs). Ordered cheapest-first;
-/// the first equality that holds names the relation.
+/// the first equality that holds names the relation. Cache hints
+/// (`cache_control`) are stripped on both sides first: the provider does
+/// not tokenize them as content, and breakpoint management (the proxy's or
+/// the client's) moves them without changing meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rel {
     Exact,
@@ -398,6 +407,9 @@ enum Rel {
 }
 
 fn relation(a: &Value, b: &Value) -> Rel {
+    let a = strip_cache_control(a);
+    let b = strip_cache_control(b);
+    let (a, b): (&Value, &Value) = (&a, &b);
     if a == b {
         return Rel::Exact;
     }
@@ -411,6 +423,30 @@ fn relation(a: &Value, b: &Value) -> Rel {
         return Rel::Equivalent(DriftKind::RoleContentReshaped);
     }
     Rel::Different
+}
+
+/// A copy of `v` with content-block cache hints removed — an object that
+/// names a `type` and carries an object-valued `cache_control`. Borrowed
+/// when there is nothing to strip, so hint-free requests pay no
+/// allocation. The in-place walk lives in [`crate::breakpoints`]; one
+/// predicate, one home.
+fn strip_cache_control(v: &Value) -> std::borrow::Cow<'_, Value> {
+    fn carries_hint(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => is_hint_shaped(map) || map.values().any(carries_hint),
+            Value::Array(items) => items.iter().any(carries_hint),
+            _ => false,
+        }
+    }
+    fn is_hint_shaped(map: &serde_json::Map<String, Value>) -> bool {
+        map.contains_key("type") && map.get("cache_control").is_some_and(Value::is_object)
+    }
+    if !carries_hint(v) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    let mut owned = v.clone();
+    crate::breakpoints::strip_hints_in_place(&mut owned);
+    std::borrow::Cow::Owned(owned)
 }
 
 /// Rewrite every tool-call `arguments` string as its parsed JSON value, so
@@ -1021,5 +1057,108 @@ mod tests {
         let c = classify(&client, &canonical);
         assert_eq!(c.semantic_break, None);
         assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn cache_control_presence_and_placement_are_not_content() {
+        // Breakpoint hints move as conversations grow (Anthropic's
+        // incremental guidance); the provider does not tokenize them as
+        // content. A hint present on the canonical side and absent (or
+        // moved) on the client's is an exact match — never drift, never
+        // rewritten for, never at risk.
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "world"},
+        ]})];
+        let without = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world"},
+        ]})];
+        let c = classify(&without, &canonical);
+        assert!(c.report_matches, "hint presence alone is not drift");
+        assert_eq!(c.tokens_at_risk, 0);
+
+        let moved = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world", "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let c2 = classify(&moved, &canonical);
+        assert!(c2.report_matches, "hint placement alone is not drift");
+        assert_eq!(c2.drift_kind, None);
+
+        // A string ↔ hinted-parts reshape is still detected as a reshape:
+        // the hint must not block the ladder's sibling-gated rungs (the
+        // three-key part would read as non-flattenable without the strip).
+        let as_string = vec![json!({"role": "user", "content": "hello world"})];
+        let hinted_parts = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello world", "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let c3 = classify(&hinted_parts, &as_string);
+        assert_eq!(c3.semantic_break, None);
+        assert_eq!(
+            c3.drift_kind,
+            Some(DriftKind::RoleContentReshaped),
+            "the shape difference is still repairable drift"
+        );
+    }
+
+    #[test]
+    fn a_cache_control_key_outside_block_shape_is_payload() {
+        // `cache_control` with a non-object value, or on an object with no
+        // `type` sibling, is user payload: compared exactly like any other
+        // string leaf, never stripped.
+        let canonical = vec![json!({
+            "role": "user", "content": "x", "cache_control": 1,
+        })];
+        let client = vec![json!({
+            "role": "user", "content": "x", "cache_control": 2,
+        })];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+    }
+
+    #[test]
+    fn a_rewrite_never_inherits_the_canonical_side_hints() {
+        // The chain's element carries the proxy's breakpoints; the drifted
+        // re-send is rewritten to its content, hint-free. Hints are
+        // placement policy — re-derived by breakpoint management or the
+        // client's own — and a rewrite smuggling them in could push a
+        // client-managed request past the provider's block limit.
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "Please  summarize",
+             "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let mut client = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "Please summarize"},
+        ]})];
+        let c = classify(&client, &canonical);
+        let rw = apply_canonical(&mut client, &c, &canonical, &tok()).unwrap();
+        assert_eq!(rw.elements_replaced, 1);
+        assert_eq!(
+            client[0]["content"][0]["text"], "Please  summarize",
+            "the canonical content went in"
+        );
+        assert!(
+            client[0]["content"][0].get("cache_control").is_none(),
+            "the canonical side's hint did not"
+        );
+    }
+
+    #[test]
+    fn hint_ttl_differences_are_not_content() {
+        // A ttl changes retention policy, not the cached prefix's content;
+        // the match model ignores hints entirely, so this is an exact
+        // match. (Under --manage-breakpoints, ttl hints read as
+        // client-managed and pass through untouched — see
+        // crate::breakpoints.)
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+        ]})];
+        let client = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        ]})];
+        let c = classify(&client, &canonical);
+        assert!(c.report_matches);
+        assert_eq!(c.tokens_at_risk, 0);
     }
 }

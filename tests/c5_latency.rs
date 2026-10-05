@@ -88,6 +88,8 @@ async fn proxy_for(upstream: String) -> String {
         // The product default: the budget gates what ships, and drift
         // classification sits on the pre-forward path in dry-run.
         repair: cachemax::repair::RepairMode::DryRun,
+        manage_breakpoints: false,
+        force_breakpoints: false,
     });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();

@@ -113,6 +113,24 @@ impl Fault {
             docs: "repair-mode",
         }
     }
+
+    fn breakpoints_require_anthropic() -> Self {
+        Fault {
+            problem: "breakpoint management is anthropic-only",
+            cause: "--manage-breakpoints was set without --backend anthropic".into(),
+            fix: "pass --backend anthropic, or drop --manage-breakpoints",
+            docs: "breakpoints",
+        }
+    }
+
+    fn force_requires_manage() -> Self {
+        Fault {
+            problem: "nowhere to force breakpoints",
+            cause: "--force-breakpoints was set without --manage-breakpoints".into(),
+            fix: "add --manage-breakpoints (force overrides client-placed hints)",
+            docs: "breakpoints",
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -171,6 +189,18 @@ struct Cli {
     /// Keep the repair ledger in memory only; nothing is written to disk.
     #[arg(long, global = true)]
     no_ledger: bool,
+
+    /// Anthropic only: manage cache breakpoints (`cache_control` markers)
+    /// per Anthropic's incremental-breakpoint guidance — the last system
+    /// block plus the last user/tool-result blocks, at most 4 per request.
+    /// Requests carrying client-placed breakpoints pass through untouched.
+    #[arg(long, global = true)]
+    manage_breakpoints: bool,
+
+    /// With --manage-breakpoints: re-derive breakpoints even over
+    /// client-placed ones (still never exceeding the 4-block limit).
+    #[arg(long, global = true)]
+    force_breakpoints: bool,
 }
 
 #[derive(Subcommand)]
@@ -236,6 +266,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cachemax::proxy::ServeOptions {
                     repair,
                     inject_usage: !cli.no_inject_usage,
+                    manage_breakpoints: cli.manage_breakpoints,
+                    force_breakpoints: cli.force_breakpoints,
                 },
             )
             .await
@@ -317,6 +349,14 @@ async fn dispatch_serve(
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| Fault::bind_unavailable(bind, e.to_string()))?;
+    // Validate the breakpoint flags before serving: a flag that silently
+    // does nothing is a doc-lie, not a default.
+    if (options.manage_breakpoints || options.force_breakpoints) && backend != "anthropic" {
+        return Err(Fault::breakpoints_require_anthropic().into());
+    }
+    if options.force_breakpoints && !options.manage_breakpoints {
+        return Err(Fault::force_requires_manage().into());
+    }
     match backend {
         "openai" => {
             proxy::serve(

@@ -83,6 +83,12 @@ pub struct Record {
     /// annotation; repair decisions never consult token counts.
     #[serde(default)]
     pub canonicalized_tokens: u64,
+    /// `None` when breakpoint management is off (`--manage-breakpoints`
+    /// unset, or a non-Anthropic backend). `Some(n)`: the request as
+    /// forwarded carried `n` cache hints — the client's own, untouched,
+    /// when management declined to touch them.
+    #[serde(default)]
+    pub breakpoint_count: Option<u64>,
 }
 
 impl Record {
@@ -153,6 +159,7 @@ mod tests {
             matches_canonical: None,
             drift_kind: None,
             canonicalized_tokens: 0,
+            breakpoint_count: None,
         }
     }
 

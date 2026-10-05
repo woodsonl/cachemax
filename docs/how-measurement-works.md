@@ -40,6 +40,7 @@ One record per request. Nothing about message content is in it — metrics only:
 | `matches_canonical` | `null` when not examined; else whether the re-sent history byte-matched the canonical chain. |
 | `drift_kind` | The classified drift flavor, when there was one. |
 | `canonicalized_tokens` | Tokens of drifted history that would be (`dry_run`) or were (`on`) canonicalized. An estimate for annotation. |
+| `breakpoint_count` | Cache hints on the request as forwarded. `null` when breakpoint management is off; the client's own count when management declined to touch them. |
 
 ## The hit-rate formula
 

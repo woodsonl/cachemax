@@ -75,6 +75,12 @@ pub struct CanonicalTurn {
     /// continuity. A cross-check between the session store and the ledger;
     /// the ledger's authority is the messages themselves, never the hashes.
     pub prefix_hashes: Vec<u64>,
+    /// Breakpoints the proxy placed on the request as sent (0 when the
+    /// client manages its own, or the feature is off). A compliant client
+    /// echoes those bytes back, so the next turn tells its own hints from
+    /// the client's by this count.
+    #[serde(default)]
+    pub breakpoints: u64,
 }
 
 /// The on-disk line: the turn plus the session it belongs to. One JSON object
@@ -787,6 +793,7 @@ mod tests {
             request_messages: json!([{"role": "user", "content": marker}]),
             response_messages: vec![json!({"role": "assistant", "content": marker})],
             prefix_hashes: vec![seq as u64],
+            breakpoints: 0,
         }
     }
 
