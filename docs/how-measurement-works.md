@@ -70,7 +70,6 @@ Two rules that matter:
 denominator renders `—`, never `0`.
 
 ## What `provider_reported` means
-
 On the cloud path, the cache figure is the provider's own number. cachemax never
 re-derives or second-guesses it. OpenAI and OpenRouter report
 `usage.prompt_tokens_details.cached_tokens`; cachemax reads it and labels it
@@ -106,6 +105,35 @@ That derived figure is a secondary read on Anthropic's cache economics. The
 **headline** hit rate stays `cached / resent_history`, the same binding formula
 every other backend uses, so sessions are comparable across providers.
 
+## Repair (what the drift fields say)
+
+Repair is the second half of the product: the canonical ledger remembers the
+exact `messages` the proxy forwarded (and the assistant reply exactly as
+received), and each new request's re-sent history is classified against that
+chain. The record fields:
+
+- `repair_mode` — `off` (no classification), `dry_run` (the default:
+  classify and annotate, never touch a byte), or `on` (rewrite).
+- `matches_canonical` — `null` when mode is `off` (unexamined, **not**
+  false); otherwise whether the re-sent history matched the chain under
+  semantic JSON equality: object key order is not drift, string leaves are
+  compared byte-for-byte.
+- `drift_kind` — the classified flavor when it drifted: tool-call
+  `arguments` re-serialized, whitespace normalized, leading history
+  truncated, content reshaped between string and parts form — or `mixed`.
+  `null` also covers the hard stops (changed system prompt, model switch,
+  first turn), which are never rewritten.
+- `canonicalized_tokens` — the tokens drift endanger (`dry_run` estimate)
+  or that were actually rewritten (`on`).
+- `repaired` — true only when `on` mode actually rewrote the request.
+
+Rewriting replaces drifted elements with the canonical serialization the
+provider already cached — bytes the provider already accepted, never invented
+content — and every rewrite is logged. Semantic inequality passes through
+untouched and flagged. The dashboard adds a **recovered by repair** line:
+cache-served tokens on repaired turns, the proof the rewrite re-read a warm
+prefix.
+
 ## Cost
 
 Cost is priced from a static per-model rate table (`src/rates.rs`), overridable
@@ -121,6 +149,7 @@ Unknown models carry no cost rather than a guessed one.
 
 ## What is not measured
 
-cachemax measures cache reuse and its cost/speed consequence. It does not repair
-a broken prefix, warm a cache, or route by prefix affinity — those are later
-phases. It measures first.
+cachemax measures cache reuse and its cost/speed consequence, and (see the
+companion repair documentation in the README) repairs drifted history. It does
+not warm a cache from nothing, prefetch content the client has not sent, or
+route by prefix affinity — those remain out of scope.

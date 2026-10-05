@@ -154,7 +154,7 @@ be created or written — permissions, a read-only volume, or the path is a file
 memory only (repair then works within a single run and forgets the chain on
 restart). The ledger stores the message content cachemax forwards and receives,
 locally, so repair can extend the provider-seen prefix; it is never exported or
-logged. Delete the directory to purge it.
+logged. Purge it with `cachemax purge`.
 
 ## repair-mode
 

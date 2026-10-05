@@ -2,17 +2,26 @@
 
 An OpenAI-compatible proxy that sits in front of an LLM endpoint, measures how
 much of each request's re-sent history was served from the provider's prompt
-cache, and reports the cost and speed consequence on a live dashboard.
+cache, repairs drifted request history so the provider re-sees what it already
+cached, and reports the cost and speed consequence on a live dashboard.
 
-It measures first. It does not repair yet.
+Measure → repair → prove, on one loopback port:
 
-- **Cloud (typical):** point an app or agent at the proxy instead of directly at
-  OpenAI, Anthropic, or OpenRouter. See how much prompt-cache reuse you get and
-  what it costs.
-- **Local (minority):** run llama.cpp, vLLM, or mlx-lm and watch TTFT collapse
-  as the cache warms. (mlx-lm is macOS/Apple Silicon only.)
-
-Both are first-class targets.
+- **Measure (always on):** point an app or agent at the proxy instead of
+  directly at OpenAI, Anthropic, or OpenRouter, and see how much prompt-cache
+  reuse you get and what it costs. Local engines (llama.cpp, vLLM, mlx-lm) are
+  a first-class target too: watch TTFT collapse as the cache warms.
+- **Repair (dry-run by default):** agent frameworks re-serialize tool-call
+  arguments and re-wrap text on every turn, and each re-serialization breaks
+  the provider's cache key. cachemax classifies that drift per turn — in
+  `--repair on` it rewrites the drifted history back to the exact
+  serialization the provider already cached, so the cache hits again. It never
+  invents content: a rewrite replaces bytes with bytes the provider already
+  accepted, and anything semantically different passes through untouched and
+  flagged.
+- **Prove:** every turn's record shows what happened — drift classified,
+  tokens repaired, cache-served tokens recovered — on the dashboard and in the
+  metrics-only JSONL export.
 
 ## Install
 
@@ -123,7 +132,9 @@ The last five fields are the drift annotation: `repair_mode` (`off` |
 `dry_run` | `on`), `repaired` (true only when a rewrite happened), and — when
 the turn was examined — whether the re-sent history matched the canonical
 chain under semantic JSON equality, the classified drift flavor, and the
-tokens at risk. Still metrics only: never message content.
+tokens at risk. `breakpoint_count` is the cache hints on the request as
+forwarded (`null` when breakpoint management is off). Still metrics only:
+never message content.
 
 ## Commands
 
@@ -132,6 +143,7 @@ tokens at risk. Still metrics only: never message content.
 | `cachemax serve` | Run the proxy + dashboard (default). |
 | `cachemax check` | Check the upstream is reachable; exit non-zero if not. |
 | `cachemax export` | Write the running proxy's session as JSONL. |
+| `cachemax purge` | Delete the on-disk repair ledger (see Security). |
 
 | Flag | Meaning |
 |---|---|
@@ -157,10 +169,11 @@ One thing does touch disk: the **repair ledger**. To repair a broken cache
 prefix, cachemax must remember the exact message content it forwarded and
 received, so `serve` persists that record locally under
 `~/.cache/cachemax/ledger/` (one JSONL file per session). It stays on your
-machine, is never included in exports or logs, and you can delete the directory
-at any time, or run with `--no-ledger` to keep it in memory only. A purge
-command ships with the repair release; until then, deleting the directory is
-the purge.
+machine, is never included in exports or logs, and is purged with
+`cachemax purge` (or `cachemax purge --ledger-dir <path>` for a non-default
+location) — it deletes only the ledger's own `*.jsonl` files, touches nothing
+else in the directory, and prints what it removed. Run with `--no-ledger` to
+keep the ledger in memory only, so nothing is ever written at all.
 
 Binding non-loopback is explicit (`--bind`) and should be done only on a
 trusted host.

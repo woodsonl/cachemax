@@ -182,7 +182,7 @@ struct Cli {
     /// Directory for the repair ledger (default: ~/.cache/cachemax/ledger).
     /// The ledger stores the exact message content the proxy forwards and
     /// receives — locally only, never exported — so repair can extend the
-    /// provider-seen prefix. Delete the directory to purge it.
+    /// provider-seen prefix. Purge it with `cachemax purge`.
     #[arg(long, global = true)]
     ledger_dir: Option<String>,
 
@@ -215,10 +215,14 @@ enum Command {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Delete the on-disk repair ledger (the exact messages the proxy
+    /// forwarded and received). Metrics and exports are unaffected; a
+    /// running proxy's in-memory ledger is not — restart to drop it.
+    Purge,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let level = if cli.verbose {
@@ -228,10 +232,92 @@ async fn main() {
     };
     tracing_subscriber::fmt().with_max_level(level).init();
 
+    // Purge needs nothing but the ledger directory: no tokenizer, no
+    // adapter, and it must not CREATE a ledger merely by running.
+    if matches!(cli.command, Some(Command::Purge)) {
+        let dir = cli
+            .ledger_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_ledger_dir);
+        let report = purge_ledger(&dir)?;
+        if report.files == 0 && !report.dir_existed {
+            println!("nothing to purge: {} does not exist", dir.display());
+        } else if report.files == 0 {
+            println!("ledger {} already empty", dir.display());
+        } else {
+            println!(
+                "purged {} ledger file(s), {} bytes, from {}",
+                report.files,
+                report.bytes,
+                dir.display()
+            );
+        }
+        return Ok(());
+    }
     if let Err(e) = run(cli).await {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// What one purge removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub dir_existed: bool,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Delete the ledger's JSONL files from `dir`. Only the ledger's own
+/// files (`*.jsonl` directly inside the directory) are removed: anything
+/// else that lives there — and the directory itself — is left alone.
+/// In-memory ledgers of a running proxy are untouched by design.
+pub fn purge_ledger(dir: &std::path::Path) -> Result<PurgeReport, Box<dyn std::error::Error>> {
+    if !dir.exists() {
+        return Ok(PurgeReport {
+            dir_existed: false,
+            files: 0,
+            bytes: 0,
+        });
+    }
+    if !dir.is_dir() {
+        return Err(Fault {
+            problem: "ledger directory unusable",
+            cause: format!("{} is not a directory", dir.display()),
+            fix: "pass the --ledger-dir the proxy runs with (default: ~/.cache/cachemax/ledger)",
+            docs: "ledger",
+        }
+        .into());
+    }
+    let mut report = PurgeReport {
+        dir_existed: true,
+        files: 0,
+        bytes: 0,
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_ledger_file = path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
+        if !is_ledger_file {
+            continue;
+        }
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.files += 1;
+                report.bytes += bytes;
+            }
+            // A file that cannot be removed is reported, not fatal: the
+            // rest of the purge still happened.
+            Err(e) => eprintln!("could not remove {}: {e}", path.display()),
+        }
+    }
+    Ok(report)
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -301,6 +387,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {path}");
             Ok(())
         }
+        // Handled before `run` (it needs no tokenizer or upstream); the
+        // compiler still wants the arm here.
+        Command::Purge => Ok(()),
     }
 }
 
@@ -499,5 +588,43 @@ mod tests {
         // silently write `cachemax-0.jsonl`.
         assert_eq!(first_session_id(""), None);
         assert_eq!(first_session_id("\n  \n"), None);
+    }
+
+    #[test]
+    fn purge_removes_only_ledger_files() {
+        let dir = std::env::temp_dir().join(format!("cachemax-purge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("7.jsonl");
+        let b = dir.join("9.JSONL"); // case-insensitive ledger files
+        let keep = dir.join("notes.txt");
+        let nested = dir.join("sub.jsonl"); // a directory, not a file
+        std::fs::write(&a, "{\"turn\":1}\n").unwrap();
+        std::fs::write(&b, "{\"turn\":2}\n").unwrap();
+        std::fs::write(&keep, "user data").unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let report = purge_ledger(&dir).unwrap();
+        assert_eq!(report.files, 2);
+        assert!(report.bytes > 0);
+        assert!(!a.exists(), "ledger files are gone");
+        assert!(!b.exists(), "case-insensitive too");
+        assert!(keep.exists(), "non-ledger files stay");
+        assert!(nested.exists(), "subdirectories stay");
+        assert!(dir.exists(), "the directory itself stays");
+
+        // A second purge is a clean no-op; a missing dir reports honestly.
+        let again = purge_ledger(&dir).unwrap();
+        assert_eq!(again.files, 0);
+        let missing = purge_ledger(&dir.join("nope")).unwrap();
+        assert!(!missing.dir_existed && missing.files == 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_of_a_file_path_faults() {
+        let f = std::env::temp_dir().join(format!("cachemax-purge-file-{}", std::process::id()));
+        std::fs::write(&f, "x").unwrap();
+        assert!(purge_ledger(&f).is_err());
+        std::fs::remove_file(&f).ok();
     }
 }
