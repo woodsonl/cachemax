@@ -89,12 +89,12 @@ pub fn plan_request(
     }
 }
 
-/// Stamp a record with the drift claim computed on the request path. The
-/// request itself was untouched in every mode except `on` (the rewrite
-/// batch overrides `repaired`/`canonicalized_tokens` when it actually
-/// rewrites). Shared by the stream-finalize path and the send-error path so
-/// an examined turn is never recorded as unexamined.
-fn apply_drift_claim(record: &mut Record, report: &DriftReport) {
+/// Stamp a record with the drift claim computed on the request path, plus
+/// the rewrite outcome when one was applied (the actual canonicalized
+/// amount in place of the estimate). Every path that records an examined
+/// turn stamps the same claim, so a send failure and a clean finalize
+/// agree on what repair did.
+fn apply_drift_claim(record: &mut Record, report: &DriftReport, rewrite: Option<&repair::Rewrite>) {
     record.repair_mode = report.mode;
     record.matches_canonical = if report.mode == RepairMode::Off {
         None
@@ -103,6 +103,10 @@ fn apply_drift_claim(record: &mut Record, report: &DriftReport) {
     };
     record.drift_kind = report.drift_kind;
     record.canonicalized_tokens = report.tokens_at_risk;
+    if let Some(rw) = rewrite {
+        record.repaired = true;
+        record.canonicalized_tokens = rw.canonicalized_tokens;
+    }
 }
 
 /// The raw observed figures for one turn, before cost is applied.
@@ -401,6 +405,9 @@ struct Finalizer<A: Adapter> {
     /// The drift report computed on the request path. Patched into the
     /// record at finalize; dry-run never lets it touch the request.
     drift_report: DriftReport,
+    /// The rewrite that was applied (`on` mode, drift present, chain
+    /// extendable). `None` means the request went out untouched.
+    rewrite: Option<repair::Rewrite>,
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
@@ -445,7 +452,7 @@ impl<A: Adapter> Finalizer<A> {
             complete,
             engine_cached,
         );
-        apply_drift_claim(&mut record, &self.drift_report);
+        apply_drift_claim(&mut record, &self.drift_report, self.rewrite.as_ref());
         if complete {
             // The canonical turn: the messages exactly as forwarded, extended
             // by the assistant message(s) exactly as received. Only complete
@@ -701,26 +708,21 @@ async fn sample_prom(
 /// when the request sets `stream_options.include_usage`. The proxy measures
 /// cache reuse, so it asks for usage on the client's behalf: if the body is a
 /// JSON object with `"stream": true` and no `stream_options.include_usage`, set
-/// it. Non-streaming bodies, non-OpenAI dialects, and bodies already opting in
-/// are returned unchanged.
+/// it. Non-streaming bodies and bodies already opting in are left unchanged.
 ///
-/// Mutates `doc` in place — the caller's single parse serves session planning,
-/// the canonical ledger, and the forwarded bytes — and returns the bytes to
-/// forward: the re-serialized `doc` when injection applied, else the client's
-/// original bytes, untouched.
-fn with_usage_requested(doc: &mut serde_json::Value, original: &Bytes, inject: bool) -> Bytes {
-    if !inject {
-        return original.clone();
-    }
+/// Mutates `doc` in place and returns whether anything changed. The caller
+/// serializes once, after every mutation (injection, repair rewrite) has
+/// applied — never once per mutation.
+fn ensure_usage_requested(doc: &mut serde_json::Value) -> bool {
     if doc.get("stream").and_then(|s| s.as_bool()) != Some(true) {
-        return original.clone();
+        return false;
     }
-    let already = doc
+    if doc
         .pointer("/stream_options/include_usage")
         .and_then(|b| b.as_bool())
-        .unwrap_or(false);
-    if already {
-        return original.clone();
+        .unwrap_or(false)
+    {
+        return false;
     }
     if !doc
         .get("stream_options")
@@ -730,10 +732,7 @@ fn with_usage_requested(doc: &mut serde_json::Value, original: &Bytes, inject: b
         doc["stream_options"] = serde_json::json!({});
     }
     doc["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
-    match serde_json::to_vec(doc) {
-        Ok(b) => Bytes::from(b),
-        Err(_) => original.clone(),
-    }
+    true
 }
 
 /// The request handler: plan, forward, stream through, observe, finalize.
@@ -754,36 +753,110 @@ pub async fn handle_chat<A: Adapter + 'static>(
     };
     let model = model_from_doc(&doc);
 
-    let plan = {
+    let mut plan = {
         let mut guard = state.sessions.lock();
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
-    // Drift classification (dry-run default): does this request extend the
-    // canonical chain we forwarded last time? Never mutates the request in
-    // any mode except `on` (which lands with the repair batch); dry-run only
-    // produces the report the record carries.
-    let drift_report = if state.repair == RepairMode::Off {
-        DriftReport::unexamined(RepairMode::Off)
+    // The repair stage: classify the re-sent history against the canonical
+    // chain, then — only in `on` mode — rewrite drifted elements to the
+    // canonical serialization. Dry-run (the default) and off never touch a
+    // byte. The per-request header overrides the configured mode.
+    let effective_mode = match headers
+        .get("x-cachemax-repair")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on") => RepairMode::On,
+        Some("off") => RepairMode::Off,
+        Some(other) => {
+            tracing::warn!(value = %other, "ignoring unknown x-cachemax-repair override");
+            state.repair
+        }
+        None => state.repair,
+    };
+    let (drift_report, mut rewrite, mut pre_repair_messages) = if effective_mode == RepairMode::Off
+    {
+        (DriftReport::unexamined(RepairMode::Off), None, None)
     } else {
-        let (chain, other_models) = {
+        // Which chain does this request extend? Its own session's, or — when
+        // the session forked (truncated or re-based leading history shares
+        // no prefix-hash, so the store allocated a new session) — a probed
+        // chain: the most recently written one for this model, accepted
+        // below only when the client's history actually reads as a re-send
+        // of it. A model switch gets no cross-chain fallback: chains are
+        // per model by design.
+        let (chain, model_switched, probed) = {
             let ledger = state.ledger.lock();
-            let chain = ledger.canonical_messages(plan.session_id, &model);
-            let other_models = ledger.session_has_chains(plan.session_id);
-            (chain, other_models)
+            match ledger.canonical_messages(plan.session_id, &model) {
+                Some(c) => (Some(c), false, false),
+                None if ledger.session_has_chains(plan.session_id) => (None, true, false),
+                None => (
+                    ledger
+                        .most_recent_chain_session(&model)
+                        .and_then(|s| ledger.canonical_messages(s, &model)),
+                    false,
+                    true,
+                ),
+            }
         };
-        let client_values = doc
+        let mut client_values = doc
             .get("messages")
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default();
-        let classification = repair::classify_turn(
+        let mut classification = repair::classify_turn(
             &client_values,
             chain.as_deref(),
-            other_models,
+            model_switched,
             &state.tokenizer,
         );
-        repair::report(&classification, state.repair)
+        if probed && !(classification.semantic_break.is_none() && classification.equivalent_run > 0)
+        {
+            // The probed chain is only a candidate — the most recently
+            // written chain *for the model*, nothing more. It stands for
+            // this conversation only when the client's history reads as a
+            // re-send of it: every element with a canonical counterpart
+            // aligns, and at least one does. A request that merely shares
+            // a leading span with a foreign conversation (the same
+            // framework system prompt is the norm) breaks somewhere inside
+            // — that is a new conversation's first turn, honestly reported
+            // and never rewritten.
+            classification = repair::classify_turn(&client_values, None, false, &state.tokenizer);
+        }
+        let report = repair::report(&classification, effective_mode);
+        let mut rewrite = None;
+        let mut pre_repair_messages = None;
+        if effective_mode == RepairMode::On {
+            if let Some(chain) = chain.as_deref() {
+                if let Some(rw) = repair::apply_canonical(
+                    &mut client_values,
+                    &classification,
+                    chain,
+                    &state.tokenizer,
+                ) {
+                    // The rewrite log (trust): what, why, how much. Metadata
+                    // only — the content stays in the local ledger.
+                    tracing::info!(
+                        target: "cachemax_repair",
+                        session = plan.session_id,
+                        turn = plan.turn,
+                        kind = ?report.drift_kind,
+                        elements = rw.elements_replaced,
+                        tokens = rw.canonicalized_tokens,
+                        "rewrote drifted history to canonical"
+                    );
+                    // What the messages were before the rewrite: if
+                    // re-serialization ever fails below, the ledger must
+                    // still record what actually went on the wire.
+                    pre_repair_messages = doc.get("messages").cloned();
+                    doc["messages"] = serde_json::Value::Array(client_values);
+                    rewrite = Some(rw);
+                }
+            }
+        }
+        (report, rewrite, pre_repair_messages)
     };
 
     // Forward first. The request body is passed through untouched unless
@@ -813,13 +886,49 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Only the OpenAI dialect understands `stream_options`; Anthropic's
     // Messages API would reject it, so never inject there.
     let inject = state.inject_usage && matches!(state.adapter.name(), "openai" | "vllm");
-    let forwarded = with_usage_requested(&mut doc, &body, inject);
-    // The ledger remembers the messages exactly as forwarded — after any
-    // injection, byte-for-byte the `messages` the provider received.
-    let as_sent_messages = doc
-        .get("messages")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    // Every mutation applies before one serialization: usage injection and
+    // a repair rewrite each may change the document, and neither pays for
+    // a second pass.
+    let usage_mutated = inject && ensure_usage_requested(&mut doc);
+    let (forwarded, as_sent_messages) = if usage_mutated || rewrite.is_some() {
+        match serde_json::to_vec(&doc) {
+            Ok(bytes) => (
+                Bytes::from(bytes),
+                doc.get("messages")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            Err(_) => {
+                // Unreachable with a document parsed from the request, but
+                // degrade honestly: forward the client's bytes untouched and
+                // claim no rewrite whose forwarded form could not be
+                // produced. The ledger then records what really went out.
+                rewrite = None;
+                (
+                    body.clone(),
+                    pre_repair_messages
+                        .take()
+                        .unwrap_or_else(|| doc.get("messages").cloned().unwrap_or_default()),
+                )
+            }
+        }
+    } else {
+        (
+            body.clone(),
+            doc.get("messages")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+    };
+    if rewrite.is_some() {
+        // The canonical turn's prefix hashes must describe what was
+        // forwarded, not what the client sent: a rewrite changes the
+        // flattened history that turn claims to extend, and its hashes
+        // must agree with its (rewritten) request messages.
+        if let Some(sent) = messages_from_doc(&doc) {
+            plan.prefix_hashes = state.tokenizer.prefix_hashes(&sent);
+        }
+    }
     let upstream = match req.body(forwarded).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -832,9 +941,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 false,
             );
             // The turn was examined; the failed-forward record still carries
-            // the drift claim (it stays excluded from aggregates as
-            // Incomplete).
-            apply_drift_claim(&mut record, &drift_report);
+            // the drift claim — and the rewrite claim, when one was applied
+            // before the send failed — exactly as a clean finalize would
+            // (it stays excluded from aggregates as Incomplete).
+            apply_drift_claim(&mut record, &drift_report, rewrite.as_ref());
             crate::export::log_finalize(&record);
             state.sessions.lock().append(record);
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();
@@ -878,6 +988,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             ledger,
             as_sent_messages,
             drift_report,
+            rewrite,
             complete: true,
             done: false,
             metrics,
@@ -986,42 +1097,32 @@ mod tests {
 
     #[test]
     fn usage_is_requested_on_openai_streaming_only() {
-        let run = |body: &'static [u8], inject: bool| {
-            let bytes = Bytes::from_static(body);
+        let run = |body: &'static [u8]| {
             let mut doc: serde_json::Value = serde_json::from_slice(body).unwrap();
-            let out = with_usage_requested(&mut doc, &bytes, inject);
-            (out, doc)
+            let mutated = ensure_usage_requested(&mut doc);
+            (mutated, serde_json::to_vec(&doc).unwrap())
         };
-        let (out, doc) = run(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#, true);
-        assert_eq!(doc["stream_options"]["include_usage"], true);
-        let reparsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(reparsed["stream_options"]["include_usage"], true);
-        // Injection preserves the rest of the document's key order.
-        assert_eq!(out.to_vec(), br#"{"model":"gpt-4o","stream":true,"messages":[],"stream_options":{"include_usage":true}}"#.to_vec());
+        let (mutated, out) = run(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+        assert!(mutated);
+        // Injection preserves the rest of the document's key order, and the
+        // caller's single serialization carries it.
+        assert_eq!(
+            out,
+            br#"{"model":"gpt-4o","stream":true,"messages":[],"stream_options":{"include_usage":true}}"#.to_vec()
+        );
 
         // Non-streaming untouched.
-        let nonstream = Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#);
-        let out = with_usage_requested(
-            &mut serde_json::from_slice(&nonstream).unwrap(),
-            &nonstream,
-            true,
-        );
-        assert_eq!(&out[..], &nonstream[..]);
-
-        // Opt-out untouched.
-        let stream = Bytes::from_static(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
-        let out = with_usage_requested(
-            &mut serde_json::from_slice(&stream).unwrap(),
-            &stream,
-            false,
-        );
-        assert_eq!(&out[..], &stream[..]);
+        let (mutated, out) = run(br#"{"model":"gpt-4o","messages":[]}"#);
+        assert!(!mutated);
+        assert_eq!(out, br#"{"model":"gpt-4o","messages":[]}"#.to_vec());
 
         // Already opted in: unchanged, not duplicated.
-        let opted =
-            Bytes::from_static(br#"{"stream":true,"stream_options":{"include_usage":true}}"#);
-        let out = with_usage_requested(&mut serde_json::from_slice(&opted).unwrap(), &opted, true);
-        assert_eq!(&out[..], &opted[..]);
+        let (mutated, out) = run(br#"{"stream":true,"stream_options":{"include_usage":true}}"#);
+        assert!(!mutated);
+        assert_eq!(
+            out,
+            br#"{"stream":true,"stream_options":{"include_usage":true}}"#.to_vec()
+        );
     }
 
     #[test]

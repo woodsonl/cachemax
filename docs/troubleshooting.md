@@ -155,3 +155,18 @@ memory only (repair then works within a single run and forgets the chain on
 restart). The ledger stores the message content cachemax forwards and receives,
 locally, so repair can extend the provider-seen prefix; it is never exported or
 logged. Delete the directory to purge it.
+
+## repair-mode
+
+**Problem:** `--repair` rejects the given mode.
+
+**Cause:** the value is not one of the three modes.
+
+**Fix:** `--repair dry-run` (the default: detect and annotate drift, never
+touch a byte), `--repair on` (rewrite drifted history to the canonical
+serialization the provider already saw — every rewrite is logged), or
+`--repair off` (no classification). A per-request `x-cachemax-repair: on|off`
+header overrides the configured mode for that one request. `on` never
+rewrites what it cannot prove equivalent: changed tool arguments, changed
+system prompts, model switches, and first turns all pass through untouched
+and are flagged instead.

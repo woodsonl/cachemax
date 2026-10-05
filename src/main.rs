@@ -105,6 +105,14 @@ impl Fault {
             docs: "ledger",
         }
     }
+    fn repair_mode_unknown(other: &str) -> Self {
+        Fault {
+            problem: "unknown repair mode",
+            cause: format!("'{other}' is not a repair mode"),
+            fix: "use one of: dry-run (default), on, off",
+            docs: "repair-mode",
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -146,6 +154,12 @@ struct Cli {
     /// chunk (and thus cache figures); disable only for strict pass-through.
     #[arg(long, global = true)]
     no_inject_usage: bool,
+
+    /// Repair mode: `dry-run` (default; detect and annotate drift, never
+    /// touch a byte), `on` (rewrite drifted history to the canonical
+    /// serialization), `off` (no classification). Every rewrite is logged.
+    #[arg(long, global = true, default_value = "dry-run")]
+    repair: String,
 
     /// Directory for the repair ledger (default: ~/.cache/cachemax/ledger).
     /// The ledger stores the exact message content the proxy forwards and
@@ -196,6 +210,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| Fault::tokenizer_unavailable(&cli.tokenizer, e))?;
     // Built before the command is taken out of `cli` (a partial move).
     let ledger = build_ledger(&cli)?;
+    let repair = match cli.repair.as_str() {
+        "off" => cachemax::repair::RepairMode::Off,
+        "dry-run" => cachemax::repair::RepairMode::DryRun,
+        "on" => cachemax::repair::RepairMode::On,
+        other => return Err(Fault::repair_mode_unknown(other).into()),
+    };
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
@@ -210,11 +230,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ledger,
                 upstream,
                 &cli.bind,
-                // Dry-run is the product default: classify and annotate,
-                // never rewrite. The `--repair` flag lands with the rewrite
-                // batch; until then the mode is fixed here.
+                // Dry-run is the default; `on` requires the operator to ask
+                // for it explicitly with --repair on (or the per-request
+                // x-cachemax-repair header).
                 cachemax::proxy::ServeOptions {
-                    repair: cachemax::repair::RepairMode::DryRun,
+                    repair,
                     inject_usage: !cli.no_inject_usage,
                 },
             )

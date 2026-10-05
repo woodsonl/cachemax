@@ -205,6 +205,11 @@ impl SessionStore {
         self.sessions.len()
     }
 
+    /// Total recorded turns across all sessions.
+    pub fn total_records(&self) -> usize {
+        self.sessions.values().map(|s| s.records.len()).sum()
+    }
+
     /// Whether any session is tracked.
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
