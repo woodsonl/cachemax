@@ -106,6 +106,11 @@ fn apply_drift_claim(record: &mut Record, report: &DriftReport, rewrite: Option<
     record.repair_mode = report.mode;
     record.matches_canonical = if report.mode == RepairMode::Off {
         None
+    } else if !report.system_examined && report.matches_canonical {
+        // The top-level system had no baseline to examine: a messages-only
+        // match cannot confirm the whole span. A proven mismatch keeps its
+        // `false` — hiding known drift would be its own falsehood.
+        None
     } else {
         Some(report.matches_canonical)
     };
@@ -950,10 +955,16 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // fabricate a hard stop — with an at-risk figure counted from the
         // literal `null` — on every such turn. A system that genuinely rides
         // inside `messages` (OpenAI) is classified there, so nothing is lost.
-        let sys = if chain.is_some() && !probed_rejected && !canonical_system.is_null() {
+        // `examined` is false when the ladder had no baseline AND the client
+        // actually carries a system: that span went unexamined, so the
+        // record must not claim a whole-span match.
+        let system_examined = (chain.is_some() && !probed_rejected && !canonical_system.is_null())
+            || client_system.is_null();
+        let sys = if system_examined {
             repair::classify_system(&client_system, &canonical_system, &state.tokenizer)
         } else {
             repair::SystemRelation {
+                examined: false,
                 kind: None,
                 different: false,
                 tokens_at_risk: 0,
@@ -985,7 +996,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // hints, and a survey taken after that would read the proxy's own
         // output as if the client had sent it.
         let survey = crate::breakpoints::survey(&doc);
-        let report = repair::report(&classification, effective_mode);
+        let report = repair::report(&classification, effective_mode, system_examined);
         let mut rewrite = None;
         if effective_mode == RepairMode::On {
             if let Some(chain) = chain.as_deref() {

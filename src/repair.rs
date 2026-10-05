@@ -101,7 +101,11 @@ pub enum Unrepairable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftReport {
     pub mode: RepairMode,
-    /// True when the whole re-sent span is exactly the canonical chain.
+    /// True when the whole re-sent span is exactly the canonical chain —
+    /// the re-sent `messages` under semantic JSON equality, and the
+    /// top-level `system` when one had a recorded baseline to compare
+    /// against. A system without a baseline is unexamined, not matching.
+    pub system_examined: bool,
     pub matches_canonical: bool,
     pub drift_kind: Option<DriftKind>,
     /// Re-sent history elements not byte-equal to their canonical
@@ -120,6 +124,7 @@ impl DriftReport {
     pub fn unexamined(mode: RepairMode) -> Self {
         Self {
             mode,
+            system_examined: false,
             matches_canonical: false,
             drift_kind: None,
             turns_affected: 0,
@@ -302,9 +307,14 @@ pub fn classify_turn(
 }
 
 /// Turn a classification into the record-facing report under `mode`.
-pub fn report(classification: &Classification, mode: RepairMode) -> DriftReport {
+pub fn report(
+    classification: &Classification,
+    mode: RepairMode,
+    system_examined: bool,
+) -> DriftReport {
     DriftReport {
         mode,
+        system_examined,
         matches_canonical: classification.unrepairable.is_none() && classification.report_matches,
         drift_kind: classification.drift_kind,
         turns_affected: classification.turns_affected,
@@ -409,6 +419,11 @@ fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
 /// same hard stop: a semantically different system is never rewritten.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemRelation {
+    /// Whether the ladder actually compared against a recorded baseline.
+    /// `false` when it was skipped (no chain, or a chain recorded without a
+    /// top-level system): the caller then knows the system was unexamined
+    /// and must not claim a whole-span match.
+    pub examined: bool,
     /// The repairable drift flavor, when the system is
     /// equivalent-but-not-exact. `None` when exact or absent.
     pub kind: Option<DriftKind>,
@@ -433,6 +448,7 @@ pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer)
     };
     if client_present != canonical_present {
         return SystemRelation {
+            examined: true,
             kind: None,
             different: true,
             tokens_at_risk: at_risk(),
@@ -440,6 +456,7 @@ pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer)
     }
     if !client_present || client == canonical {
         return SystemRelation {
+            examined: true,
             kind: None,
             different: false,
             tokens_at_risk: 0,
@@ -455,6 +472,7 @@ pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer)
     let canonical = strip_cache_control(canonical);
     if client == canonical {
         return SystemRelation {
+            examined: true,
             kind: None,
             different: false,
             tokens_at_risk: 0,
@@ -469,12 +487,14 @@ pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer)
         Some(DriftKind::RoleContentReshaped)
     } else {
         return SystemRelation {
+            examined: true,
             kind: None,
             different: true,
             tokens_at_risk: at_risk(),
         };
     };
     SystemRelation {
+        examined: true,
         kind,
         different: false,
         tokens_at_risk: at_risk(),
@@ -1177,7 +1197,7 @@ mod tests {
         let canonical = msgs(&[("user", "hi  there"), ("assistant", "yo")]);
         let client = msgs(&[("user", "hi there"), ("assistant", "yo")]);
         let c = classify(&client, &canonical);
-        let r = report(&c, RepairMode::DryRun);
+        let r = report(&c, RepairMode::DryRun, true);
         assert_eq!(r.mode, RepairMode::DryRun);
         assert!(!r.matches_canonical);
         assert_eq!(r.drift_kind, Some(DriftKind::TextNormalization));
