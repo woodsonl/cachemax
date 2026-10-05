@@ -475,30 +475,15 @@ fn system_prose_normalized(v: &Value) -> Value {
 }
 
 /// Flatten the top-level `system` to its text, so a string and an equivalent
-/// block array compare equal. Mirrors [`reshaped`] for the system's shapes.
+/// block array compare equal. The system's shapes (a bare string, or an
+/// array of text parts) are exactly what [`all_text_flattened`] accepts, so
+/// the same two-key sibling gate applies: a block carrying `annotations`,
+/// `signature`, or any other sibling is data and blocks the reshape — repair
+/// never drops a sibling it did not prove equal.
 fn system_reshaped(v: &Value) -> Value {
-    match v {
-        Value::String(_) => v.clone(),
-        Value::Array(blocks) => {
-            let mut text = String::new();
-            for b in blocks {
-                let Some(map) = b.as_object() else {
-                    return v.clone();
-                };
-                match map.get("type").and_then(Value::as_str) {
-                    Some("text") if map.contains_key("text") => {
-                        if let Some(t) = map.get("text").and_then(Value::as_str) {
-                            text.push_str(t);
-                        } else {
-                            return v.clone();
-                        }
-                    }
-                    _ => return v.clone(),
-                }
-            }
-            Value::String(text)
-        }
-        _ => v.clone(),
+    match all_text_flattened(v) {
+        Some(text) => Value::String(text),
+        None => v.clone(),
     }
 }
 

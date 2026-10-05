@@ -132,10 +132,19 @@ impl Record {
 }
 
 /// The foreign-prefix floor of a session: cached tokens reported on a turn
-/// that re-sent no history, therefore attributable to the endpoint's own
-/// wrapper (router prompt, injected preamble) rather than this
-/// conversation. The minimum over such turns; `0` when none exists (direct
-/// providers report `0` cached on a cold turn, so they are unaffected).
+/// that re-sent no history **and wrote nothing to the cache**, therefore
+/// attributable to the endpoint's own wrapper (router prompt, injected
+/// preamble) rather than this conversation. The minimum over such turns; `0`
+/// when none exists.
+///
+/// The write gate is what separates a wrapper from a client's own cache: a
+/// cold turn that *wrote* what it read (Anthropic's `cache_creation_input_tokens`,
+/// typically from a `cache_control` breakpoint on the system prompt) cached
+/// this conversation's own prefix, so its reading is not foreign. Only a cold
+/// turn that read a prefix it did not create — and, on direct providers, that
+/// is impossible, since they report `0` cached on a cold turn — reveals a
+/// foreign span. Erring toward `0` is deliberate: a false floor would
+/// under-report real reuse, the worse error.
 pub fn router_prefix_floor(records: &[Record]) -> u64 {
     records
         .iter()
@@ -143,6 +152,7 @@ pub fn router_prefix_floor(records: &[Record]) -> u64 {
             r.status == Status::Complete
                 && r.turn == 0
                 && r.resent_history_tokens == 0
+                && r.cache_written_tokens == 0
                 && r.source != SourceLabel::NoCacheTruth
         })
         .map(|r| r.cached_tokens)
@@ -254,8 +264,8 @@ mod tests {
     #[test]
     fn router_floor_is_the_cold_turn_reading() {
         // A routed endpoint reports 128 cached tokens even on the cold turn
-        // (its own wrapper). That span is foreign to this conversation and
-        // the re-sent-history denominator never contains it.
+        // (its own wrapper) and wrote none of them — the router cached that
+        // prefix before our request.
         let cold = rec(0, Status::Complete, 128, 0);
         let warm = rec(1, Status::Complete, 628, 500);
         let records = [cold, warm];
@@ -269,6 +279,26 @@ mod tests {
             (net - 500.0 / 500.0).abs() < 1e-9,
             "628-128 over 500 = 100%"
         );
+    }
+
+    #[test]
+    fn a_clients_own_cold_cache_is_not_a_floor() {
+        // Direct Anthropic: a cold turn whose `cache_control` breakpoint
+        // cached the system prompt reports a read AND a creation for that
+        // same prefix. That is this conversation's own cache, not a foreign
+        // wrapper — netting it would under-report real reuse.
+        let mut cold = rec(0, Status::Complete, 4000, 0);
+        cold.cache_written_tokens = 4200;
+        let warm = rec(1, Status::Complete, 4500, 1000);
+        let records = [cold, warm];
+        assert_eq!(
+            router_prefix_floor(&records),
+            0,
+            "a cold turn that wrote what it read owns that prefix"
+        );
+        // With no floor, the warm rate is the provider's own figure.
+        let warm = rec(1, Status::Complete, 4500, 1000);
+        assert_eq!(warm.hit_rate_net(0), warm.hit_rate());
     }
 
     #[test]

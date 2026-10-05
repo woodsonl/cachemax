@@ -309,6 +309,8 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
     let turns = records.iter().map(|r| turn_row(r, floor)).collect();
     let cumulative = CumulativeRow {
         hit: format_pct(net_hit),
+        // Token counts stay provider-raw; the netted rate beside them is
+        // disclosed by the session tag ("router prefix N tk subtracted").
         cached_over_history: format!(
             "{} / {}",
             format_tokens(cached_sum),
@@ -321,7 +323,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         },
     };
 
-    let tape = records.iter().map(tape_row).collect();
+    let tape = records.iter().map(|r| tape_row(r, floor)).collect();
 
     // Anthropic's write/read split, when the provider exposes writes. Derived
     // rate = read / (read + creation), cumulative over complete turns.
@@ -427,7 +429,7 @@ fn turn_row(r: &Record, floor: u64) -> TurnRow {
 /// Render a turn's prefix tape. The cell count is proportional to the re-sent
 /// history (capped for layout); hit cells are the cached fraction, resent the
 /// remainder, cold is a full cold run, incomplete its own glyph.
-fn tape_row(r: &Record) -> TapeRow {
+fn tape_row(r: &Record, floor: u64) -> TapeRow {
     const CELLS: usize = 16;
     let incomplete = r.status == Status::Incomplete;
     let mut cells = if incomplete {
@@ -435,7 +437,11 @@ fn tape_row(r: &Record) -> TapeRow {
     } else if r.turn == 0 || r.resent_history_tokens == 0 {
         vec![TapeState::Cold; CELLS]
     } else {
-        let hit = ((r.cached_tokens as f64 / r.resent_history_tokens as f64) * CELLS as f64)
+        // Net of the foreign-prefix floor, exactly like the per-turn rate
+        // shown in the same row — the tape and the number beside it must
+        // describe the same fraction.
+        let hit = ((r.cached_tokens.saturating_sub(floor) as f64 / r.resent_history_tokens as f64)
+            * CELLS as f64)
             .round()
             .clamp(0.0, CELLS as f64) as usize;
         let mut v = vec![TapeState::Hit; hit];
@@ -616,7 +622,7 @@ mod tests {
     fn a_broken_prefix_leads_the_tape_with_break_and_miss() {
         let mut r = rec(3, 100, 200);
         r.broke_prefix = true;
-        let row = tape_row(&r);
+        let row = tape_row(&r, 0);
         assert_eq!(row.cells[0], TapeState::Break, "break glyph leads the tape");
         assert_eq!(
             row.cells[1],
@@ -633,7 +639,7 @@ mod tests {
         let row = turn_row(&r, 0);
         assert!(row.incomplete);
         assert_eq!(row.hit, "—");
-        let t = tape_row(&r);
+        let t = tape_row(&r, 0);
         assert!(t.cells.iter().all(|c| *c == TapeState::Incomplete));
     }
 
@@ -683,7 +689,7 @@ mod tests {
         assert_eq!(row.drift.as_deref(), Some("tool_args"));
         assert_eq!(row.drift_tokens.as_deref(), Some("312 tk"));
         // And the tape leads with the drift glyph.
-        let tape = tape_row(&r);
+        let tape = tape_row(&r, 0);
         assert_eq!(tape.cells[0], TapeState::Drift);
     }
 
@@ -693,7 +699,7 @@ mod tests {
         let r = drifted(2, None, 900);
         let row = turn_row(&r, 0);
         assert_eq!(row.drift.as_deref(), Some("unrepairable"));
-        let tape = tape_row(&r);
+        let tape = tape_row(&r, 0);
         assert_eq!(tape.cells[0], TapeState::Unrepairable);
     }
 
@@ -716,7 +722,7 @@ mod tests {
         let row = turn_row(&r, 0);
         assert!(row.repaired);
         assert_eq!(row.drift.as_deref(), Some("tool_args"));
-        let tape = tape_row(&r);
+        let tape = tape_row(&r, 0);
         assert_eq!(
             tape.cells[0],
             TapeState::Repaired,

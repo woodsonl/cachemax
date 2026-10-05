@@ -78,11 +78,18 @@ cached tokens — but it is not part of the history you re-sent, so the raw
 ratio can exceed 100%.
 
 cachemax learns that span as the session's **floor**: the cached count on a
-complete cold turn (a turn with no re-sent history). Every derived rate then
-subtracts the floor from the numerator, and the dashboard says so
-(`router prefix N tk subtracted from hit rate`). Token counts stay
-provider-raw; only the rates are netted. Direct providers report `0` on a cold
-turn, so their floor is `0` and nothing changes.
+complete cold turn (a turn with no re-sent history) that **wrote nothing to
+the cache**. The write gate is what separates a wrapper from your own cache: a
+cold turn that *wrote* what it read — on Anthropic, a `cache_control`
+breakpoint on the system prompt — cached this conversation's prefix itself, so
+its reading is not foreign and no floor is taken. Only a cold turn that read a
+prefix it did not create reveals a foreign span.
+
+Every derived rate then subtracts the floor from the numerator, and the
+dashboard says so (`router prefix N tk subtracted from hit rate`). Token
+counts stay provider-raw; only the rates are netted. A direct provider that
+reports `0` cached on a cold turn — OpenAI, and Anthropic without a cache
+breakpoint — has a floor of `0`, so nothing changes.
 
 ## What `provider_reported` means
 On the cloud path, the cache figure is the provider's own number. cachemax never

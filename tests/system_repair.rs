@@ -281,3 +281,46 @@ async fn a_stable_system_reads_clean() {
     );
     assert_eq!(record1.canonicalized_tokens, 0);
 }
+
+#[tokio::test]
+async fn a_system_block_with_siblings_is_never_reshaped_away() {
+    // A text block carrying a sibling key (`annotations`, `signature`, …) is
+    // not proven equal to a bare string or a two-key block: the siblings are
+    // semantic and repair must never drop them. The turn is flagged, not
+    // rewritten.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    let turn0 = serde_json::json!({
+        "model": "claude-3",
+        "system": "Be terse.",
+        "messages": [user("q1")],
+    });
+    send(&rig, &turn0).await;
+    last_record(&rig, 1).await;
+
+    // Turn 1 re-emits the same text as a block that also carries a citation
+    // annotation. The annotation is content the client sent; it must survive.
+    let annotated = serde_json::json!([
+        {"type": "text", "text": "Be terse.", "annotations": [{"type": "url_citation"}]}
+    ]);
+    let turn1 = serde_json::json!({
+        "model": "claude-3",
+        "system": annotated,
+        "messages": extended(&rig, "claude-3", "q2"),
+    });
+    send(&rig, &turn1).await;
+    let record1 = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent1: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent1["system"], annotated,
+        "the annotated block passes through untouched"
+    );
+    assert!(
+        !record1.repaired,
+        "a system block with semantic siblings is not rewritten"
+    );
+}
