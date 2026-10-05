@@ -204,6 +204,9 @@ trusted host.
 - [How measurement works](docs/how-measurement-works.md) — the record schema, the
   hit-rate formula in plain words, what `provider_reported` means, the Anthropic
   write/read split.
+- [Dogfood report](docs/dogfood-v0.2.0.md) — v0.2.0 measured against real routed
+  traffic: verified rewrites, the drift token surcharge, and routing-noise
+  methodology.
 - [Troubleshooting](docs/troubleshooting.md) — every failure, its cause, and the
   fix.
 - [Design](docs/designs/cachemax-measurement-core.md) — the full spec.
