@@ -67,6 +67,10 @@ fn push_bounded(log: &mut Vec<Collision>, c: Collision) {
 #[derive(Default)]
 pub struct SessionStore {
     sessions: HashMap<u64, Session>,
+    /// Explicit client-declared affinity keys (`x-cachemax-session`) → session
+    /// id. Opt-in: a client that names its conversation gets exactly that
+    /// session, with no prefix-fork inference.
+    keys: HashMap<String, u64>,
     next_id: u64,
     tick: u64,
     collision_log: Vec<Collision>,
@@ -177,6 +181,50 @@ impl SessionStore {
                 last_active: tick,
             },
         );
+        Resolution {
+            session_id: id,
+            continued: false,
+            broke_prefix: false,
+        }
+    }
+
+    /// Resolve by an explicit client-declared affinity key
+    /// (`x-cachemax-session`), bypassing prefix inference entirely.
+    ///
+    /// The client is opting in to "this request belongs to the conversation I
+    /// name." A known key returns its session (a continuation, even when the
+    /// bytes re-sent are a truncated or re-based history — the client's word
+    /// is the authority); a new key allocates a session and binds it. The
+    /// prefix hashes are still recorded/absorbed so a later un-keyed request
+    /// can still match this session by prefix.
+    pub fn resolve_keyed(&mut self, key: &str, prefix_hashes: &[u64]) -> Resolution {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(&id) = self.keys.get(key) {
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.last_active = tick;
+                if prefix_hashes.len() > s.prefix_hashes.len() {
+                    s.prefix_hashes = prefix_hashes.to_vec();
+                }
+            }
+            return Resolution {
+                session_id: id,
+                continued: true,
+                broke_prefix: false,
+            };
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.sessions.insert(
+            id,
+            Session {
+                id,
+                prefix_hashes: prefix_hashes.to_vec(),
+                records: Vec::new(),
+                last_active: tick,
+            },
+        );
+        self.keys.insert(key.to_string(), id);
         Resolution {
             session_id: id,
             continued: false,
@@ -410,5 +458,45 @@ mod tests {
         let _ = store.resolve(&[1, 2, 9]); // break → incomplete marker
         let s = store.session(a.session_id).unwrap();
         assert!((s.cumulative_hit_rate().unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_declared_key_pins_the_session_across_disjoint_history() {
+        // Two requests under one key, with histories that share NO prefix
+        // (a re-based/truncated re-send): the client's word wins — same
+        // session, a continuation, no fork.
+        let mut store = SessionStore::new();
+        let a = store.resolve_keyed("conv-7", &[1, 2, 3]);
+        let b = store.resolve_keyed("conv-7", &[9, 9, 9]);
+        assert_eq!(a.session_id, b.session_id);
+        assert!(b.continued, "the named session is the session");
+        assert!(!b.broke_prefix);
+    }
+
+    #[test]
+    fn distinct_keys_never_cross() {
+        let mut store = SessionStore::new();
+        let a = store.resolve_keyed("conv-a", &[1, 2, 3]);
+        let b = store.resolve_keyed("conv-b", &[1, 2, 3]);
+        assert_ne!(
+            a.session_id, b.session_id,
+            "identical bytes under two keys are two conversations"
+        );
+        let a2 = store.resolve_keyed("conv-a", &[1, 2, 3, 4]);
+        assert_eq!(a2.session_id, a.session_id);
+    }
+
+    #[test]
+    fn a_keyed_session_absorbs_the_longest_prefix() {
+        // The keyed path still grows the recorded prefix, so a later
+        // un-keyed request can match this session by prefix continuity.
+        let mut store = SessionStore::new();
+        let a = store.resolve_keyed("conv-7", &[1, 2]);
+        assert_eq!(a.session_id, 1);
+        let b = store.resolve_keyed("conv-7", &[1, 2, 3, 4]);
+        assert_eq!(b.session_id, 1);
+        let c = store.resolve(&[1, 2, 3, 4, 5]);
+        assert_eq!(c.session_id, 1, "un-keyed continuity still finds it");
+        assert!(c.continued);
     }
 }

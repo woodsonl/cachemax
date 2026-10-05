@@ -114,6 +114,15 @@ impl Fault {
         }
     }
 
+    fn replay_execute_requires(flag: &str, cause: String) -> Self {
+        Fault {
+            problem: "replay --execute is missing a required flag",
+            cause: format!("{flag}: {cause}"),
+            fix: "pass --upstream-url pointing at the endpoint, and --backend openai|anthropic",
+            docs: "replay-execute",
+        }
+    }
+
     fn breakpoints_require_anthropic() -> Self {
         Fault {
             problem: "breakpoint management is anthropic-only",
@@ -221,10 +230,33 @@ enum Command {
     /// directory itself stay; a running proxy's in-memory ledger is not
     /// touched — restart to drop it.
     Purge,
-    /// Replay the recorded ledger: print per-chain, A/B request bodies
-    /// (drifted vs canonical) and the tokens each costs, as JSONL — the
-    /// input for an A/B cache measurement against any endpoint.
-    Replay,
+    /// Replay the recorded ledger. By default, print per-chain A/B request
+    /// bodies (drifted vs canonical) as JSONL — the input for an A/B cache
+    /// measurement. With --execute, drive those pairs against a real
+    /// endpoint instead and report what each form measurably costs.
+    Replay {
+        /// Actually send each pair's two forms to the endpoint, `--n` times
+        /// each, and report cached tokens (median and max) per form. Without
+        /// this flag nothing is sent; the A/B bodies are only printed.
+        #[arg(long)]
+        execute: bool,
+        /// Endpoint base URL to POST to (with --execute). The backend's
+        /// chat path is appended.
+        #[arg(long)]
+        upstream_url: Option<String>,
+        /// Wire shape of the endpoint (with --execute): `openai` or
+        /// `anthropic`. Defaults to `openai`.
+        #[arg(long, default_value = "openai")]
+        backend: String,
+        /// Environment variable holding the API key (with --execute).
+        /// Defaults per backend: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Samples per form (with --execute). One reading on a routed
+        /// endpoint is a routing lottery; ≥3 exposes the spread.
+        #[arg(long, default_value_t = 3)]
+        n: usize,
+    },
 }
 
 #[tokio::main]
@@ -258,8 +290,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Replay reads the ledger directory directly: it has no use for a
     // tokenizer (token columns come from the line's own counts) and must
     // not touch the running proxy — or create the directory by running.
-    if matches!(cli.command, Some(Command::Replay)) {
-        let dir = ledger_dir_of(&cli);
+    let replay_dir = ledger_dir_of(&cli);
+    if let Some(Command::Replay {
+        execute,
+        upstream_url,
+        backend,
+        api_key_env,
+        n,
+    }) = cli.command
+    {
+        let dir = replay_dir;
         if !dir.is_dir() {
             return Err(Fault::ledger_unavailable(
                 &dir.display().to_string(),
@@ -275,6 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dir.display()
             );
             return Ok(());
+        }
+        if execute {
+            return run_replay_execute(&requests, upstream_url, &backend, api_key_env, n.max(1))
+                .await;
         }
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -478,7 +522,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         // Handled before `run` (they need no tokenizer or upstream); the
         // compiler still wants the arms here.
-        Command::Purge | Command::Replay => Ok(()),
+        Command::Purge | Command::Replay { .. } => Ok(()),
     }
 }
 
@@ -489,6 +533,62 @@ fn ledger_dir_of(cli: &Cli) -> std::path::PathBuf {
     cli.ledger_dir
         .clone()
         .map_or_else(default_ledger_dir, std::path::PathBuf::from)
+}
+
+/// Drive each recorded A/B pair against a real endpoint and print what each
+/// form measurably costs. Requires `--upstream-url`; auth comes from the
+/// backend's environment variable (omitted only if the endpoint needs none).
+async fn run_replay_execute(
+    requests: &[cachemax::ledger::ReplayRequest],
+    upstream_url: Option<String>,
+    backend: &str,
+    api_key_env: Option<String>,
+    samples: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = upstream_url.ok_or_else(|| {
+        Fault::replay_execute_requires(
+            "--upstream-url",
+            "--execute needs an endpoint to send to".to_string(),
+        )
+    })?;
+    let backend = cachemax::replay::Backend::parse(backend).ok_or_else(|| {
+        Fault::replay_execute_requires("--backend", "expected `openai` or `anthropic`".to_string())
+    })?;
+    let env_name = api_key_env.unwrap_or_else(|| backend.default_key_env().to_string());
+    let api_key = std::env::var(&env_name).ok().filter(|s| !s.is_empty());
+
+    let cfg = cachemax::replay::ExecuteConfig {
+        endpoint,
+        backend,
+        api_key,
+        samples,
+        timeout: std::time::Duration::from_secs(120),
+    };
+    let client = reqwest::Client::builder().timeout(cfg.timeout).build()?;
+
+    let mut out = std::io::stdout().lock();
+    use std::io::Write;
+    for request in requests {
+        let pair = cachemax::repair::replay_pair(request);
+        let report = cachemax::replay::ChainReport {
+            session_id: request.session_id,
+            turn: request.turn,
+            model: request.model.clone(),
+            a_drifted: cachemax::replay::FormSample::empty("a_drifted"),
+            b_canonical: cachemax::replay::FormSample::empty("b_canonical"),
+        };
+        let report = cachemax::replay::execute_pair(
+            &client,
+            &cfg,
+            &report,
+            &pair["a_drifted"],
+            &pair["b_canonical"],
+        )
+        .await;
+        write!(out, "{}", cachemax::replay::render_report(&report))?;
+        out.flush().ok();
+    }
+    Ok(())
 }
 
 /// Build the canonical ledger from `--ledger-dir` / `--no-ledger`. Default:

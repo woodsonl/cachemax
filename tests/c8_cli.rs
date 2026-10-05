@@ -153,3 +153,56 @@ fn purge_reports_honestly_at_the_cli_level() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn replay_help_lists_the_execute_surface() {
+    let out = cachemax().args(["replay", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "--execute",
+        "--upstream-url",
+        "--backend",
+        "--api-key-env",
+        "--n",
+    ] {
+        assert!(s.contains(needle), "replay --help missing {needle}");
+    }
+}
+
+#[test]
+fn replay_execute_without_an_endpoint_faults_with_the_contract() {
+    // A ledger dir with one chain so replay reaches the execute path, but no
+    // --upstream-url: it must fail loudly naming the missing flag, not
+    // silently print pairs.
+    let dir = std::env::temp_dir().join(format!("cachemax-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Write one real ledger line through the library, so the on-disk shape is
+    // the proxy's own — not a hand-rolled approximation.
+    {
+        let mut ledger = cachemax::ledger::Ledger::on_disk(dir.clone()).unwrap();
+        ledger.append(
+            1,
+            cachemax::ledger::CanonicalTurn {
+                turn: 0,
+                model: "gpt-4o".into(),
+                request_messages: serde_json::json!([{"role": "user", "content": "hi"}]),
+                request_system: serde_json::Value::Null,
+                response_messages: vec![],
+                prefix_hashes: vec![1, 2],
+                breakpoints: 0,
+            },
+        );
+    }
+
+    let out = cachemax()
+        .args(["replay", "--execute", "--ledger-dir", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "missing --upstream-url must fault");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("problem:"), "D3 contract, got: {err}");
+    assert!(err.contains("--upstream-url"), "names the flag, got: {err}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

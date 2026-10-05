@@ -56,13 +56,21 @@ pub struct RequestPlan {
 /// Token counts are measured locally here only to size the denominator. On the
 /// cloud path the *provider's* figure stays authoritative for `cached_tokens`;
 /// this local count is the re-sent-history measure the dashboard divides by.
+///
+/// `affinity`, when present, is the client's declared session key
+/// (`x-cachemax-session`). It bypasses prefix inference: the named conversation
+/// IS the session. Absent, resolution is purely by prefix continuity.
 pub fn plan_request(
     store: &mut SessionStore,
     tokenizer: &Tokenizer,
     messages: &[Message],
+    affinity: Option<&str>,
 ) -> RequestPlan {
     let hashes = tokenizer.prefix_hashes(messages);
-    let resolution = store.resolve(&hashes);
+    let resolution = match affinity {
+        Some(key) => store.resolve_keyed(key, &hashes),
+        None => store.resolve(&hashes),
+    };
     let session_id = resolution.session_id;
     let session = store.session(session_id);
     // Turn index = records finalized so far. Appends happen when a stream ends,
@@ -800,9 +808,18 @@ pub async fn handle_chat<A: Adapter + 'static>(
     };
     let model = model_from_doc(&doc);
 
+    // Opt-in conversation affinity: a client that names its session gets
+    // exactly that session, with no prefix-fork inference. Absent → purely
+    // prefix-based continuity, unchanged.
+    let affinity = headers
+        .get("x-cachemax-session")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
     let mut plan = {
         let mut guard = state.sessions.lock();
-        plan_request(&mut guard, &state.tokenizer, &messages)
+        plan_request(&mut guard, &state.tokenizer, &messages, affinity.as_deref())
     };
 
     // The repair stage: classify the re-sent history against the canonical
@@ -1418,7 +1435,7 @@ mod tests {
         let tokenizer = Tokenizer::default_encoder().unwrap();
         let store = Arc::new(SharedSessions::new());
         let conv1 = vec![msg("system", "You are helpful."), msg("user", "Hi")];
-        let p0 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv1);
+        let p0 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv1, None);
         assert_eq!(p0.turn, 0, "first request is cold");
         assert_eq!(p0.resent_history_tokens, 0, "turn 0 has no history");
 
@@ -1443,7 +1460,7 @@ mod tests {
             msg("assistant", "Hello!"),
             msg("user", "More"),
         ];
-        let p1 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv2);
+        let p1 = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &conv2, None);
         assert_eq!(p1.session_id, p0.session_id, "same session");
         assert_eq!(p1.turn, 1);
         assert!(
@@ -1491,7 +1508,7 @@ mod tests {
         for turn in 0..4 {
             convo.push(msg("user", &format!("Question number {turn} please")));
             // resolve/append so turn indexing advances
-            let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &convo);
+            let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &convo, None);
             let r = build_record(
                 &p,
                 Observation {
@@ -1522,10 +1539,10 @@ mod tests {
         let store = Arc::new(SharedSessions::new());
         // Seed a session with a two-message prefix.
         let seed = vec![msg("system", "You are helpful."), msg("user", "First")];
-        let _ = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &seed);
+        let _ = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &seed, None);
         // A request that shares only the system message then diverges.
         let broken = vec![msg("system", "You are helpful."), msg("user", "Different")];
-        let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &broken);
+        let p = plan_request(&mut store.0.lock().unwrap(), &tokenizer, &broken, None);
         assert!(p.broke_prefix, "a divergent prefix is flagged on the plan");
         assert_eq!(
             p.session_id, 1,

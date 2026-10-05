@@ -909,3 +909,78 @@ async fn a_send_failure_records_the_rewrite_not_the_estimate() {
         "the actual canonicalized amount, not a silent zero"
     );
 }
+
+// ---- Conversation affinity (`x-cachemax-session`) ---------------------------
+
+/// A request under an explicit session key.
+async fn send_affinity(rig: &Rig, body: &serde_json::Value, key: &str) {
+    let _ = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", rig.url))
+        .header("content-type", "application/json")
+        .header("x-cachemax-session", key)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_declared_session_key_pins_drifted_history_to_one_session() {
+    // Without a key, whitespace drift changes the flattened prefix hashes and
+    // forks a new session. A client that names its conversation gets its own
+    // session regardless — so the drifted turn repairs against that chain.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send_affinity(&rig, &weather_turn0(), "conv-weather").await;
+    last_record(&rig, 1).await;
+    send_affinity(&rig, &weather_turn1_reordered_args(), "conv-weather").await;
+    last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent1: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent1["messages"][2],
+        canonical_tool_call_message(),
+        "the keyed turn repaired against the same session's chain"
+    );
+
+    // One conversation, two turns — never forked.
+    let guard = rig.sessions.lock();
+    assert_eq!(
+        guard.len(),
+        1,
+        "the declared key holds one session across drift"
+    );
+    assert_eq!(guard.most_recent().unwrap().records.len(), 2);
+}
+
+#[tokio::test]
+async fn two_declared_keys_never_cross_even_with_identical_bytes() {
+    // Identical histories under two keys are two conversations: the key is
+    // the authority, not the bytes. Neither session's chain is offered to the
+    // other, so a first turn under each stays cold.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send_affinity(&rig, &weather_turn0(), "conv-a").await;
+    last_record(&rig, 1).await;
+    send_affinity(&rig, &weather_turn0(), "conv-b").await;
+    last_record(&rig, 2).await;
+
+    let guard = rig.sessions.lock();
+    assert_eq!(guard.len(), 2, "two keys, two sessions");
+    // Both are turn 0: neither inherited the other's history.
+    for session in [guard.session(1).unwrap(), guard.session(2).unwrap()] {
+        assert_eq!(session.records.len(), 1);
+        assert_eq!(
+            session.records[0].turn, 0,
+            "each key starts its own cold turn"
+        );
+    }
+}

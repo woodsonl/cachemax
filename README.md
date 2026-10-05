@@ -153,6 +153,41 @@ The A/B that produced the numbers above is reproducible on your own traffic:
    provider's `cached_tokens` per variant. The dashboard's *recovered by
    repair* line shows the same delta live, on repaired turns.
 
+Or let `replay` drive it for you:
+
+```
+cachemax replay --execute \
+  --upstream-url https://api.openai.com/v1 \
+  --backend openai --n 5
+```
+
+`--execute` sends each form to the endpoint `--n` times (bypassing the
+proxy, so the number is the provider's own cache, not ours) and prints a
+table of cached tokens — median and max — per form, plus how many distinct
+upstream instances answered. Auth is read from an environment variable
+(`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `--api-key-env <VAR>`); the key
+is never printed or written. A single send is not a measurement on a routed
+endpoint — different instances have different cache namespaces — so read
+`--n`'s max, not one line; the table says so when more than one instance
+answered.
+
+### Declaring conversation affinity
+
+By default a request joins the session whose token-prefix it extends, which
+is what you want for an ordinary client. An agent that re-sends a
+truncated or re-based history every turn can defeat prefix matching; send an
+`x-cachemax-session: <id>` header to name the conversation explicitly:
+
+```
+POST /v1/chat/completions
+x-cachemax-session: my-agent-run-42
+```
+
+Every request under the same key is one session, whatever the bytes — the
+client's word is the authority, no prefix-fork inference. Distinct keys
+never cross, even with identical history. Omit the header for the default
+prefix-based behavior.
+
 ## Commands
 
 | Command | What it does |
@@ -161,11 +196,11 @@ The A/B that produced the numbers above is reproducible on your own traffic:
 | `cachemax check` | Check the upstream is reachable; exit non-zero if not. |
 | `cachemax export` | Write the running proxy's session as JSONL. |
 | `cachemax purge` | Delete the on-disk repair ledger (see Security). |
-| `cachemax replay` | Print A/B request bodies (drifted vs canonical) from the recorded ledger, as JSONL — drive any endpoint with both to measure the repair delta. |
+| `cachemax replay` | Print A/B request bodies (drifted vs canonical) from the recorded ledger, as JSONL. With `--execute`, drive them against a real endpoint and report cached tokens per form. |
 
 | Flag | Meaning |
 |---|---|
-| `--upstream-url <url>` | Provider endpoint (required for `serve`/`check`). |
+| `--upstream-url <url>` | Provider endpoint (required for `serve`/`check`/`replay --execute`). |
 | `--backend <name>` | `openai` \| `anthropic` \| `llamacpp` \| `vllm` \| `mlxlm`. |
 | `--bind <addr>` | Loopback address (default `127.0.0.1:8787`). |
 | `--tokenizer <name>` | Prefix-hash tokenizer (default `cl100k_base`). |
@@ -176,6 +211,9 @@ The A/B that produced the numbers above is reproducible on your own traffic:
 | `--manage-breakpoints` | Anthropic only: place `cache_control` breakpoints per the incremental-breakpoint guidance (last system block + last user/tool-result blocks, ≤ 4). Requests carrying client-placed breakpoints pass through untouched. |
 | `--force-breakpoints` | With `--manage-breakpoints`: re-derive breakpoints even over client-placed ones. |
 | `--verbose` | Debug logging. Metadata only — never message content. |
+
+`replay` takes its own flags: `--execute`, `--upstream-url`, `--backend`,
+`--api-key-env <VAR>`, and `--n <samples>`.
 
 ## Security
 
