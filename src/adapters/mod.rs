@@ -10,6 +10,19 @@ pub mod vllm;
 
 use crate::record::SourceLabel;
 
+/// Read a usage count that may arrive in any numeric form. Providers and
+/// gateways emit `"900"`, `900.0`, and `1e3` for the same count; under
+/// `serde_json`'s `arbitrary_precision` the non-integer forms parse as text
+/// and `as_u64` returns `None` — reading that as cache-absent would fake a
+/// 0% headline. Integral floats and exponents are accepted.
+pub fn usage_count(n: &serde_json::Value) -> Option<u64> {
+    n.as_u64().or_else(|| {
+        n.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0)
+            .map(|f| f as u64)
+    })
+}
+
 /// A normalized cache observation extracted from one response.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CacheSignal {

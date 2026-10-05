@@ -27,10 +27,10 @@ One record per request. Nothing about message content is in it — metrics only:
 | `turn` | Turn index within the session. Turn 0 is cold. |
 | `status` | `complete` or `incomplete` (the stream ended early, or the upstream answered non-2xx). |
 | `source` | Where the cache figure came from: `provider_reported`, `engine_measured`, or `no_cache_truth`. |
-| `ttft_ms` | Time to first token — from the moment the request was sent upstream to the first non-empty response byte. It therefore includes the upstream's full first-token wait (headers included), not just the time from headers to first chunk. |
+| `ttft_ms` | Time to first token — the upstream's full first-token wait, measured from the moment the request was sent upstream to the first non-empty response byte, headers included. Earlier builds timed a narrower span, so today's figures read larger. |
 | `cached_tokens` | Prefix tokens the provider/engine reports it served from cache. |
 | `cache_written_tokens` | Prefix tokens written to cache this turn (Anthropic only; 0 elsewhere). |
-| `resent_history_tokens` | The binding denominator: system + all prior messages, excluding this turn's new content. |
+| `resent_history_tokens` | The binding denominator: the history this request re-sent. On OpenAI the system prompt rides inside `messages` and counts; on Anthropic it is the top-level `system` field and does not. Excludes this turn's new content. |
 | `billed_input_tokens` | Billed input tokens for the turn. |
 | `broke_prefix` | `true` when this turn's prompt diverged from the tracked session's prefix (a prefix break). |
 | `cost_usd` | Cost at the provider's published rate, if the model is known. `null` for an incomplete turn. |
@@ -60,9 +60,13 @@ Two rules that matter:
 
 - **Turn 0 is cold.** It establishes the cache, so it has no history to reuse.
   Its hit rate is `—`, not `0`, and it is excluded from the cumulative.
-- **The denominator is the re-sent history**, not the whole prompt. It is the
-  system prompt plus every prior user/assistant/tool message — the part that
+- **The denominator is the re-sent history**, not the whole prompt: every
+  prior user/assistant/tool message the request carried — the part that
   *could* have been served from cache. This turn's new content is not in it.
+  The system prompt counts when it rides inside `messages` (OpenAI); on
+  Anthropic it is a top-level field outside the denominator, which is why a
+  cached system breakpoint can read above 100% — the case the router-prefix
+  floor exists for.
   That is why the denominator grows every turn, and why the hit rate is the
   honest answer to "how much of what I re-sent came back from cache?"
 
@@ -85,11 +89,16 @@ breakpoint on the system prompt — cached this conversation's prefix itself, so
 its reading is not foreign and no floor is taken. Only a cold turn that read a
 prefix it did not create reveals a foreign span.
 
-Every derived rate then subtracts the floor from the numerator, and the
-dashboard says so (`router prefix N tk subtracted from hit rate`). Token
-counts stay provider-raw; only the rates are netted. A direct provider that
-reports `0` cached on a cold turn — OpenAI, and Anthropic without a cache
-breakpoint — has a floor of `0`, so nothing changes.
+Every derived rate applies the floor only where the raw reading is
+impossible: a numerator larger than its own denominator is a span that
+history cannot contain — the wrapper's cached prefix — and that numerator is
+netted. Rates at or below 100% are already honest, so a direct provider's
+figures are never deflated by a guess; the dashboard discloses the floor
+only on a session where netting actually applied (`router prefix N tk netted
+from rates above 100%`). Token counts stay provider-raw; only the rates are
+netted. Known limit: a wrapper that writes its own preamble carries a
+breakpoint, defeats the write gate, and is not learned as a floor — such a
+session is disclosed only through the >100% gate.
 
 ## What `provider_reported` means
 On the cloud path, the cache figure is the provider's own number. cachemax never

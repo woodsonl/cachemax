@@ -21,10 +21,10 @@ impl AnthropicAdapter {
         let usage = v.get("usage").or_else(|| v.pointer("/message/usage"))?;
         let read = usage
             .get("cache_read_input_tokens")
-            .and_then(|n| n.as_u64());
+            .and_then(crate::adapters::usage_count);
         let creation = usage
             .get("cache_creation_input_tokens")
-            .and_then(|n| n.as_u64());
+            .and_then(crate::adapters::usage_count);
         match (read, creation) {
             (None, None) => None,
             (r, c) => Some((r.unwrap_or(0), c.unwrap_or(0))),
@@ -37,7 +37,7 @@ impl AnthropicAdapter {
         let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
         v.pointer("/usage/input_tokens")
             .or_else(|| v.pointer("/message/usage/input_tokens"))
-            .and_then(|n| n.as_u64())
+            .and_then(crate::adapters::usage_count)
     }
 
     /// The derived cache-hit share shown beside the write/read split:
@@ -123,4 +123,14 @@ mod tests {
         let sig = AnthropicAdapter.cache_signal(body);
         assert_eq!((sig.cached_tokens, sig.written_tokens), (1234, 567));
     }
+}
+
+#[test]
+fn usage_counts_in_float_or_exponent_form_are_read() {
+    // Gateways re-serialize counts: 900.0 and 1e3 are the same count as 900.
+    // Under arbitrary_precision these parse as text; as_u64 alone would
+    // read cache-absent and fake a 0% headline.
+    let body = br#"{"usage":{"input_tokens":2140.0,"cache_read_input_tokens":9.02e2,"cache_creation_input_tokens":0.0}}"#;
+    assert_eq!(AnthropicAdapter::split(body), Some((902, 0)));
+    assert_eq!(AnthropicAdapter::billed_input(body), Some(2140));
 }

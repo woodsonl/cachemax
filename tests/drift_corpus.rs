@@ -96,7 +96,7 @@ fn integers_beyond_f64_precision_do_not_alias() {
 }
 
 #[test]
-fn node_compact_is_tool_arg_reserialization() {
+fn node_int_vs_float_number_text_is_flagged() {
     // JSON.stringify — compact, insertion order.
     let js = "{\"city\":\"Paris\",\"unit\":\"celsius\",\"count\":\"9007199254740993\",\"ratio\":1}";
     // note: JS serializes 2^53+1 inaccurately as a Number, so frameworks

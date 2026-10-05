@@ -540,7 +540,7 @@ fn billed_from_doc(doc: &[u8]) -> Option<u64> {
     v.pointer("/usage/prompt_tokens")
         .or_else(|| v.pointer("/usage/input_tokens"))
         .or_else(|| v.pointer("/message/usage/input_tokens"))
-        .and_then(|n| n.as_u64())
+        .and_then(crate::adapters::usage_count)
 }
 
 /// State shared by every request handler.
@@ -862,8 +862,14 @@ pub async fn handle_chat<A: Adapter + 'static>(
         }
         None => state.repair,
     };
-    let (drift_report, mut rewrite) = if effective_mode == RepairMode::Off {
-        (DriftReport::unexamined(RepairMode::Off), None)
+    let (drift_report, mut rewrite, survey) = if effective_mode == RepairMode::Off {
+        (
+            DriftReport::unexamined(RepairMode::Off),
+            None,
+            // Captured before any mutation, whatever the mode: the stage
+            // that consumes it runs later.
+            crate::breakpoints::survey(&doc),
+        )
     } else {
         // Which chain does this request extend? Its own session's, or — when
         // the session forked (truncated or re-based leading history shares
@@ -915,7 +921,6 @@ pub async fn handle_chat<A: Adapter + 'static>(
             .get("system")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let sys = repair::classify_system(&client_system, &canonical_system, &state.tokenizer);
         let mut client_values = doc
             .get("messages")
             .and_then(|m| m.as_array())
@@ -927,22 +932,40 @@ pub async fn handle_chat<A: Adapter + 'static>(
             model_switched,
             &state.tokenizer,
         );
+        // A probed foreign chain stands for this conversation only when the
+        // messages read as a re-send of it. That gate runs on the message
+        // facts alone, before any system comparison — and when it rejects,
+        // the turn is a new conversation's first turn: no chain, no system
+        // baseline, nothing to differ from.
+        let probed_rejected = probed
+            && !(classification.semantic_break.is_none() && classification.equivalent_run > 0);
+        if probed_rejected {
+            classification = repair::classify_turn(&client_values, None, false, &state.tokenizer);
+        }
+        // The system ladder compares only against a recorded baseline. No
+        // chain (first turn, model switch, rejected probe), or a chain
+        // recorded without a top-level system (an OpenAI-dialect chain, a
+        // ledger written before systems were recorded): there is no baseline
+        // to differ from, and reading its absence as "changed" would
+        // fabricate a hard stop — with an at-risk figure counted from the
+        // literal `null` — on every such turn. A system that genuinely rides
+        // inside `messages` (OpenAI) is classified there, so nothing is lost.
+        let sys = if chain.is_some() && !probed_rejected && !canonical_system.is_null() {
+            repair::classify_system(&client_system, &canonical_system, &state.tokenizer)
+        } else {
+            repair::SystemRelation {
+                kind: None,
+                different: false,
+                tokens_at_risk: 0,
+            }
+        };
         let mut system_rewritable = false;
         if sys.different {
             // A semantically different system prompt re-bases everything
             // downstream, exactly like a changed system message: the turn
             // is never rewritten, on either side of the dialect.
-            let tokens = sys.tokens_at_risk;
-            classification = crate::repair::Classification {
-                report_matches: false,
-                drift_kind: None,
-                turns_affected: 1,
-                tokens_at_risk: tokens,
-                unrepairable: Some(crate::repair::Unrepairable::SystemPromptChanged),
-                canonical_offset: 0,
-                equivalent_run: 0,
-                semantic_break: Some(0),
-            };
+            classification =
+                crate::repair::Classification::system_prompt_changed(sys.tokens_at_risk);
         } else {
             system_rewritable = sys.kind.is_some();
             if let Some(k) = sys.kind {
@@ -957,20 +980,11 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 classification.tokens_at_risk += sys.tokens_at_risk;
             }
         }
-        if probed && !(classification.semantic_break.is_none() && classification.equivalent_run > 0)
-        {
-            // The probed chain is only a candidate — the most recently
-            // written chain *for the model*, nothing more. It stands for
-            // this conversation only when the client's history reads as a
-            // re-send of it: every element with a canonical counterpart
-            // aligns, and at least one does. A request that merely shares
-            // a leading span with a foreign conversation (the same
-            // framework system prompt is the norm) breaks somewhere inside
-            // — that is a new conversation's first turn, honestly reported
-            // and never rewritten.
-            classification = repair::classify_turn(&client_values, None, false, &state.tokenizer);
-            system_rewritable = false;
-        }
+        // The breakpoint survey captures the CLIENT's hint placement. It
+        // must run before any mutation of `doc` — a system rewrite strips
+        // hints, and a survey taken after that would read the proxy's own
+        // output as if the client had sent it.
+        let survey = crate::breakpoints::survey(&doc);
         let report = repair::report(&classification, effective_mode);
         let mut rewrite = None;
         if effective_mode == RepairMode::On {
@@ -998,33 +1012,54 @@ pub async fn handle_chat<A: Adapter + 'static>(
             }
             // The top-level system, when its drift is repairable: replaced
             // with the canonical serialization (content only — hints are
-            // placement policy, re-derived by breakpoint management).
-            if system_rewritable && !canonical_system.is_null() {
-                let mut canonical = canonical_system.clone();
-                crate::breakpoints::strip_hints_in_place(&mut canonical);
-                tracing::info!(
-                    target: "cachemax_repair",
-                    session = plan.session_id,
-                    turn = plan.turn,
-                    kind = ?sys.kind,
-                    elements = 1,
-                    tokens = sys.tokens_at_risk,
-                    "rewrote drifted system prompt to canonical"
-                );
-                doc["system"] = canonical;
-                rewrite = Some(match rewrite {
-                    Some(rw) => crate::repair::Rewrite {
-                        elements_replaced: rw.elements_replaced + 1,
-                        canonicalized_tokens: rw.canonicalized_tokens + sys.tokens_at_risk,
-                    },
-                    None => crate::repair::Rewrite {
-                        elements_replaced: 1,
-                        canonicalized_tokens: sys.tokens_at_risk,
-                    },
-                });
+            // placement policy, re-derived by breakpoint management). With
+            // management OFF the client owns placement: a rewrite would
+            // strip their cache_control and silently erase their breakpoint
+            // — the exact loss repair exists to prevent — so the drifted
+            // system passes through untouched, still flagged.
+            if system_rewritable {
+                debug_assert!(!canonical_system.is_null());
+                // A rewrite strips the client's hint placement. Pass through
+                // when placement is not the proxy's to re-derive: management
+                // off (the client owns placement), or the survey showing
+                // foreign/client-managed hints with force off (management
+                // will decline, leaving the stripped placement unrestored).
+                let placement_not_ours = crate::breakpoints::has_cache_control(&client_system)
+                    && (!state.manage_breakpoints || (survey.foreign && !state.force_breakpoints));
+                if placement_not_ours {
+                    tracing::info!(
+                        target: "cachemax_repair",
+                        session = plan.session_id,
+                        turn = plan.turn,
+                        "system drift passed through: client-managed breakpoints"
+                    );
+                } else {
+                    let mut canonical = canonical_system.clone();
+                    crate::breakpoints::strip_hints_in_place(&mut canonical);
+                    tracing::info!(
+                        target: "cachemax_repair",
+                        session = plan.session_id,
+                        turn = plan.turn,
+                        kind = ?sys.kind,
+                        elements = 1,
+                        tokens = sys.tokens_at_risk,
+                        "rewrote drifted system prompt to canonical"
+                    );
+                    doc["system"] = canonical;
+                    rewrite = Some(match rewrite {
+                        Some(rw) => crate::repair::Rewrite {
+                            elements_replaced: rw.elements_replaced + 1,
+                            canonicalized_tokens: rw.canonicalized_tokens + sys.tokens_at_risk,
+                        },
+                        None => crate::repair::Rewrite {
+                            elements_replaced: 1,
+                            canonicalized_tokens: sys.tokens_at_risk,
+                        },
+                    });
+                }
             }
         }
-        (report, rewrite)
+        (report, rewrite, survey)
     };
 
     // Anthropic breakpoint management (opt-in): the last body mutation
@@ -1034,9 +1069,8 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // client-managed. Other backends never take this path.
     let breakpoints =
         (state.manage_breakpoints && state.adapter.name() == "anthropic").then(|| {
-            // Surveyed before the stage's own mutations: what the CLIENT
+            // `survey` was captured before the repair stage: what the CLIENT
             // carried, in the shapes and positions that say whose it is.
-            let survey = crate::breakpoints::survey(&doc);
             let ours_last_turn = state
                 .ledger
                 .lock()
@@ -1096,13 +1130,14 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 // Unreachable with a document parsed from the request, but
                 // degrade honestly: forward the client's bytes untouched,
                 // claim no rewrite whose forwarded form could not be
-                // produced, and record the messages that actually went
-                // out — read back from the client's own bytes.
+                // produced, and record what actually went out — read back
+                // from the client's own bytes, messages and system alike,
+                // so the ledger never holds a value that was never sent.
                 rewrite = None;
-                let as_sent = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|d| d.get("messages").cloned())
-                    .unwrap_or_default();
+                if let Ok(original) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    doc = original;
+                }
+                let as_sent = doc.get("messages").cloned().unwrap_or_default();
                 (body.clone(), as_sent)
             }
         }

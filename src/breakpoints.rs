@@ -218,6 +218,24 @@ fn strip(doc: &mut Value) {
     }
 }
 
+/// Whether any content block in `v` carries a cache hint. The repair
+/// rewriter consults this before replacing a drifted element: rewriting
+/// strips hint placement, and a client-managed placement must not be
+/// silently erased.
+pub(crate) fn has_cache_control(v: &Value) -> bool {
+    fn carries_hint(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => {
+                map.get("cache_control").is_some_and(Value::is_object)
+                    || map.values().any(carries_hint)
+            }
+            Value::Array(items) => items.iter().any(carries_hint),
+            _ => false,
+        }
+    }
+    carries_hint(v)
+}
+
 /// Remove every content-block cache hint in `v`, recursively, in place.
 /// Shared with the repair rewriter, which must never let the canonical
 /// side's hints ride into a rewritten element.

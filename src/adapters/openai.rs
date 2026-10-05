@@ -21,7 +21,7 @@ impl Adapter for OpenAiAdapter {
             .ok()
             .and_then(|v| {
                 v.pointer("/usage/prompt_tokens_details/cached_tokens")
-                    .and_then(|n| n.as_u64())
+                    .and_then(crate::adapters::usage_count)
             });
         match cached {
             // The provider reported a figure (possibly a real 0): keep it.
@@ -80,4 +80,15 @@ mod tests {
         assert_eq!(sig.cached_tokens, 0);
         assert_eq!(sig.source, Some(SourceLabel::ProviderReported));
     }
+}
+
+#[test]
+fn cached_tokens_in_float_form_are_read_not_cache_absent() {
+    // 1455.0 is the same count as 1455; reading it as absent would fake a
+    // 0% headline under arbitrary_precision.
+    let body =
+        br#"{"usage":{"prompt_tokens":2140.0,"prompt_tokens_details":{"cached_tokens":1455.0}}}"#;
+    let sig = OpenAiAdapter.cache_signal(body);
+    assert_eq!(sig.cached_tokens, 1455);
+    assert_eq!(sig.source, Some(SourceLabel::ProviderReported));
 }

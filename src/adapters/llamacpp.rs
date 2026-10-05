@@ -23,23 +23,32 @@ impl LlamaCppAdapter {
     pub fn tokens_cached(response_body: &[u8]) -> Option<u64> {
         let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
         // Native /completion shape.
-        if let Some(n) = v.get("tokens_cached").and_then(|n| n.as_u64()) {
+        if let Some(n) = v
+            .get("tokens_cached")
+            .and_then(crate::adapters::usage_count)
+        {
             return Some(n);
         }
         // OAI-compatible chat/completions shape.
-        if let Some(n) = v.pointer("/timings/cache_n").and_then(|n| n.as_u64()) {
+        if let Some(n) = v
+            .pointer("/timings/cache_n")
+            .and_then(crate::adapters::usage_count)
+        {
             return Some(n);
         }
         v.pointer("/usage/prompt_tokens_details/cached_tokens")
-            .and_then(|n| n.as_u64())
+            .and_then(crate::adapters::usage_count)
     }
 
     /// Total prompt tokens evaluated (the denominator raw material when present).
     pub fn tokens_evaluated(response_body: &[u8]) -> Option<u64> {
         let v: serde_json::Value = serde_json::from_slice(response_body).ok()?;
         v.get("tokens_evaluated")
-            .and_then(|n| n.as_u64())
-            .or_else(|| v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64()))
+            .and_then(crate::adapters::usage_count)
+            .or_else(|| {
+                v.pointer("/usage/prompt_tokens")
+                    .and_then(crate::adapters::usage_count)
+            })
     }
 }
 

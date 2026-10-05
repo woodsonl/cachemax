@@ -56,7 +56,11 @@ pub struct Record {
     /// Prefix tokens written to cache this turn (Anthropic's creation count).
     /// 0 where the provider exposes no write/premium distinction.
     pub cache_written_tokens: u64,
-    /// Binding denominator: system + all prior messages, excluding this turn's new content.
+    /// Binding denominator: the history this request re-sent — on OpenAI the
+    /// system prompt rides inside `messages` and counts; on Anthropic it is
+    /// the top-level `system` field and does not (which is why a cached
+    /// system breakpoint can read above 100%, the case the foreign-prefix
+    /// floor exists for). Excludes this turn's new content.
     pub resent_history_tokens: u64,
     /// Billed input tokens for this turn.
     pub billed_input_tokens: u64,
@@ -99,37 +103,27 @@ pub struct Record {
 }
 
 impl Record {
-    /// Per-turn hit rate per the binding formula.
+    /// Per-turn hit rate with a foreign-prefix floor applied when the raw
+    /// reading is impossible: a numerator larger than the whole re-sent
+    /// history is a span the denominator cannot contain — the endpoint's
+    /// wrapper caching its own prefix — and the floor (that wrapper's
+    /// measured span) is subtracted. At or below 100% the raw rate stands:
+    /// it is already honest, and subtracting a guessed floor would only
+    /// deflate a direct provider's true number.
     ///
     /// `turn == 0` is cold and returns `None`. A zero denominator (empty
-    /// history) also returns `None` — rendered as `—`, never `0`. A turn whose
-    /// source exposes no cache truth (e.g. mlx-lm) has no rate to show, so it
-    /// is unexposed (`None`), never a measured `0%`.
-    pub fn hit_rate(&self) -> Option<f64> {
-        if self.turn == 0 || self.resent_history_tokens == 0 {
-            return None;
-        }
-        if self.source == SourceLabel::NoCacheTruth {
-            return None;
-        }
-        Some(self.cached_tokens as f64 / self.resent_history_tokens as f64)
-    }
-
-    /// Per-turn hit rate with a foreign-prefix floor subtracted: routed
-    /// endpoints report their own wrapper's cached tokens inside
-    /// `cached_tokens` even on a cold turn, which the re-sent-history
-    /// denominator never contains — the raw rate can exceed 100%. The floor
-    /// is the session's cold-turn reading (see [`router_prefix_floor`]);
-    /// `0` leaves the raw rate untouched.
+    /// history) also returns `None` — rendered as `—`, never `0`. A turn
+    /// whose source exposes no cache truth (e.g. mlx-lm) has no rate to
+    /// show, so it is unexposed (`None`), never a measured `0%`.
     pub fn hit_rate_net(&self, floor: u64) -> Option<f64> {
-        if floor == 0 {
-            return self.hit_rate();
-        }
         if self.turn == 0 || self.resent_history_tokens == 0 {
             return None;
         }
         if self.source == SourceLabel::NoCacheTruth {
             return None;
+        }
+        if self.cached_tokens <= self.resent_history_tokens {
+            return Some(self.cached_tokens as f64 / self.resent_history_tokens as f64);
         }
         Some(self.cached_tokens.saturating_sub(floor) as f64 / self.resent_history_tokens as f64)
     }
@@ -145,9 +139,11 @@ impl Record {
 /// cold turn that *wrote* what it read (Anthropic's `cache_creation_input_tokens`,
 /// typically from a `cache_control` breakpoint on the system prompt) cached
 /// this conversation's own prefix, so its reading is not foreign. Only a cold
-/// turn that read a prefix it did not create — and, on direct providers, that
-/// is impossible, since they report `0` cached on a cold turn — reveals a
-/// foreign span. Erring toward `0` is deliberate: a false floor would
+/// turn that read a prefix it did not create reveals a foreign span. Known
+/// limit: a wrapper that injects its own preamble WITH a breakpoint also
+/// writes on the cold turn and is not learned as a floor; netting then
+/// still applies through the >100% pathology gate, capped by whatever
+/// floor was learned. Erring toward `0` is deliberate: a false floor would
 /// under-report real reuse, the worse error.
 pub fn router_prefix_floor(records: &[Record]) -> u64 {
     records
@@ -164,21 +160,13 @@ pub fn router_prefix_floor(records: &[Record]) -> u64 {
         .unwrap_or(0)
 }
 
-/// Session-cumulative hit rate: `Σ cached / Σ resent_history` over complete
-/// turns only (turn ≥ 1). Returns `None` when no complete turn contributes.
-///
-/// Turns that expose no cache truth (e.g. mlx-lm) and turns with a zero
-/// history (nothing re-sent) contribute nothing: counting their `cached_tokens`
-/// against a zero/absent denominator would inflate or fabricate the rate.
-pub fn cumulative_hit_rate(records: &[Record]) -> Option<f64> {
-    cumulative_hit_rate_net(records, 0)
-}
-
-/// Cumulative hit rate with a foreign-prefix floor subtracted from every
-/// turn's numerator: `Σ max(0, cached − floor) / Σ resent_history`. The
-/// floor is the endpoint's own wrapper span ([`router_prefix_floor`]),
-/// which the denominator never contains — without netting, routed sessions
-/// read above 100%. `0` reproduces the raw formula exactly.
+/// Cumulative hit rate with the foreign-prefix floor applied where the raw
+/// reading is impossible: a turn whose cached tokens exceed its own
+/// re-sent history carries a span that history cannot contain — the
+/// endpoint's wrapper caching its own prefix ([`router_prefix_floor`]) —
+/// and that turn's numerator is netted. Honest turns (at or below 100%)
+/// keep their raw numerator, for the same reason
+/// [`Record::hit_rate_net`] leaves honest rates alone.
 pub fn cumulative_hit_rate_net(records: &[Record], floor: u64) -> Option<f64> {
     let mut cached: u64 = 0;
     let mut history: u64 = 0;
@@ -190,7 +178,12 @@ pub fn cumulative_hit_rate_net(records: &[Record], floor: u64) -> Option<f64> {
         {
             continue;
         }
-        cached += r.cached_tokens.saturating_sub(floor);
+        let numerator = if r.cached_tokens > r.resent_history_tokens {
+            r.cached_tokens.saturating_sub(floor)
+        } else {
+            r.cached_tokens
+        };
+        cached += numerator;
         history += r.resent_history_tokens;
     }
     if history == 0 {
@@ -243,25 +236,29 @@ mod tests {
         let t1 = rec(1, Status::Complete, 1020, 1550);
         let t2 = rec(2, Status::Complete, 860, 1810);
 
-        assert_eq!(t0.hit_rate(), None, "turn 0 is cold and excluded");
-        assert!((t1.hit_rate().unwrap() - 1020.0 / 1550.0).abs() < 1e-9);
-        assert!((t2.hit_rate().unwrap() - 860.0 / 1810.0).abs() < 1e-9);
+        assert_eq!(t0.hit_rate_net(0), None, "turn 0 is cold and excluded");
+        assert!((t1.hit_rate_net(0).unwrap() - 1020.0 / 1550.0).abs() < 1e-9);
+        assert!((t2.hit_rate_net(0).unwrap() - 860.0 / 1810.0).abs() < 1e-9);
 
-        let cum = cumulative_hit_rate(&[t0, t1, t2]).unwrap();
+        let cum = cumulative_hit_rate_net(&[t0, t1, t2], 0).unwrap();
         assert!((cum - 1880.0 / 3360.0).abs() < 1e-9);
     }
 
     #[test]
     fn zero_denominator_is_none_not_zero() {
         let r = rec(1, Status::Complete, 0, 0);
-        assert_eq!(r.hit_rate(), None, "empty history renders as — , never 0");
+        assert_eq!(
+            r.hit_rate_net(0),
+            None,
+            "empty history renders as — , never 0"
+        );
     }
 
     #[test]
     fn incomplete_records_are_excluded_from_cumulative() {
         let t1 = rec(1, Status::Complete, 1000, 2000); // 0.5
         let t2 = rec(2, Status::Incomplete, 9999, 9999); // must be ignored
-        let cum = cumulative_hit_rate(&[t1, t2]).unwrap();
+        let cum = cumulative_hit_rate_net(&[t1, t2], 0).unwrap();
         assert!((cum - 0.5).abs() < 1e-9);
     }
 
@@ -277,7 +274,7 @@ mod tests {
 
         // Raw rate exceeds 100%; the netted rate does not.
         let warm = rec(1, Status::Complete, 628, 500);
-        assert!((warm.hit_rate().unwrap() - 628.0 / 500.0).abs() < 1e-9);
+        assert!((warm.hit_rate_net(0).unwrap() - 628.0 / 500.0).abs() < 1e-9);
         let net = warm.hit_rate_net(128).unwrap();
         assert!(
             (net - 500.0 / 500.0).abs() < 1e-9,
@@ -302,7 +299,7 @@ mod tests {
         );
         // With no floor, the warm rate is the provider's own figure.
         let warm = rec(1, Status::Complete, 4500, 1000);
-        assert_eq!(warm.hit_rate_net(0), warm.hit_rate());
+        assert_eq!(warm.hit_rate_net(0), warm.hit_rate_net(0));
     }
 
     #[test]
@@ -313,7 +310,69 @@ mod tests {
         let records = [cold, warm];
         assert_eq!(router_prefix_floor(&records), 0);
         let warm = rec(1, Status::Complete, 900, 1000);
-        assert_eq!(warm.hit_rate_net(0), warm.hit_rate());
+        assert_eq!(warm.hit_rate_net(0), warm.hit_rate_net(0));
+    }
+
+    #[test]
+    fn a_learned_floor_is_not_applied_to_honest_rates() {
+        // OpenAI's auto-cache reports the client's OWN system prompt as
+        // cached on a cold turn with no write — the floor's exact signature.
+        // The floor is learned, but the warm turn reads 90% (at or below
+        // 100%): the raw rate stands. Netting there would deflate a direct
+        // provider's true number while claiming a routed artifact.
+        let cold = rec(0, Status::Complete, 210, 0);
+        let warm = rec(1, Status::Complete, 900, 1000);
+        assert_eq!(router_prefix_floor(&[cold, warm]), 210);
+        let warm = rec(1, Status::Complete, 900, 1000);
+        assert_eq!(
+            warm.hit_rate_net(210),
+            Some(0.9),
+            "≤100% keeps the raw rate even with a learned floor"
+        );
+    }
+
+    #[test]
+    fn netting_applies_exactly_when_the_rate_is_impossible() {
+        // A numerator larger than the whole re-sent history is a span the
+        // denominator cannot contain — the wrapper's cached prefix. That is
+        // the only case the floor nets, and the floor caps the subtraction.
+        let cold = rec(0, Status::Complete, 210, 0);
+        let impossible = rec(1, Status::Complete, 1400, 1000); // raw 140%
+        let floor = router_prefix_floor(&[cold, impossible.clone()]);
+        assert_eq!(floor, 210);
+        let impossible = rec(1, Status::Complete, 1400, 1000);
+        assert_eq!(
+            impossible.hit_rate_net(floor),
+            Some(1190.0 / 1000.0),
+            "netted by the learned wrapper span"
+        );
+        // No floor learned: the honest absurdity stands — no invention.
+        let impossible = rec(1, Status::Complete, 1400, 1000);
+        assert_eq!(impossible.hit_rate_net(0), Some(1.4));
+    }
+
+    #[test]
+    fn cumulative_netting_follows_the_same_per_turn_gate() {
+        // One impossible turn (140%) and one honest turn (50%): the
+        // impossible numerator is netted, the honest one untouched.
+        let cold = rec(0, Status::Complete, 210, 0);
+        let hot = rec(1, Status::Complete, 1400, 1000);
+        let calm = rec(2, Status::Complete, 500, 1000);
+        let floor = router_prefix_floor(&[cold, hot.clone(), calm.clone()]);
+        let rate = cumulative_hit_rate_net(&[hot, calm], floor).unwrap();
+        assert!((rate - (1190.0 + 500.0) / 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn floor_is_the_minimum_over_qualifying_cold_turns() {
+        // Several qualifying cold turns: the smallest reading wins — it is
+        // the wrapper span present on every turn. A writing cold turn is
+        // excluded (it cached this conversation's own prefix).
+        let cold_a = rec(0, Status::Complete, 128, 0);
+        let cold_b = rec(0, Status::Complete, 64, 0);
+        let mut writing = rec(0, Status::Complete, 4000, 0);
+        writing.cache_written_tokens = 4200;
+        assert_eq!(router_prefix_floor(&[cold_a, writing, cold_b]), 64);
     }
 
     #[test]
@@ -334,13 +393,16 @@ mod tests {
 
     #[test]
     fn netting_clamps_at_zero() {
-        // A warm turn whose cached reading is below the floor (the router's
-        // wrapper shrank) must not go negative: it reads as 0% net, never a
-        // nonsensical negative rate.
-        let cold = rec(0, Status::Complete, 128, 0);
+        // A turn whose reading exceeds its whole history (the impossible
+        // case) and whose learned floor exceeds the reading still cannot go
+        // negative: saturating subtraction reads 0% net, never negative.
+        // An honest ≤100% turn keeps its raw rate even with a learned
+        // floor — netting is for the impossible case only.
+        let cold = rec(0, Status::Complete, 1280, 0);
         let _ = &cold;
-        let warm = rec(1, Status::Complete, 90, 500);
-        let net = warm.hit_rate_net(128).unwrap();
-        assert!((net - 0.0).abs() < 1e-9);
+        let honest = rec(1, Status::Complete, 90, 500);
+        assert!((honest.hit_rate_net(1280).unwrap() - 0.18).abs() < 1e-9);
+        let impossible = rec(1, Status::Complete, 640, 500);
+        assert!((impossible.hit_rate_net(1280).unwrap() - 0.0).abs() < 1e-9);
     }
 }
