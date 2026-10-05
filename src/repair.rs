@@ -18,8 +18,8 @@
 //!    repairable, because rewriting to the canonical serialization changes
 //!    no semantics the model sees.
 //! 3. **TextNormalization** — equal after collapsing whitespace runs in
-//!    text-bearing strings (`content` strings, `text`/`thinking` parts).
-//!    Repairable for the same reason.
+//!    certified prose positions: a message's `content` string, and the
+//!    `text`/`thinking` field of an exactly-shaped content part. Repairable.
 //! 4. **RoleContentReshaped** — same role, same flattened text, different
 //!    content shape (string ↔ parts array). Repairable.
 //! 5. Otherwise — **semantic inequality**: the history means something
@@ -448,34 +448,61 @@ fn parsed_or_self(v: &Value) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| v.clone())
 }
 
-/// Collapse whitespace runs in text-bearing strings: `content` when a
-/// string, and `text`/`thinking` part fields. Other strings (ids, names,
-/// signatures, argument blobs) are compared exactly — they are not prose.
+/// Collapse whitespace runs in the *certified prose positions* of a message
+/// element: the `content` string of an object carrying a `role` sibling (a
+/// message), and the `text`/`thinking` field of an exactly-shaped content
+/// part inside a content array. Every other string — ids, names,
+/// signatures, tool argument blobs, nested user payload in any field named
+/// `text` or `content` — is data, not prose, and compares exactly.
 fn text_normalized(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => {
-            let mut out = Map::new();
-            for (k, val) in map {
-                out.insert(
-                    k.clone(),
-                    if k == "text" || k == "thinking" {
-                        collapse_ws(val)
-                    } else if k == "content" {
-                        match val {
-                            Value::String(_) => collapse_ws(val),
-                            Value::Array(_) => text_normalized(val),
-                            _ => val.clone(),
-                        }
-                    } else {
-                        text_normalized(val)
-                    },
-                );
+    let Value::Object(map) = v else {
+        return v.clone();
+    };
+    let mut out = Map::new();
+    for (k, val) in map {
+        let normalized = if k == "content" && map.contains_key("role") {
+            match val {
+                Value::String(_) => collapse_ws(val),
+                // A content array's parts are certified one level down, by
+                // their own exact shape.
+                Value::Array(parts) => {
+                    Value::Array(parts.iter().map(part_text_normalized).collect())
+                }
+                _ => val.clone(),
             }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(text_normalized).collect()),
-        _ => v.clone(),
+        } else {
+            val.clone()
+        };
+        out.insert(k.clone(), normalized);
     }
+    Value::Object(out)
+}
+
+/// Normalize the prose field of a content part: `{type, text}` or
+/// `{type, thinking}` exactly — two keys, matching type. A part carrying
+/// any other key (`annotations`, `signature`, …) or any other type is data:
+/// returned verbatim, so it compares exactly and is never rewritten away.
+fn part_text_normalized(part: &Value) -> Value {
+    let Some(map) = part.as_object() else {
+        return part.clone();
+    };
+    let prose_key = match map.get("type").and_then(Value::as_str) {
+        Some("text") if map.len() == 2 && map.contains_key("text") => "text",
+        Some("thinking") if map.len() == 2 && map.contains_key("thinking") => "thinking",
+        _ => return part.clone(),
+    };
+    let mut out = Map::new();
+    for (k, val) in map {
+        out.insert(
+            k.clone(),
+            if k.as_str() == prose_key {
+                collapse_ws(val)
+            } else {
+                val.clone()
+            },
+        );
+    }
+    Value::Object(out)
 }
 
 /// Collapse interior runs of spaces/tabs/CRs to a single space. Newline
@@ -556,10 +583,18 @@ fn all_text_flattened(content: &Value) -> Option<String> {
         Value::Array(parts) => {
             let mut out = String::new();
             for p in parts {
-                if p.get("type").and_then(Value::as_str) != Some("text") {
+                let map = p.as_object()?;
+                // A text part carrying any sibling key (`annotations`,
+                // `cache_control`, `signature`, …) is not proven equal to a
+                // bare string: the siblings are semantic and must compare
+                // exactly, so they block the reshape.
+                if map.len() != 2
+                    || map.get("type").and_then(Value::as_str) != Some("text")
+                    || !map.contains_key("text")
+                {
                     return None;
                 }
-                out.push_str(p.get("text").and_then(Value::as_str).unwrap_or(""));
+                out.push_str(map.get("text").and_then(Value::as_str).unwrap_or(""));
             }
             Some(out)
         }
@@ -919,5 +954,72 @@ mod tests {
         assert!(!r.matches_canonical);
         assert_eq!(r.drift_kind, Some(DriftKind::TextNormalization));
         assert_eq!(r.tokens_at_risk, c.tokens_at_risk);
+    }
+
+    #[test]
+    fn nested_text_keys_are_payload_not_prose() {
+        // Whitespace tolerance is certified for message content and
+        // exactly-shaped text parts — not for any string named `text`
+        // anywhere in the tree. Nested user payload is data and must
+        // compare exactly, or a rewrite would silently reformat it.
+        let canonical = vec![json!({
+            "role": "user",
+            "content": "Deploy",
+            "spec": {"text": "keep  double  spaces"},
+        })];
+        let client = vec![json!({
+            "role": "user",
+            "content": "Deploy",
+            "spec": {"text": "keep double spaces"},
+        })];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn annotated_text_parts_are_not_reshaped_away() {
+        // A text part carrying sibling keys is not a bare string: the
+        // siblings (annotations, cache_control) are semantic and must
+        // compare exactly, never be rewritten away by a reshape.
+        let canonical = msgs(&[("user", "hello world")]);
+        let client = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world",
+                         "annotations": [{"type": "url_citation"}]}],
+        })];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn a_signed_thinking_part_is_data_not_prose() {
+        // A thinking part carrying a signature sibling is not the certified
+        // two-key prose part: whitespace inside its text compares exactly.
+        let canonical = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hm  let me think", "signature": "sig1"},
+        ]})];
+        let client = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hm let me think", "signature": "sig1"},
+        ]})];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn exactly_shaped_text_parts_still_normalize() {
+        // The certified shape keeps the tolerance: two-key text parts are
+        // prose, so an interior whitespace run alone is repairable drift.
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "summarize   this"},
+        ]})];
+        let client = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "summarize this"},
+        ]})];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, None);
+        assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
     }
 }

@@ -88,6 +88,35 @@ fn usage_reply(message: serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// A stub upstream whose accepting task is handed back to the caller:
+/// aborting it drops the listener, closing the port — an unreachable
+/// provider mid-conversation, without a second rig.
+async fn abortable_stub_upstream(
+    seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    reply: serde_json::Value,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let reply = Arc::new(reply);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| {
+            let seen = seen.clone();
+            let reply = reply.clone();
+            async move {
+                seen.lock().unwrap().push(body.to_vec());
+                let bytes = serde_json::to_vec(reply.as_ref()).unwrap();
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(bytes))
+                    .unwrap()
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (format!("http://{a}"), handle)
+}
+
 fn streaming_usage_tail() -> Vec<Bytes> {
     vec![Bytes::from_static(
         b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\n",
@@ -103,6 +132,13 @@ struct Rig {
 }
 
 async fn rig(upstream: String, mode: RepairMode) -> Rig {
+    rig_with(upstream, mode, reqwest::Client::new()).await
+}
+
+/// A rig whose proxy client uses the given reqwest client — tests that
+/// need connection semantics the default pooling hides (a provider that
+/// goes away mid-conversation) pass a no-pool client.
+async fn rig_with(upstream: String, mode: RepairMode, client: reqwest::Client) -> Rig {
     let sessions = Arc::new(SharedSessions::new());
     let ledger = Arc::new(SharedLedger::new());
     let state = Arc::new(proxy::AppState {
@@ -112,7 +148,7 @@ async fn rig(upstream: String, mode: RepairMode) -> Rig {
         ledger: ledger.clone(),
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
-        client: reqwest::Client::new(),
+        client,
         inject_usage: true,
         repair: mode,
     });
@@ -730,4 +766,144 @@ async fn incomplete_turns_do_not_seed_the_chain() {
         .canonical_messages(1, "gpt-4o")
         .map(|c| c.len());
     assert_eq!(chain_len, Some(3), "sys + user + assistant");
+}
+
+#[tokio::test]
+async fn a_foreign_conversation_is_not_repaired_toward_another_chain() {
+    // The fork probe's worst case: a *different* conversation on the same
+    // model shares the framework's system prompt (whitespace-variant) and
+    // diverges right after. The probe must not adopt the first
+    // conversation's chain — a history that breaks inside the probed chain
+    // is a first turn, forwarded untouched, never rewritten toward bytes
+    // another conversation cached.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reply = usage_reply(serde_json::json!({"role": "assistant", "content": "ok"}));
+    let upstream = stub_upstream(seen.clone(), reply).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    // Conversation A completes a turn with a double-space system prompt.
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Be terse. You  deploy."},
+                {"role": "user", "content": "Deploy the cache."},
+            ],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+
+    // Conversation B: same framework prompt, single space, different topic.
+    // Its leading hash differs, so it forks — straight onto the probe.
+    let foreign = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "Be terse. You deploy."},
+            {"role": "user", "content": "Plan my garden."},
+        ],
+    });
+    let sent = foreign.to_string();
+    send(&rig, &foreign).await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    assert_eq!(
+        upstream_saw[1],
+        sent.as_bytes(),
+        "a foreign conversation forwards untouched, system prompt included"
+    );
+    assert!(!record.repaired);
+    assert_eq!(record.matches_canonical, Some(false));
+    assert_eq!(record.drift_kind, None, "honestly a first turn");
+    assert_eq!(record.canonicalized_tokens, 0);
+}
+
+#[tokio::test]
+async fn a_shared_prefix_that_diverges_is_a_first_turn() {
+    // Harder probe case: the foreign conversation shares a whole templated
+    // opening (drifted system + an exact onboarding turn) before diverging.
+    // However much of the opening aligned, the divergence inside the
+    // probed chain is the tell — first turn, untouched.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reply = usage_reply(serde_json::json!({"role": "assistant", "content": "Welcome."}));
+    let upstream = stub_upstream(seen.clone(), reply).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    // Conversation A: the template opening, then its own turn.
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Framework v2.  Be brief."},
+                {"role": "user", "content": "Onboard me"},
+            ],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+
+    // Conversation B: whitespace-drifted template system, the same
+    // onboarding turn, then a different question. The probed chain breaks
+    // at B's third element (A's slot there holds an assistant answer).
+    let foreign = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "Framework v2. Be brief."},
+            {"role": "user", "content": "Onboard me"},
+            {"role": "user", "content": "Now plan my Q3"},
+        ],
+    });
+    let sent = foreign.to_string();
+    send(&rig, &foreign).await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    assert_eq!(
+        upstream_saw[1],
+        sent.as_bytes(),
+        "a diverging history is never rewritten toward a foreign chain"
+    );
+    assert!(!record.repaired);
+    assert_eq!(record.drift_kind, None);
+    assert_eq!(record.canonicalized_tokens, 0);
+}
+
+#[tokio::test]
+async fn a_send_failure_records_the_rewrite_not_the_estimate() {
+    // The 502 path and the finalize path must agree on what repair did: a
+    // rewrite applied before the send failed is reported as a rewrite with
+    // the actual amount — never silently downgraded to the dry-run
+    // estimate, never dropped.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (upstream, server) =
+        abortable_stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    // No pooled connections: turn 1 must dial the (now closed) port itself,
+    // instead of riding turn 0's keep-alive connection through the abort.
+    let no_pool = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let rig = rig_with(upstream, RepairMode::On, no_pool).await;
+
+    send(&rig, &weather_turn0()).await;
+    last_record(&rig, 1).await;
+
+    // The provider becomes unreachable; the client re-sends drifted history.
+    server.abort();
+    let _ = server.await; // the listener is closed before the next send
+    send(&rig, &weather_turn1_reordered_args()).await;
+    let record = last_record(&rig, 2).await;
+
+    assert_eq!(record.status, Status::Incomplete);
+    assert!(
+        record.repaired,
+        "the rewrite happened before the send failed; the record says so"
+    );
+    assert!(
+        record.canonicalized_tokens > 0,
+        "the actual canonicalized amount, not a silent zero"
+    );
 }
