@@ -89,6 +89,22 @@ pub fn plan_request(
     }
 }
 
+/// Stamp a record with the drift claim computed on the request path. The
+/// request itself was untouched in every mode except `on` (the rewrite
+/// batch overrides `repaired`/`canonicalized_tokens` when it actually
+/// rewrites). Shared by the stream-finalize path and the send-error path so
+/// an examined turn is never recorded as unexamined.
+fn apply_drift_claim(record: &mut Record, report: &DriftReport) {
+    record.repair_mode = report.mode;
+    record.matches_canonical = if report.mode == RepairMode::Off {
+        None
+    } else {
+        Some(report.matches_canonical)
+    };
+    record.drift_kind = report.drift_kind;
+    record.canonicalized_tokens = report.tokens_at_risk;
+}
+
 /// The raw observed figures for one turn, before cost is applied.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Observation {
@@ -429,22 +445,7 @@ impl<A: Adapter> Finalizer<A> {
             complete,
             engine_cached,
         );
-        // The repair claim rides on the record; the request itself was
-        // untouched in every mode except `on`.
-        record.repair_mode = self.drift_report.mode;
-        record.matches_canonical = if self.drift_report.mode == RepairMode::Off {
-            None
-        } else {
-            Some(self.drift_report.matches_canonical)
-        };
-        record.drift_kind = self.drift_report.drift_kind;
-        // Dry-run: the would-be count is the at-risk estimate. `on` mode
-        // (next batch) sets the actual count when it rewrites.
-        record.canonicalized_tokens = if self.drift_report.mode == RepairMode::On {
-            0
-        } else {
-            self.drift_report.tokens_at_risk
-        };
+        apply_drift_claim(&mut record, &self.drift_report);
         if complete {
             // The canonical turn: the messages exactly as forwarded, extended
             // by the assistant message(s) exactly as received. Only complete
@@ -517,8 +518,6 @@ pub struct AppState<A: Adapter> {
 /// The proxy's operating configuration (everything the CLI tunes).
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
-    /// Provider endpoint to forward to.
-    pub upstream_url: String,
     /// Inject `stream_options.include_usage` on OpenAI-dialect streams.
     pub inject_usage: bool,
     /// The repair mode (dry-run is the product default).
@@ -532,6 +531,7 @@ pub async fn serve<A: Adapter + 'static>(
     tokenizer: Tokenizer,
     rates: Rates,
     ledger: Arc<SharedLedger>,
+    upstream_url: String,
     options: ServeOptions,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -543,7 +543,7 @@ pub async fn serve<A: Adapter + 'static>(
         sessions: Arc::new(SharedSessions::new()),
         ledger,
         rates,
-        upstream_url: options.upstream_url,
+        upstream_url,
         repair: options.repair,
         inject_usage: options.inject_usage,
         // A connect timeout fails fast on an unreachable upstream without
@@ -769,7 +769,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         let (chain, other_models) = {
             let ledger = state.ledger.lock();
             let chain = ledger.canonical_messages(plan.session_id, &model);
-            let other_models = !ledger.session_models(plan.session_id).is_empty();
+            let other_models = ledger.session_has_chains(plan.session_id);
             (chain, other_models)
         };
         let client_values = doc
@@ -823,7 +823,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
     let upstream = match req.body(forwarded).send().await {
         Ok(r) => r,
         Err(e) => {
-            let record = build_record(
+            let mut record = build_record(
                 &plan,
                 Observation::default(),
                 &model,
@@ -831,6 +831,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 state.adapter.source(),
                 false,
             );
+            // The turn was examined; the failed-forward record still carries
+            // the drift claim (it stays excluded from aggregates as
+            // Incomplete).
+            apply_drift_claim(&mut record, &drift_report);
             crate::export::log_finalize(&record);
             state.sessions.lock().append(record);
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();

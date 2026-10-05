@@ -70,8 +70,9 @@ pub struct Record {
     #[serde(default)]
     pub repaired: bool,
     /// `None` when repair did not examine the turn (mode off). `Some(true)`:
-    /// the re-sent history byte-matches the canonical chain. `Some(false)`:
-    /// drift (see `drift_kind`) or an unrepairable hard stop.
+    /// the re-sent history matches the canonical chain under semantic JSON
+    /// equality (object key order is not drift; string leaves are). Some
+    /// `false`: drift (see `drift_kind`) or an unrepairable hard stop.
     #[serde(default)]
     pub matches_canonical: Option<bool>,
     /// The classified flavor of the drift, when there was one.

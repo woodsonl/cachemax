@@ -242,13 +242,12 @@ impl Ledger {
         self.sessions.get(&session_id)?.get(model)
     }
 
-    /// The models this session has canonical turns under. Distinguishes a
-    /// model switch (chains exist, none for this model) from a first turn.
-    pub fn session_models(&self, session_id: u64) -> Vec<String> {
+    /// Whether the session has canonical turns under any model. Distinguishes
+    /// a model switch (chains exist, none for this model) from a first turn.
+    pub fn session_has_chains(&self, session_id: u64) -> bool {
         self.sessions
             .get(&session_id)
-            .map(|per_model| per_model.keys().cloned().collect())
-            .unwrap_or_default()
+            .is_some_and(|per_model| !per_model.is_empty())
     }
 
     /// The canonical message chain for a session+model: the messages of the

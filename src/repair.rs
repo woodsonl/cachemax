@@ -208,37 +208,42 @@ pub fn classify_turn(
     // Find the best alignment: the offset d into the canonical chain that
     // the client's history extends. The common clean case (d = 0) is tried
     // first and usually wins immediately; the offset scan only runs when the
-    // head-on comparison breaks early (truncation or drift).
-    let mut best: Option<Aligned> = None;
-    for d in 0..canonical.len() {
-        let aligned = align_at(client, canonical, d);
-        let better = match &best {
-            None => true,
-            Some(b) => aligned.run > b.run || (aligned.run == b.run && aligned.offset < b.offset),
-        };
-        if better {
-            best = Some(aligned);
-        }
-        // The head-on clean case can't be beaten by a deeper offset.
-        if d == 0 {
-            if let Some(a) = &best {
-                if a.run == canonical.len().min(client.len()) && a.semantic_break.is_none() {
-                    break;
-                }
+    // head-on comparison breaks early (truncation or drift). Among equal
+    // runs, a break-free alignment beats one with a semantic break: with
+    // repeated identical elements both readings fit, and the break-free one
+    // (history extends, possibly truncated) is the reading repair can act on.
+    let clean =
+        |a: &Aligned| a.run == canonical.len().min(client.len()) && a.semantic_break.is_none();
+    let mut best = align_at(client, canonical, 0);
+    if !clean(&best) {
+        for d in 1..canonical.len() {
+            let aligned = align_at(client, canonical, d);
+            let better = aligned.run > best.run
+                || (aligned.run == best.run
+                    && best.semantic_break.is_some()
+                    && aligned.semantic_break.is_none());
+            if better {
+                best = aligned;
+            }
+            if clean(&best) {
+                break;
             }
         }
     }
-    let a = best.unwrap_or_else(|| align_at(client, canonical, 0));
 
     // Assemble the report from the winning alignment.
+    let a = best;
     let compared = canonical.len().min(client.len());
     let mut kinds: Vec<DriftKind> = Vec::new();
     let mut nonexact = 0usize;
+    let mut tokens_at_risk = tokens_of(tokenizer, &canonical[..a.offset]);
     for i in 0..a.run {
         match relation(&client[i], &canonical[a.offset + i]) {
             Rel::Exact => {}
             Rel::Equivalent(k) => {
                 nonexact += 1;
+                tokens_at_risk +=
+                    tokens_of(tokenizer, std::slice::from_ref(&canonical[a.offset + i]));
                 if !kinds.contains(&k) {
                     kinds.push(k);
                 }
@@ -265,12 +270,6 @@ pub fn classify_turn(
         None => 0,
     };
     let turns_affected = a.offset + nonexact + residual;
-    let mut tokens_at_risk = tokens_of(tokenizer, &canonical[..a.offset]);
-    for i in 0..a.run {
-        if relation(&client[i], &canonical[a.offset + i]) != Rel::Exact {
-            tokens_at_risk += tokens_of(tokenizer, std::slice::from_ref(&canonical[a.offset + i]));
-        }
-    }
     if residual > 0 {
         let k = a.semantic_break.unwrap();
         tokens_at_risk += tokens_of(tokenizer, &canonical[a.offset + k..a.offset + k + residual]);
@@ -358,8 +357,11 @@ fn relation(a: &Value, b: &Value) -> Rel {
 /// Rewrite every tool-call `arguments` string as its parsed JSON value, so
 /// two serializations of the same arguments compare equal. Covers the
 /// current OpenAI shape (`tool_calls[].function.arguments`) and the legacy
-/// `function_call.arguments`. Anthropic's `tool_use.input` is already an
-/// object on the wire and needs no tolerance.
+/// `function_call.arguments` — both are objects carrying a sibling `name`,
+/// which gates the tolerance: a string field merely *named* `arguments`
+/// elsewhere in the tree is user payload, not a tool call, and must compare
+/// exactly. Anthropic's `tool_use.input` is already an object on the wire
+/// and needs no tolerance.
 fn tool_args_normalized(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -367,7 +369,7 @@ fn tool_args_normalized(v: &Value) -> Value {
             for (k, val) in map {
                 out.insert(
                     k.clone(),
-                    if (k == "arguments" || k == "partial_json") && val.is_string() {
+                    if k == "arguments" && val.is_string() && map.contains_key("name") {
                         parsed_or_self(val)
                     } else {
                         tool_args_normalized(val)
@@ -402,9 +404,7 @@ fn text_normalized(v: &Value) -> Value {
                     } else if k == "content" {
                         match val {
                             Value::String(_) => collapse_ws(val),
-                            Value::Array(parts) => {
-                                Value::Array(parts.iter().map(text_normalized).collect())
-                            }
+                            Value::Array(_) => text_normalized(val),
                             _ => val.clone(),
                         }
                     } else {
@@ -419,15 +419,51 @@ fn text_normalized(v: &Value) -> Value {
     }
 }
 
+/// Collapse interior runs of spaces/tabs/CRs to a single space. Newline
+/// structure and line-edge whitespace are preserved verbatim: indentation
+/// and line breaks are semantic text (code, YAML, markdown), and rewriting
+/// them would change what the model reads, not just its serialization.
 fn collapse_ws(v: &Value) -> Value {
-    match v.as_str() {
-        Some(s) => Value::String(s.split_whitespace().collect::<Vec<_>>().join(" ")),
-        None => v.clone(),
+    let Some(s) = v.as_str() else {
+        return v.clone();
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut pending = String::new();
+    let mut line_started = false;
+    for ch in s.chars() {
+        match ch {
+            ' ' | '\t' | '\r' => {
+                if line_started {
+                    pending.push(ch);
+                } else {
+                    out.push(ch); // leading indentation stays verbatim
+                }
+            }
+            '\n' => {
+                out.push_str(&pending);
+                pending.clear();
+                out.push('\n');
+                line_started = false;
+            }
+            c => {
+                if !pending.is_empty() {
+                    out.push(' ');
+                    pending.clear();
+                }
+                line_started = true;
+                out.push(c);
+            }
+        }
     }
+    out.push_str(&pending); // trailing whitespace stays verbatim
+    Value::String(out)
 }
 
 /// Flatten `content` to its text on both sides, so a string and an
 /// equivalent parts-array compare equal. Text must then match exactly.
+/// Content carrying non-text parts (images, audio, tool results) is kept
+/// verbatim — it is semantic and must compare exactly, so a message that
+/// gained, lost, or swapped an image is never "reshaped".
 fn reshaped(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -436,9 +472,9 @@ fn reshaped(v: &Value) -> Value {
                 out.insert(
                     k.clone(),
                     if k == "content" {
-                        match crate::proxy::flatten_content(Some(val)) {
-                            s if s.is_empty() && !matches!(val, Value::String(_)) => val.clone(),
-                            s => Value::String(s),
+                        match all_text_flattened(val) {
+                            Some(text) => Value::String(text),
+                            None => val.clone(),
                         }
                     } else {
                         reshaped(val)
@@ -452,16 +488,34 @@ fn reshaped(v: &Value) -> Value {
     }
 }
 
+/// The flattened text of a content value when it is a string or an array of
+/// text-only parts. `None` when any part is not a text part: non-text
+/// content is semantic and must compare exactly.
+fn all_text_flattened(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                if p.get("type").and_then(Value::as_str) != Some("text") {
+                    return None;
+                }
+                out.push_str(p.get("text").and_then(Value::as_str).unwrap_or(""));
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Serialized token count of the given canonical elements — the at-risk
 /// estimate. Reporting only.
 fn tokens_of(tokenizer: &Tokenizer, elements: &[Value]) -> u64 {
-    let mut n = 0u64;
-    for e in elements {
-        if let Ok(s) = serde_json::to_string(e) {
-            n += tokenizer.count(&s) as u64;
-        }
-    }
-    n
+    elements
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|s| tokenizer.count(&s) as u64)
+        .sum()
 }
 
 #[cfg(test)]
@@ -557,11 +611,96 @@ mod tests {
 
     #[test]
     fn whitespace_normalization_is_detected() {
-        let canonical = msgs(&[("user", "Please   summarize\nthe   results.")]);
+        let canonical = msgs(&[("user", "Please   summarize  the   results.")]);
         let client = msgs(&[("user", "Please summarize the results.")]);
         let c = classify(&client, &canonical);
         assert!(!c.report_matches);
         assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn newline_structure_is_semantic_not_normalization() {
+        // Line breaks are meaning (code, lists); collapsing them would
+        // rewrite what the model reads. Such drift is inequality: flagged,
+        // passed through, never "repaired".
+        let canonical = msgs(&[("user", "if x:\n    return 1\nelse:\n    return 2")]);
+        let client = msgs(&[("user", "if x: return 1 else: return 2")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn indentation_is_preserved_not_collapsed() {
+        // Leading line whitespace stays verbatim; interior runs collapse.
+        let canonical = msgs(&[("user", "line one\n    indented")]);
+        let client = msgs(&[("user", "line one\n  indented")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0), "different indentation differs");
+        // Same indentation, different interior run: normalization.
+        let client2 = msgs(&[("user", "line  one\n    indented")]);
+        let c2 = classify(&client2, &canonical);
+        assert_eq!(c2.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn non_text_content_parts_are_never_reshaped_away() {
+        // A message that gained an image is a different message; a message
+        // with a different image is too. Neither may be rewritten to the
+        // text-only canonical form.
+        let canonical = msgs(&[("user", "What is in this image?")]);
+        let with_image = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ],
+        })];
+        let c = classify(&with_image, &canonical);
+        assert_eq!(c.semantic_break, Some(0), "image content is inequality");
+
+        // Two different images are not equivalent to each other either.
+        let other_image = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/dog.png"}},
+            ],
+        })];
+        let c2 = classify(&other_image, with_image.as_slice());
+        assert_eq!(c2.semantic_break, Some(0));
+    }
+
+    #[test]
+    fn a_string_field_named_arguments_is_not_tool_args() {
+        // Tool-arg tolerance is gated on the function-call structure (a
+        // sibling `name`), not the bare field name: a user-authored
+        // `arguments` payload must compare exactly.
+        let canonical = vec![json!({
+            "role": "user",
+            "content": "Deploy this",
+            "arguments": "{\"region\": \"us-east-1\", \"replicas\": 3}",
+        })];
+        let client = vec![json!({
+            "role": "user",
+            "content": "Deploy this",
+            "arguments": "{\"replicas\":3,\"region\":\"us-east-1\"}",
+        })];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0), "user payload is not a tool call");
+        assert_eq!(c.drift_kind, None);
+    }
+
+    #[test]
+    fn duplicated_elements_prefer_the_break_free_alignment() {
+        // With repeated identical elements two readings fit; the break-free
+        // one (truncation) must win over the semantic-break reading.
+        let canonical = msgs(&[("user", "continue"), ("user", "continue")]);
+        let client = msgs(&[("user", "continue"), ("user", "what next?")]);
+        let c = classify(&client, &canonical);
+        assert_eq!(c.canonical_offset, 1, "the dropped duplicate is truncation");
+        assert_eq!(c.semantic_break, None);
+        assert_eq!(c.drift_kind, Some(DriftKind::TruncatedHistory));
     }
 
     #[test]
@@ -711,8 +850,10 @@ mod tests {
 
     #[test]
     fn report_carries_mode_and_matches() {
-        let canonical = msgs(&[("user", "hi"), ("assistant", "yo")]);
-        let client = msgs(&[("user", "hi  "), ("assistant", "yo")]);
+        // Interior-run whitespace drift (trailing spaces are line-edge and
+        // stay verbatim under the conservative normalization).
+        let canonical = msgs(&[("user", "hi  there"), ("assistant", "yo")]);
+        let client = msgs(&[("user", "hi there"), ("assistant", "yo")]);
         let c = classify(&client, &canonical);
         let r = report(&c, RepairMode::DryRun);
         assert_eq!(r.mode, RepairMode::DryRun);

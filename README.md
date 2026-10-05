@@ -121,9 +121,9 @@ metrics-only — never message content.
 
 The last five fields are the drift annotation: `repair_mode` (`off` |
 `dry_run` | `on`), `repaired` (true only when a rewrite happened), and — when
-the turn was examined — whether the re-sent history byte-matched the canonical
-chain, the classified drift flavor, and the tokens at risk. Still metrics
-only: never message content.
+the turn was examined — whether the re-sent history matched the canonical
+chain under semantic JSON equality, the classified drift flavor, and the
+tokens at risk. Still metrics only: never message content.
 
 ## Commands
 

@@ -111,7 +111,7 @@ fn first_turn_body() -> serde_json::Value {
         "stream": true,
         "messages": [
             {"role": "system", "content": "You are terse."},
-            {"role": "user", "content": "Hi"},
+            {"role": "user", "content": "Hi there"},
         ],
     })
 }
@@ -124,7 +124,7 @@ fn drifted_second_turn_body() -> serde_json::Value {
         "stream": true,
         "messages": [
             {"role": "system", "content": "You are terse."},
-            {"role": "user", "content": "Hi "},
+            {"role": "user", "content": "Hi  there"},
             {"role": "assistant", "content": "Hello"},
             {"role": "user", "content": "More"},
         ],
@@ -185,7 +185,7 @@ async fn a_clean_continuation_reports_a_match() {
         "stream": true,
         "messages": [
             {"role": "system", "content": "You are terse."},
-            {"role": "user", "content": "Hi"},
+            {"role": "user", "content": "Hi there"},
             {"role": "assistant", "content": "Hello"},
             {"role": "user", "content": "More"},
         ],

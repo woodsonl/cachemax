@@ -216,7 +216,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cachemax::proxy::ServeOptions {
                     repair: cachemax::repair::RepairMode::DryRun,
                     inject_usage: !cli.no_inject_usage,
-                    upstream_url: String::new(),
                 },
             )
             .await
@@ -305,10 +304,8 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                cachemax::proxy::ServeOptions {
-                    upstream_url: upstream.clone(),
-                    ..options.clone()
-                },
+                upstream.clone(),
+                options.clone(),
                 listener,
             )
             .await
@@ -319,10 +316,8 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                cachemax::proxy::ServeOptions {
-                    upstream_url: upstream.clone(),
-                    ..options.clone()
-                },
+                upstream.clone(),
+                options.clone(),
                 listener,
             )
             .await
@@ -333,10 +328,8 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                cachemax::proxy::ServeOptions {
-                    upstream_url: upstream.clone(),
-                    ..options.clone()
-                },
+                upstream.clone(),
+                options.clone(),
                 listener,
             )
             .await
@@ -347,10 +340,8 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                cachemax::proxy::ServeOptions {
-                    upstream_url: upstream.clone(),
-                    ..options.clone()
-                },
+                upstream.clone(),
+                options.clone(),
                 listener,
             )
             .await
@@ -361,10 +352,8 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                cachemax::proxy::ServeOptions {
-                    upstream_url: upstream.clone(),
-                    ..options.clone()
-                },
+                upstream.clone(),
+                options.clone(),
                 listener,
             )
             .await
