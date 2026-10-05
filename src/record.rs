@@ -32,8 +32,12 @@ pub enum SourceLabel {
 ///
 /// `cached_tokens` is the provider- or engine-reported count of prefix tokens
 /// served from cache. `resent_history_tokens` is the binding denominator: the
-/// token count of the re-sent message list (system + all prior user, assistant,
-/// and tool messages), excluding this turn's new content.
+/// token count of the re-sent message list, excluding this turn's new content.
+/// On OpenAI the system prompt is a `role: "system"` message and is counted;
+/// on Anthropic it is a top-level `system` field and is not — the denominator
+/// is dialect-dependent by construction, so a cached system breakpoint on
+/// Anthropic can read above 100%. The floor nets a foreign wrapper, not this;
+/// a client's own system-prompt cache is reported as the provider gave it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// Session this request belongs to.
@@ -42,7 +46,10 @@ pub struct Record {
     pub turn: u32,
     pub status: Status,
     pub source: SourceLabel,
-    /// Time to first token, milliseconds.
+    /// Time to first token, milliseconds — request send to the first
+    /// non-empty response byte, so it covers the upstream's whole
+    /// time-to-first-token (headers wait included). Streaming requests
+    /// measure the first SSE data chunk; JSON bodies the first body byte.
     pub ttft_ms: Option<f64>,
     /// Provider- or engine-reported cached prefix tokens.
     pub cached_tokens: u64,
@@ -107,6 +114,54 @@ impl Record {
         }
         Some(self.cached_tokens as f64 / self.resent_history_tokens as f64)
     }
+
+    /// Per-turn hit rate with a foreign-prefix floor subtracted: routed
+    /// endpoints report their own wrapper's cached tokens inside
+    /// `cached_tokens` even on a cold turn, which the re-sent-history
+    /// denominator never contains — the raw rate can exceed 100%. The floor
+    /// is the session's cold-turn reading (see [`router_prefix_floor`]);
+    /// `0` leaves the raw rate untouched.
+    pub fn hit_rate_net(&self, floor: u64) -> Option<f64> {
+        if floor == 0 {
+            return self.hit_rate();
+        }
+        if self.turn == 0 || self.resent_history_tokens == 0 {
+            return None;
+        }
+        if self.source == SourceLabel::NoCacheTruth {
+            return None;
+        }
+        Some(self.cached_tokens.saturating_sub(floor) as f64 / self.resent_history_tokens as f64)
+    }
+}
+
+/// The foreign-prefix floor of a session: cached tokens reported on a turn
+/// that re-sent no history **and wrote nothing to the cache**, therefore
+/// attributable to the endpoint's own wrapper (router prompt, injected
+/// preamble) rather than this conversation. The minimum over such turns; `0`
+/// when none exists.
+///
+/// The write gate is what separates a wrapper from a client's own cache: a
+/// cold turn that *wrote* what it read (Anthropic's `cache_creation_input_tokens`,
+/// typically from a `cache_control` breakpoint on the system prompt) cached
+/// this conversation's own prefix, so its reading is not foreign. Only a cold
+/// turn that read a prefix it did not create — and, on direct providers, that
+/// is impossible, since they report `0` cached on a cold turn — reveals a
+/// foreign span. Erring toward `0` is deliberate: a false floor would
+/// under-report real reuse, the worse error.
+pub fn router_prefix_floor(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .filter(|r| {
+            r.status == Status::Complete
+                && r.turn == 0
+                && r.resent_history_tokens == 0
+                && r.cache_written_tokens == 0
+                && r.source != SourceLabel::NoCacheTruth
+        })
+        .map(|r| r.cached_tokens)
+        .min()
+        .unwrap_or(0)
 }
 
 /// Session-cumulative hit rate: `Σ cached / Σ resent_history` over complete
@@ -116,6 +171,15 @@ impl Record {
 /// history (nothing re-sent) contribute nothing: counting their `cached_tokens`
 /// against a zero/absent denominator would inflate or fabricate the rate.
 pub fn cumulative_hit_rate(records: &[Record]) -> Option<f64> {
+    cumulative_hit_rate_net(records, 0)
+}
+
+/// Cumulative hit rate with a foreign-prefix floor subtracted from every
+/// turn's numerator: `Σ max(0, cached − floor) / Σ resent_history`. The
+/// floor is the endpoint's own wrapper span ([`router_prefix_floor`]),
+/// which the denominator never contains — without netting, routed sessions
+/// read above 100%. `0` reproduces the raw formula exactly.
+pub fn cumulative_hit_rate_net(records: &[Record], floor: u64) -> Option<f64> {
     let mut cached: u64 = 0;
     let mut history: u64 = 0;
     for r in records {
@@ -126,7 +190,7 @@ pub fn cumulative_hit_rate(records: &[Record]) -> Option<f64> {
         {
             continue;
         }
-        cached += r.cached_tokens;
+        cached += r.cached_tokens.saturating_sub(floor);
         history += r.resent_history_tokens;
     }
     if history == 0 {
@@ -199,5 +263,84 @@ mod tests {
         let t2 = rec(2, Status::Incomplete, 9999, 9999); // must be ignored
         let cum = cumulative_hit_rate(&[t1, t2]).unwrap();
         assert!((cum - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn router_floor_is_the_cold_turn_reading() {
+        // A routed endpoint reports 128 cached tokens even on the cold turn
+        // (its own wrapper) and wrote none of them — the router cached that
+        // prefix before our request.
+        let cold = rec(0, Status::Complete, 128, 0);
+        let warm = rec(1, Status::Complete, 628, 500);
+        let records = [cold, warm];
+        assert_eq!(router_prefix_floor(&records), 128);
+
+        // Raw rate exceeds 100%; the netted rate does not.
+        let warm = rec(1, Status::Complete, 628, 500);
+        assert!((warm.hit_rate().unwrap() - 628.0 / 500.0).abs() < 1e-9);
+        let net = warm.hit_rate_net(128).unwrap();
+        assert!(
+            (net - 500.0 / 500.0).abs() < 1e-9,
+            "628-128 over 500 = 100%"
+        );
+    }
+
+    #[test]
+    fn a_clients_own_cold_cache_is_not_a_floor() {
+        // Direct Anthropic: a cold turn whose `cache_control` breakpoint
+        // cached the system prompt reports a read AND a creation for that
+        // same prefix. That is this conversation's own cache, not a foreign
+        // wrapper — netting it would under-report real reuse.
+        let mut cold = rec(0, Status::Complete, 4000, 0);
+        cold.cache_written_tokens = 4200;
+        let warm = rec(1, Status::Complete, 4500, 1000);
+        let records = [cold, warm];
+        assert_eq!(
+            router_prefix_floor(&records),
+            0,
+            "a cold turn that wrote what it read owns that prefix"
+        );
+        // With no floor, the warm rate is the provider's own figure.
+        let warm = rec(1, Status::Complete, 4500, 1000);
+        assert_eq!(warm.hit_rate_net(0), warm.hit_rate());
+    }
+
+    #[test]
+    fn direct_providers_have_no_floor_and_are_untouched() {
+        // OpenAI reports 0 cached on a cold turn: floor 0, raw == net.
+        let cold = rec(0, Status::Complete, 0, 0);
+        let warm = rec(1, Status::Complete, 900, 1000);
+        let records = [cold, warm];
+        assert_eq!(router_prefix_floor(&records), 0);
+        let warm = rec(1, Status::Complete, 900, 1000);
+        assert_eq!(warm.hit_rate_net(0), warm.hit_rate());
+    }
+
+    #[test]
+    fn no_cold_turn_means_no_floor() {
+        // A session whose first observed turn already re-sent history gives
+        // no evidence of a foreign prefix: 0, so nothing is netted.
+        let warm = rec(1, Status::Complete, 628, 500);
+        assert_eq!(router_prefix_floor(&[warm]), 0);
+    }
+
+    #[test]
+    fn incomplete_cold_turn_does_not_set_the_floor() {
+        // A partial cold turn's usage is not trustworthy token truth.
+        let cold = rec(0, Status::Incomplete, 128, 0);
+        let warm = rec(1, Status::Complete, 628, 500);
+        assert_eq!(router_prefix_floor(&[cold, warm]), 0);
+    }
+
+    #[test]
+    fn netting_clamps_at_zero() {
+        // A warm turn whose cached reading is below the floor (the router's
+        // wrapper shrank) must not go negative: it reads as 0% net, never a
+        // nonsensical negative rate.
+        let cold = rec(0, Status::Complete, 128, 0);
+        let _ = &cold;
+        let warm = rec(1, Status::Complete, 90, 500);
+        let net = warm.hit_rate_net(128).unwrap();
+        assert!((net - 0.0).abs() < 1e-9);
     }
 }

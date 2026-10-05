@@ -27,7 +27,7 @@ One record per request. Nothing about message content is in it — metrics only:
 | `turn` | Turn index within the session. Turn 0 is cold. |
 | `status` | `complete` or `incomplete` (the stream ended early, or the upstream answered non-2xx). |
 | `source` | Where the cache figure came from: `provider_reported`, `engine_measured`, or `no_cache_truth`. |
-| `ttft_ms` | Time to first token. |
+| `ttft_ms` | Time to first token — from the moment the request was sent upstream to the first non-empty response byte. It therefore includes the upstream's full first-token wait (headers included), not just the time from headers to first chunk. |
 | `cached_tokens` | Prefix tokens the provider/engine reports it served from cache. |
 | `cache_written_tokens` | Prefix tokens written to cache this turn (Anthropic only; 0 elsewhere). |
 | `resent_history_tokens` | The binding denominator: system + all prior messages, excluding this turn's new content. |
@@ -68,6 +68,28 @@ Two rules that matter:
 
 `—` always means *unexposed*, and is styled to look unlike `0`. A zero
 denominator renders `—`, never `0`.
+
+### Routed endpoints: the foreign-prefix floor
+
+Some deployments put cachemax in front of a *router* (a gateway that wraps
+every request in its own preamble/prefix). The router's own cached span comes
+back inside `cached_tokens` — visible as a cold turn that already reads `>0`
+cached tokens — but it is not part of the history you re-sent, so the raw
+ratio can exceed 100%.
+
+cachemax learns that span as the session's **floor**: the cached count on a
+complete cold turn (a turn with no re-sent history) that **wrote nothing to
+the cache**. The write gate is what separates a wrapper from your own cache: a
+cold turn that *wrote* what it read — on Anthropic, a `cache_control`
+breakpoint on the system prompt — cached this conversation's prefix itself, so
+its reading is not foreign and no floor is taken. Only a cold turn that read a
+prefix it did not create reveals a foreign span.
+
+Every derived rate then subtracts the floor from the numerator, and the
+dashboard says so (`router prefix N tk subtracted from hit rate`). Token
+counts stay provider-raw; only the rates are netted. A direct provider that
+reports `0` cached on a cold turn — OpenAI, and Anthropic without a cache
+breakpoint — has a floor of `0`, so nothing changes.
 
 ## What `provider_reported` means
 On the cloud path, the cache figure is the provider's own number. cachemax never
