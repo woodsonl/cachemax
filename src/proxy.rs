@@ -178,6 +178,8 @@ pub fn build_record(
         matches_canonical: None,
         drift_kind: None,
         canonicalized_tokens: 0,
+        // Patched by the finalizer when breakpoint management ran.
+        breakpoint_count: None,
     }
 }
 
@@ -408,6 +410,10 @@ struct Finalizer<A: Adapter> {
     /// The rewrite that was applied (`on` mode, drift present, chain
     /// extendable). `None` means the request went out untouched.
     rewrite: Option<repair::Rewrite>,
+    /// Breakpoint management's outcome (`None` when the feature is off or
+    /// the backend is not Anthropic). Patches the record and the ledger's
+    /// echo-detection count.
+    breakpoints: Option<crate::breakpoints::Managed>,
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
@@ -453,6 +459,9 @@ impl<A: Adapter> Finalizer<A> {
             engine_cached,
         );
         apply_drift_claim(&mut record, &self.drift_report, self.rewrite.as_ref());
+        if let Some(managed) = self.breakpoints {
+            record.breakpoint_count = Some(managed.total as u64);
+        }
         if complete {
             // The canonical turn: the messages exactly as forwarded, extended
             // by the assistant message(s) exactly as received. Only complete
@@ -464,6 +473,13 @@ impl<A: Adapter> Finalizer<A> {
                 request_messages: self.as_sent_messages.clone(),
                 response_messages: self.observer.response_messages(),
                 prefix_hashes: self.plan.prefix_hashes.clone(),
+                // What WE placed (a declined pass touched nothing and must
+                // not claim the client's hints as ours: echoed counts are
+                // how the next turn tells the two apart).
+                breakpoints: match self.breakpoints {
+                    Some(m) if !m.declined => m.total as u64,
+                    _ => 0,
+                },
             };
             self.ledger.lock().append(self.plan.session_id, turn);
         }
@@ -520,6 +536,12 @@ pub struct AppState<A: Adapter> {
     /// The repair mode. Dry-run is the product default; `off` restores the
     /// pure-measurement behavior. `on` (rewriting) lands with the next batch.
     pub repair: RepairMode,
+    /// Anthropic-only, opt-in (`--manage-breakpoints`): place
+    /// `cache_control` breakpoints per the incremental-breakpoint guidance.
+    pub manage_breakpoints: bool,
+    /// With `--manage-breakpoints`: re-derive breakpoints even over
+    /// client-placed ones (`--force-breakpoints`).
+    pub force_breakpoints: bool,
 }
 
 /// The proxy's operating configuration (everything the CLI tunes).
@@ -529,6 +551,11 @@ pub struct ServeOptions {
     pub inject_usage: bool,
     /// The repair mode (dry-run is the product default).
     pub repair: RepairMode,
+    /// Anthropic breakpoint management (opt-in; see
+    /// [`crate::breakpoints`]).
+    pub manage_breakpoints: bool,
+    /// Override client-placed breakpoints (requires `manage_breakpoints`).
+    pub force_breakpoints: bool,
 }
 
 /// Run the proxy. Forwards to the upstream, streams the response through
@@ -553,6 +580,8 @@ pub async fn serve<A: Adapter + 'static>(
         upstream_url,
         repair: options.repair,
         inject_usage: options.inject_usage,
+        manage_breakpoints: options.manage_breakpoints,
+        force_breakpoints: options.force_breakpoints,
         // A connect timeout fails fast on an unreachable upstream without
         // capping a legitimate long-lived SSE stream. No total request timeout:
         // streams are open-ended by design.
@@ -752,6 +781,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
         return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
     };
     let model = model_from_doc(&doc);
+    // Counted before any proxy mutation: what the CLIENT carried. Breakpoint
+    // management compares this against what the proxy placed last turn to
+    // tell client-authored hints from its own echoed back.
+    let client_breakpoints = crate::breakpoints::count(&doc);
 
     let mut plan = {
         let mut guard = state.sessions.lock();
@@ -776,9 +809,8 @@ pub async fn handle_chat<A: Adapter + 'static>(
         }
         None => state.repair,
     };
-    let (drift_report, mut rewrite, mut pre_repair_messages) = if effective_mode == RepairMode::Off
-    {
-        (DriftReport::unexamined(RepairMode::Off), None, None)
+    let (drift_report, mut rewrite) = if effective_mode == RepairMode::Off {
+        (DriftReport::unexamined(RepairMode::Off), None)
     } else {
         // Which chain does this request extend? Its own session's, or — when
         // the session forked (truncated or re-based leading history shares
@@ -827,7 +859,6 @@ pub async fn handle_chat<A: Adapter + 'static>(
         }
         let report = repair::report(&classification, effective_mode);
         let mut rewrite = None;
-        let mut pre_repair_messages = None;
         if effective_mode == RepairMode::On {
             if let Some(chain) = chain.as_deref() {
                 if let Some(rw) = repair::apply_canonical(
@@ -847,17 +878,35 @@ pub async fn handle_chat<A: Adapter + 'static>(
                         tokens = rw.canonicalized_tokens,
                         "rewrote drifted history to canonical"
                     );
-                    // What the messages were before the rewrite: if
-                    // re-serialization ever fails below, the ledger must
-                    // still record what actually went on the wire.
-                    pre_repair_messages = doc.get("messages").cloned();
                     doc["messages"] = serde_json::Value::Array(client_values);
                     rewrite = Some(rw);
                 }
             }
         }
-        (report, rewrite, pre_repair_messages)
+        (report, rewrite)
     };
+
+    // Anthropic breakpoint management (opt-in): the last body mutation
+    // before the single serialization. Hints go on the last system block
+    // and the last user/tool-result blocks; the ledger remembers what went
+    // out, so echoed-back placements re-derive instead of reading as
+    // client-managed. Other backends never take this path.
+    let breakpoints =
+        (state.manage_breakpoints && state.adapter.name() == "anthropic").then(|| {
+            let ours_last_turn = state
+                .ledger
+                .lock()
+                .last_turn(plan.session_id, &model)
+                .map_or(0, |t| t.breakpoints);
+            crate::breakpoints::manage(
+                &mut doc,
+                state.force_breakpoints,
+                client_breakpoints,
+                ours_last_turn as usize,
+            )
+        });
+    // A declined pass touched nothing; a managed pass re-serializes.
+    let breakpoints_changed = breakpoints.is_some_and(|m| !m.declined);
 
     // Forward first. The request body is passed through untouched unless
     // usage injection applies; auth and provider-identification headers are
@@ -886,11 +935,12 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Only the OpenAI dialect understands `stream_options`; Anthropic's
     // Messages API would reject it, so never inject there.
     let inject = state.inject_usage && matches!(state.adapter.name(), "openai" | "vllm");
-    // Every mutation applies before one serialization: usage injection and
-    // a repair rewrite each may change the document, and neither pays for
-    // a second pass.
+    // Every mutation applies before one serialization: usage injection, a
+    // repair rewrite, and breakpoint management each may change the
+    // document, and none pays for a second pass.
     let usage_mutated = inject && ensure_usage_requested(&mut doc);
-    let (forwarded, as_sent_messages) = if usage_mutated || rewrite.is_some() {
+    let (forwarded, as_sent_messages) = if usage_mutated || rewrite.is_some() || breakpoints_changed
+    {
         match serde_json::to_vec(&doc) {
             Ok(bytes) => (
                 Bytes::from(bytes),
@@ -900,16 +950,16 @@ pub async fn handle_chat<A: Adapter + 'static>(
             ),
             Err(_) => {
                 // Unreachable with a document parsed from the request, but
-                // degrade honestly: forward the client's bytes untouched and
+                // degrade honestly: forward the client's bytes untouched,
                 // claim no rewrite whose forwarded form could not be
-                // produced. The ledger then records what really went out.
+                // produced, and record the messages that actually went
+                // out — read back from the client's own bytes.
                 rewrite = None;
-                (
-                    body.clone(),
-                    pre_repair_messages
-                        .take()
-                        .unwrap_or_else(|| doc.get("messages").cloned().unwrap_or_default()),
-                )
+                let as_sent = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|d| d.get("messages").cloned())
+                    .unwrap_or_default();
+                (body.clone(), as_sent)
             }
         }
     } else {
@@ -945,6 +995,9 @@ pub async fn handle_chat<A: Adapter + 'static>(
             // before the send failed — exactly as a clean finalize would
             // (it stays excluded from aggregates as Incomplete).
             apply_drift_claim(&mut record, &drift_report, rewrite.as_ref());
+            if let Some(managed) = breakpoints {
+                record.breakpoint_count = Some(managed.total as u64);
+            }
             crate::export::log_finalize(&record);
             state.sessions.lock().append(record);
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response();
@@ -989,6 +1042,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             as_sent_messages,
             drift_report,
             rewrite,
+            breakpoints,
             complete: true,
             done: false,
             metrics,

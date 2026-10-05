@@ -29,6 +29,7 @@ fn record(session_id: u64, turn: u32) -> Record {
         matches_canonical: None,
         drift_kind: None,
         canonicalized_tokens: 0,
+        breakpoint_count: None,
     }
 }
 

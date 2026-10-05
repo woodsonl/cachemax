@@ -4,6 +4,7 @@
 //! path. The binary (`src/main.rs`) is the CLI shell around these modules.
 
 pub mod adapters;
+pub mod breakpoints;
 pub mod dashboard;
 pub mod export;
 pub mod ledger;

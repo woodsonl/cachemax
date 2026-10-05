@@ -170,3 +170,19 @@ header overrides the configured mode for that one request. `on` never
 rewrites what it cannot prove equivalent: changed tool arguments, changed
 system prompts, model switches, and first turns all pass through untouched
 and are flagged instead.
+
+## breakpoints
+
+**Problem:** `--manage-breakpoints` refuses to start, or breakpoints do not
+appear.
+
+**Cause:** the flags only apply to the Anthropic dialect, and forcing
+requires managing.
+
+**Fix:** pass `--backend anthropic` with `--manage-breakpoints`. Breakpoints
+land on the last system block plus the last user/tool-result blocks (at most
+4 per request, the provider limit). A request that already carries
+client-placed breakpoints passes through untouched — add
+`--force-breakpoints` to re-derive over them. Breakpoint placement is a
+cache hint, not content: it never reads as drift and repair never rewrites
+for it.

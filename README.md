@@ -116,7 +116,7 @@ or click **export** on the dashboard to download the same JSONL. It is
 metrics-only — never message content.
 
 ```json
-{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"broke_prefix":false,"cost_usd":0.02,"cost_saved_usd":0.01,"repair_mode":"dry_run","repaired":false,"matches_canonical":false,"drift_kind":"tool_arg_reserialization","canonicalized_tokens":312}
+{"session_id":1,"turn":1,"status":"complete","source":"provider_reported","ttft_ms":120.0,"cached_tokens":1020,"cache_written_tokens":0,"resent_history_tokens":1550,"billed_input_tokens":1750,"broke_prefix":false,"cost_usd":0.02,"cost_saved_usd":0.01,"repair_mode":"dry_run","repaired":false,"matches_canonical":false,"drift_kind":"tool_arg_reserialization","canonicalized_tokens":312,"breakpoint_count":null}
 ```
 
 The last five fields are the drift annotation: `repair_mode` (`off` |
@@ -143,6 +143,8 @@ tokens at risk. Still metrics only: never message content.
 | `--repair <mode>` | `dry-run` (default) \| `on` \| `off`. Rewrite drifted history to the canonical serialization the provider already saw (`on`); every rewrite is logged. Per-request header `x-cachemax-repair: on\|off` overrides. |
 | `--ledger-dir <path>` | Where the local repair ledger lives (default `~/.cache/cachemax/ledger`). |
 | `--no-ledger` | Keep the repair ledger in memory only; write nothing to disk. |
+| `--manage-breakpoints` | Anthropic only: place `cache_control` breakpoints per the incremental-breakpoint guidance (last system block + last user/tool-result blocks, ≤ 4). Requests carrying client-placed breakpoints pass through untouched. |
+| `--force-breakpoints` | With `--manage-breakpoints`: re-derive breakpoints even over client-placed ones. |
 | `--verbose` | Debug logging. Metadata only — never message content. |
 
 ## Security

@@ -301,6 +301,7 @@ mod tests {
             matches_canonical: None,
             drift_kind: None,
             canonicalized_tokens: 0,
+            breakpoint_count: None,
         });
         // Incoming [1,2,9] breaks from session 1 (shared [1,2]); it is the only
         // session sharing a prefix, so it wins.
@@ -400,6 +401,7 @@ mod tests {
             matches_canonical: None,
             drift_kind: None,
             canonicalized_tokens: 0,
+            breakpoint_count: None,
         });
         let _ = store.resolve(&[1, 2, 9]); // break → incomplete marker
         let s = store.session(a.session_id).unwrap();

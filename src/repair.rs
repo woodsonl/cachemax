@@ -7,7 +7,9 @@
 //! string leaves always matter byte-for-byte. Drift that matters is therefore
 //! drift inside strings: a tool-call `arguments` blob re-serialized with
 //! different key order or spacing, text re-wrapped with different whitespace,
-//! content reshaped between string and parts-array form.
+//! content reshaped between string and parts-array form. `cache_control`
+//! hints are the one exception: the provider does not tokenize them as
+//! content, so their presence and placement are ignored on both sides.
 //!
 //! The equivalence ladder, per element pair:
 //! 1. **Exact** — `serde_json::Value` equality (semantic JSON equality:
@@ -389,7 +391,10 @@ fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
 }
 
 /// The element-relation ladder (see module docs). Ordered cheapest-first;
-/// the first equality that holds names the relation.
+/// the first equality that holds names the relation. Cache hints
+/// (`cache_control`) are stripped on both sides first: the provider does
+/// not tokenize them as content, and breakpoint management (the proxy's or
+/// the client's) moves them without changing meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rel {
     Exact,
@@ -398,6 +403,9 @@ enum Rel {
 }
 
 fn relation(a: &Value, b: &Value) -> Rel {
+    let a = strip_cache_control(a);
+    let b = strip_cache_control(b);
+    let (a, b): (&Value, &Value) = (&a, &b);
     if a == b {
         return Rel::Exact;
     }
@@ -411,6 +419,58 @@ fn relation(a: &Value, b: &Value) -> Rel {
         return Rel::Equivalent(DriftKind::RoleContentReshaped);
     }
     Rel::Different
+}
+
+/// A copy of `v` with content-block cache hints removed — an object that
+/// names a `type` and carries an object-valued `cache_control`. Borrowed
+/// when there is nothing to strip, so hint-free requests pay no allocation.
+fn strip_cache_control(v: &Value) -> std::borrow::Cow<'_, Value> {
+    match v {
+        Value::Object(map) => {
+            let mut out: Option<Map<String, Value>> = None;
+            for (k, val) in map {
+                if k == "cache_control" && map.contains_key("type") && val.is_object() {
+                    out.get_or_insert_with(|| map.clone()).remove(k);
+                    continue;
+                }
+                match strip_cache_control(val) {
+                    std::borrow::Cow::Borrowed(b) => {
+                        if let Some(o) = &mut out {
+                            o.insert(k.clone(), b.clone());
+                        }
+                    }
+                    std::borrow::Cow::Owned(s) => {
+                        out.get_or_insert_with(|| map.clone()).insert(k.clone(), s);
+                    }
+                }
+            }
+            match out {
+                Some(o) => std::borrow::Cow::Owned(Value::Object(o)),
+                None => std::borrow::Cow::Borrowed(v),
+            }
+        }
+        Value::Array(items) => {
+            let mut out: Option<Vec<Value>> = None;
+            for (i, item) in items.iter().enumerate() {
+                match strip_cache_control(item) {
+                    std::borrow::Cow::Borrowed(_) => {
+                        if let Some(o) = &mut out {
+                            o.push(item.clone());
+                        }
+                    }
+                    std::borrow::Cow::Owned(s) => {
+                        let o = out.get_or_insert_with(|| items[..i].to_vec());
+                        o.push(s);
+                    }
+                }
+            }
+            match out {
+                Some(o) => std::borrow::Cow::Owned(Value::Array(o)),
+                None => std::borrow::Cow::Borrowed(v),
+            }
+        }
+        _ => std::borrow::Cow::Borrowed(v),
+    }
 }
 
 /// Rewrite every tool-call `arguments` string as its parsed JSON value, so
@@ -1021,5 +1081,63 @@ mod tests {
         let c = classify(&client, &canonical);
         assert_eq!(c.semantic_break, None);
         assert_eq!(c.drift_kind, Some(DriftKind::TextNormalization));
+    }
+
+    #[test]
+    fn cache_control_presence_and_placement_are_not_content() {
+        // Breakpoint hints move as conversations grow (Anthropic's
+        // incremental guidance); the provider does not tokenize them as
+        // content. A hint present on the canonical side and absent (or
+        // moved) on the client's is an exact match — never drift, never
+        // rewritten for, never at risk.
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "world"},
+        ]})];
+        let without = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world"},
+        ]})];
+        let c = classify(&without, &canonical);
+        assert!(c.report_matches, "hint presence alone is not drift");
+        assert_eq!(c.tokens_at_risk, 0);
+
+        let moved = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world", "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let c2 = classify(&moved, &canonical);
+        assert!(c2.report_matches, "hint placement alone is not drift");
+        assert_eq!(c2.drift_kind, None);
+
+        // A string ↔ hinted-parts reshape is still detected as a reshape:
+        // the hint must not block the ladder's sibling-gated rungs (the
+        // three-key part would read as non-flattenable without the strip).
+        let as_string = vec![json!({"role": "user", "content": "hello world"})];
+        let hinted_parts = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hello world", "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let c3 = classify(&hinted_parts, &as_string);
+        assert_eq!(c3.semantic_break, None);
+        assert_eq!(
+            c3.drift_kind,
+            Some(DriftKind::RoleContentReshaped),
+            "the shape difference is still repairable drift"
+        );
+    }
+
+    #[test]
+    fn a_cache_control_key_outside_block_shape_is_payload() {
+        // `cache_control` with a non-object value, or on an object with no
+        // `type` sibling, is user payload: compared exactly like any other
+        // string leaf, never stripped.
+        let canonical = vec![json!({
+            "role": "user", "content": "x", "cache_control": 1,
+        })];
+        let client = vec![json!({
+            "role": "user", "content": "x", "cache_control": 2,
+        })];
+        let c = classify(&client, &canonical);
+        assert_eq!(c.semantic_break, Some(0));
     }
 }
