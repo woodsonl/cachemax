@@ -32,8 +32,12 @@ pub enum SourceLabel {
 ///
 /// `cached_tokens` is the provider- or engine-reported count of prefix tokens
 /// served from cache. `resent_history_tokens` is the binding denominator: the
-/// token count of the re-sent message list (system + all prior user, assistant,
-/// and tool messages), excluding this turn's new content.
+/// token count of the re-sent message list, excluding this turn's new content.
+/// On OpenAI the system prompt is a `role: "system"` message and is counted;
+/// on Anthropic it is a top-level `system` field and is not — the denominator
+/// is dialect-dependent by construction, so a cached system breakpoint on
+/// Anthropic can read above 100%. The floor nets a foreign wrapper, not this;
+/// a client's own system-prompt cache is reported as the provider gave it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// Session this request belongs to.

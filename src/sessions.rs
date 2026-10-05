@@ -22,9 +22,13 @@ pub struct Session {
 }
 
 impl Session {
-    /// The session's cumulative hit rate over complete, non-cold turns.
+    /// The session's cumulative hit rate over complete, non-cold turns, net of
+    /// the endpoint's foreign-prefix floor (`crate::record::router_prefix_floor`)
+    /// so it agrees with the dashboard and never reads above 100% on a routed
+    /// session.
     pub fn cumulative_hit_rate(&self) -> Option<f64> {
-        crate::record::cumulative_hit_rate(&self.records)
+        let floor = crate::record::router_prefix_floor(&self.records);
+        crate::record::cumulative_hit_rate_net(&self.records, floor)
     }
 }
 
