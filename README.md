@@ -168,12 +168,15 @@ never stored, never logged. Metrics live in memory only, and metrics export
 One thing does touch disk: the **repair ledger**. To repair a broken cache
 prefix, cachemax must remember the exact message content it forwarded and
 received, so `serve` persists that record locally under
-`~/.cache/cachemax/ledger/` (one JSONL file per session). It stays on your
-machine, is never included in exports or logs, and is purged with
-`cachemax purge` (or `cachemax purge --ledger-dir <path>` for a non-default
-location) — it deletes only the ledger's own `*.jsonl` files, touches nothing
-else in the directory, and prints what it removed. Run with `--no-ledger` to
-keep the ledger in memory only, so nothing is ever written at all.
+`~/.cache/cachemax/ledger/` (one `<session>.jsonl` file per session). It
+stays on your machine and is never included in exports or logs. `cachemax
+purge` (or `cachemax purge --ledger-dir <path>` for a non-default location)
+deletes every `<session>.jsonl` file directly inside that directory — other
+files, subdirectories, and the directory itself stay; symlinks are never
+followed — and reports what it removed. `purge` ignores `--no-ledger` and
+always targets the on-disk directory: it is how you purge what a previous
+run wrote. Run `serve` with `--no-ledger` to keep the ledger in memory only,
+so nothing is ever written at all.
 
 Binding non-loopback is explicit (`--bind`) and should be done only on a
 trusted host.

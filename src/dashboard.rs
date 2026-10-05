@@ -352,11 +352,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         }),
         provenance: source_tag(source).to_string(),
         write_split,
-        recovered: if recovered_sum > 0 {
-            Some(format!("{} tk", format_tokens(recovered_sum)))
-        } else {
-            None
-        },
+        recovered: (recovered_sum > 0).then(|| format!("{} tk", format_tokens(recovered_sum))),
         transition,
         turns,
         cumulative,
@@ -453,10 +449,11 @@ fn tape_row(r: &Record) -> TapeRow {
         let state = if r.repaired {
             Some(TapeState::Repaired)
         } else if r.matches_canonical == Some(false) {
-            match r.drift_kind {
-                Some(_) => Some(TapeState::Drift),
-                None => Some(TapeState::Unrepairable),
-            }
+            Some(if r.drift_kind.is_some() {
+                TapeState::Drift
+            } else {
+                TapeState::Unrepairable
+            })
         } else {
             None
         };
