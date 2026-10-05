@@ -441,10 +441,9 @@ fn tape_row(r: &Record) -> TapeRow {
         cells.insert(1, TapeState::Miss);
     }
     // The drift annotation leads the tape the same way: `◆` when repair
-    // rewrote the turn (the action, in amber per the C5 amendment), `~`
-    // when drift went out untouched (repairable flavor), `!` when repair
-    // would refuse it. All are glyph-legible without color (DESIGN.md
-    // tape-cell rule).
+    // rewrote the turn (the action, in amber), `~` when drift went out
+    // untouched (repairable flavor), `!` when repair would refuse it. All
+    // are glyph-legible without color (DESIGN.md tape-cell rule).
     if !incomplete && r.repair_mode != crate::repair::RepairMode::Off {
         let state = if r.repaired {
             Some(TapeState::Repaired)

@@ -341,10 +341,10 @@ impl Ledger {
 pub struct SharedLedger(pub Mutex<Ledger>);
 
 /// One replayable request reconstructed from the on-disk ledger: the
-/// canonical chain plus a fresh tail. The replay bench (C6) drives a
+/// canonical chain plus a fresh tail. The replay bench drives a
 /// stub/provider with the drifted and canonical serializations of this
 /// body to measure the repair delta.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct ReplayRequest {
     pub session_id: u64,
     pub turn: u32,

@@ -130,7 +130,7 @@ impl DriftReport {
 }
 
 /// Full classification result. Everything the dry-run report shows, plus the
-/// alignment facts the rewriting path (next batch) will consume.
+/// alignment facts the rewriting path consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub report_matches: bool,
@@ -678,7 +678,7 @@ pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
                                 Err(_) => value,
                             }
                         } else if k == "content" && val.is_string() {
-                            Value::String(collapse_interior_ws(val.as_str().unwrap_or_default()))
+                            collapse_ws(val)
                         } else {
                             value
                         },
@@ -695,51 +695,17 @@ pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
     fn compact(v: &Value) -> Value {
         match v {
             Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let mut out = Map::new();
-                for k in keys {
-                    out.insert(k.clone(), compact(&map[k]));
-                }
-                Value::Object(out)
+                let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+                Value::Object(
+                    sorted
+                        .into_iter()
+                        .map(|(k, val)| (k.clone(), compact(val)))
+                        .collect(),
+                )
             }
             Value::Array(items) => Value::Array(items.iter().map(compact).collect()),
             _ => v.clone(),
         }
-    }
-    // Collapse interior same-line whitespace runs (the inverse of the
-    // classifier's conservative repairable-drift reading).
-    fn collapse_interior_ws(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut pending = String::new();
-        let mut line_started = false;
-        for ch in s.chars() {
-            match ch {
-                ' ' | '\t' | '\r' => {
-                    if line_started {
-                        pending.push(ch);
-                    } else {
-                        out.push(ch);
-                    }
-                }
-                '\n' => {
-                    out.push_str(&pending);
-                    pending.clear();
-                    out.push('\n');
-                    line_started = false;
-                }
-                c => {
-                    if !pending.is_empty() {
-                        out.push(' ');
-                        pending.clear();
-                    }
-                    line_started = true;
-                    out.push(c);
-                }
-            }
-        }
-        out.push_str(&pending);
-        out
     }
 
     let canonical = serde_json::json!({

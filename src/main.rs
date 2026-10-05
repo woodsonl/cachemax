@@ -243,10 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ignores --no-ledger by design: it targets what a previous `serve`
     // (with or without the flag) may have written, on disk.
     if matches!(cli.command, Some(Command::Purge)) {
-        let dir = cli
-            .ledger_dir
-            .clone()
-            .map_or_else(default_ledger_dir, std::path::PathBuf::from);
+        let dir = ledger_dir_of(&cli);
         let report = match purge_ledger(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -262,10 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tokenizer (token columns come from the line's own counts) and must
     // not touch the running proxy.
     if matches!(cli.command, Some(Command::Replay)) {
-        let dir = cli
-            .ledger_dir
-            .clone()
-            .map_or_else(default_ledger_dir, std::path::PathBuf::from);
+        let dir = ledger_dir_of(&cli);
         let requests = cachemax::ledger::Ledger::replay_requests(&dir)
             .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
         if requests.is_empty() {
@@ -466,14 +460,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The ledger directory the command targets: `--ledger-dir` or the
+/// default. Shared by `serve`, `purge`, and `replay` so all three agree
+/// on the location.
+fn ledger_dir_of(cli: &Cli) -> std::path::PathBuf {
+    cli.ledger_dir
+        .clone()
+        .map_or_else(default_ledger_dir, std::path::PathBuf::from)
+}
+
 /// Build the canonical ledger from `--ledger-dir` / `--no-ledger`. Default:
 /// persisted under the user's cache directory, so the canonical chain
 /// survives a proxy restart. `--no-ledger` keeps it in memory only.
 fn build_ledger(cli: &Cli) -> Result<Arc<SharedLedger>, Box<dyn std::error::Error>> {
-    let dir = match &cli.ledger_dir {
-        Some(p) => std::path::PathBuf::from(p),
-        None => default_ledger_dir(),
-    };
+    let dir = ledger_dir_of(cli);
     let ledger = if cli.no_ledger {
         SharedLedger::new()
     } else {
