@@ -36,8 +36,8 @@ use std::sync::Mutex;
 
 /// Cap on distinct sessions held in memory. The in-memory ledger keeps one
 /// turn (the latest, per model) per session, so the bound is on *sessions*,
-/// not turns. Oldest-created sessions are evicted first; a single-user proxy
-/// interleaves at most a handful of live conversations.
+/// not turns. When a capped reload must evict, eviction follows the
+/// directory's file-name order.
 const SESSIONS_CAP: usize = 64;
 
 /// Cap on a retained non-streaming response body. A whole-JSON response is
@@ -122,8 +122,8 @@ impl Ledger {
     /// A ledger persisted as JSONL under `dir`, reloading what is already
     /// there. Torn trailing lines (a crash mid-append) are skipped, not
     /// fatal: a lost line loses one turn of audit, never correctness.
-    /// Files are read in `<session>.jsonl` naming order so reload is
-    /// deterministic (eviction picks the oldest, consistently).
+    /// Files are read in file-name order, so a capped reload's eviction
+    /// is deterministic for a given directory listing.
     pub fn on_disk(dir: PathBuf) -> std::io::Result<Self> {
         let mut ledger = Self {
             sessions: HashMap::new(),
@@ -277,29 +277,38 @@ impl Ledger {
     /// A/B driver builds both variants from these: the drifted form (what
     /// a re-serializing client sends) and the canonical form (what repair
     /// would forward).
+    ///
+    /// Untrusted disk: a chain whose stored messages are not an array is
+    /// skipped, never emitted — a pair must be a real request the provider
+    /// could have cached.
     pub fn replay_requests(dir: &std::path::Path) -> std::io::Result<Vec<ReplayRequest>> {
         let ledger = Ledger::on_disk(dir.to_path_buf())?;
         let mut out: Vec<ReplayRequest> = ledger
             .sessions
             .iter()
             .flat_map(|(session_id, per_model)| {
-                per_model.iter().map(move |(model, turn)| ReplayRequest {
-                    session_id: *session_id,
-                    turn: turn.turn,
-                    model: model.clone(),
-                    messages: {
-                        let mut chain = turn.request_messages.clone();
-                        if let Some(arr) = chain.as_array_mut() {
-                            arr.push(serde_json::json!(
-                                {"role": "user", "content": "Continue."}
-                            ));
-                        }
-                        chain
-                    },
+                per_model.iter().filter_map(move |(model, turn)| {
+                    // A chain only extends a request that is a message
+                    // array; anything else on disk is not a chain.
+                    turn.request_messages.as_array()?;
+                    let mut chain = turn.request_messages.clone();
+                    if let Some(arr) = chain.as_array_mut() {
+                        arr.push(serde_json::json!(
+                            {"role": "user", "content": "Continue."}
+                        ));
+                    }
+                    Some(ReplayRequest {
+                        session_id: *session_id,
+                        turn: turn.turn,
+                        model: model.clone(),
+                        messages: chain,
+                    })
                 })
             })
             .collect();
-        out.sort_by_key(|r| (r.session_id, r.turn));
+        // A total order: two models can share a session+turn, and the
+        // output must be identical across runs.
+        out.sort_by_key(|r| (r.session_id, r.turn, r.model.clone()));
         Ok(out)
     }
 

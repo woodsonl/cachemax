@@ -655,6 +655,12 @@ fn tokens_of(tokenizer: &Tokenizer, elements: &[Value]) -> u64 {
 /// runs — so both bodies are semantically identical and differ only in
 /// the bytes a provider's cache keys on. That delta is what the A/B
 /// measurement prices.
+///
+/// The drift is gated exactly where the classifier's tolerance is gated:
+/// only tool-call `arguments` strings with a sibling `name`, and only
+/// `content` strings on messages with a `role`. An ungated transformation
+/// would produce a pair the classifier itself reads as semantically
+/// different — a fabricated measurement.
 pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
     fn drift_value(v: &Value) -> Value {
         match v {
@@ -664,7 +670,7 @@ pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
                     let value = drift_value(val);
                     out.insert(
                         k.clone(),
-                        if k == "arguments" && val.is_string() {
+                        if k == "arguments" && val.is_string() && map.contains_key("name") {
                             match serde_json::from_str::<Value>(val.as_str().unwrap_or_default()) {
                                 // Re-serialized by a different serializer:
                                 // keys sorted, spacing compacted — the
@@ -677,7 +683,7 @@ pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
                                 }
                                 Err(_) => value,
                             }
-                        } else if k == "content" && val.is_string() {
+                        } else if k == "content" && val.is_string() && map.contains_key("role") {
                             collapse_ws(val)
                         } else {
                             value

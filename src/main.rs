@@ -257,9 +257,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Replay reads the ledger directory directly: it has no use for a
     // tokenizer (token columns come from the line's own counts) and must
-    // not touch the running proxy.
+    // not touch the running proxy — or create the directory by running.
     if matches!(cli.command, Some(Command::Replay)) {
         let dir = ledger_dir_of(&cli);
+        if !dir.is_dir() {
+            return Err(Fault::ledger_unavailable(
+                &dir.display().to_string(),
+                "the directory does not exist".to_string(),
+            )
+            .into());
+        }
         let requests = cachemax::ledger::Ledger::replay_requests(&dir)
             .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
         if requests.is_empty() {
@@ -271,11 +278,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        use std::io::Write;
         for request in &requests {
             let line = cachemax::repair::replay_pair(request);
-            serde_json::to_writer(&mut out, &line)?;
-            use std::io::Write;
-            out.write_all(b"\n")?;
+            // A closed pipe (`| head`) is a normal end for a stdout
+            // stream, not an error to report. serde_json wraps io errors
+            // — check the cause chain, not the top-level kind.
+            let io_kind =
+                |e: &serde_json::Error| e.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe);
+            if let Err(e) = serde_json::to_writer(&mut out, &line) {
+                if io_kind(&e) {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+            if let Err(e) = out.write_all(b"\n") {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
         }
         return Ok(());
     }

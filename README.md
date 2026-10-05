@@ -143,10 +143,11 @@ The A/B that produced the numbers above is reproducible on your own traffic:
 1. Run `cachemax serve` with `--repair dry-run` (the default) in front of
    your provider for a while — the ledger records the canonical chains.
 2. Run `cachemax replay` (add `--ledger-dir <path>` for a non-default
-   location). For every recorded chain it prints one JSONL line holding the
+   location; ignores `--no-ledger` — it reads the recorded directory).
+   For every recorded chain it prints one JSONL line holding the
    same request twice: `a_drifted`, re-serialized the way agent frameworks
    do (tool-argument keys reordered, interior whitespace collapsed), and
-   `b_canonical`, the exact bytes the provider already cached.
+   `b_canonical`, the exact content the provider already cached.
 3. Drive your endpoint with both bodies — `a_drifted` is the cache-miss
    baseline, `b_canonical` is what repair forwards — and compare the
    provider's `cached_tokens` per variant. The dashboard's *recovered by

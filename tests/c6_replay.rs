@@ -175,4 +175,58 @@ async fn replay_pair_is_semantically_identical_and_byte_different() {
     );
 }
 
-// debug helper (temp)
+#[tokio::test]
+async fn on_disk_replay_skips_untrustworthy_chains_and_sorts_deterministically() {
+    // The command reads a directory, not memory: exercise the real
+    // pipeline. Disk is untrusted — a chain whose stored messages are
+    // not an array must be skipped, never emitted as a pair — and the
+    // output must be in a total order (session, turn, model).
+    let dir = std::env::temp_dir().join(format!("cachemax-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let canonical_element = serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{"id": "call_1", "type": "function",
+            "function": {"name": "get_weather",
+                "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"}}],
+    });
+    let lines = [
+        // session 1, turn 5, two models — a tie the order must break.
+        // (LedgerLine flattens CanonicalTurn: turn fields sit at the top.)
+        serde_json::json!({"session_id": 1, "turn": 5, "model": "gpt-4o",
+            "request_messages": [{"role": "user", "content": "q"}],
+            "response_messages": [], "prefix_hashes": [], "breakpoints": 0}),
+        serde_json::json!({"session_id": 1, "turn": 5, "model": "claude",
+            "request_messages": [{"role": "user", "content": "q"}],
+            "response_messages": [], "prefix_hashes": [], "breakpoints": 0}),
+        // session 2: corrupt (non-array) messages — skipped.
+        serde_json::json!({"session_id": 2, "turn": 1, "model": "gpt-4o",
+            "request_messages": "torn into a string",
+            "response_messages": [], "prefix_hashes": [], "breakpoints": 0}),
+        // session 3: a real chain.
+        serde_json::json!({"session_id": 3, "turn": 1, "model": "gpt-4o",
+            "request_messages": [{"role": "user", "content": "w"}],
+            "response_messages": [canonical_element], "prefix_hashes": [], "breakpoints": 0}),
+    ];
+    let mut body = String::new();
+    for l in &lines {
+        body.push_str(&l.to_string());
+        body.push('\n');
+    }
+    std::fs::write(dir.join("7.jsonl"), &body).unwrap();
+
+    let requests = cachemax::ledger::Ledger::replay_requests(&dir).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude", "gpt-4o", "gpt-4o"],
+        "tie broken by model; the corrupt chain is skipped"
+    );
+    // The fresh tail landed on the array chains only.
+    assert_eq!(requests[0].messages.as_array().unwrap().len(), 2);
+    assert_eq!(requests[2].messages.as_array().unwrap().len(), 2);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
