@@ -6,6 +6,7 @@
 pub mod adapters;
 pub mod dashboard;
 pub mod export;
+pub mod ledger;
 pub mod proxy;
 pub mod rates;
 pub mod record;

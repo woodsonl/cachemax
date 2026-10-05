@@ -66,6 +66,7 @@ fn observed_figure_survives_into_the_record() {
         turn: 1,
         resent_history_tokens: 2000,
         broke_prefix: false,
+        prefix_hashes: Vec::new(),
     };
     let body =
         br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;

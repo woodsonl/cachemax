@@ -7,8 +7,10 @@ use cachemax::adapters::{
     anthropic::AnthropicAdapter, llamacpp::LlamaCppAdapter, mlxlm::MlxLmAdapter,
     openai::OpenAiAdapter, vllm::VllmAdapter,
 };
+use cachemax::ledger::SharedLedger;
 use cachemax::{export, proxy, rates::Rates, tokenize::Tokenizer};
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 /// Default loopback address the proxy binds.
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
@@ -95,6 +97,14 @@ impl Fault {
             docs: "address-unavailable",
         }
     }
+    fn ledger_unavailable(path: &str, cause: String) -> Self {
+        Fault {
+            problem: "ledger directory unusable",
+            cause: format!("{path}: {cause}"),
+            fix: "pass a writable --ledger-dir, or --no-ledger to keep the ledger in memory only",
+            docs: "ledger",
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -136,6 +146,17 @@ struct Cli {
     /// chunk (and thus cache figures); disable only for strict pass-through.
     #[arg(long, global = true)]
     no_inject_usage: bool,
+
+    /// Directory for the repair ledger (default: ~/.cache/cachemax/ledger).
+    /// The ledger stores the exact message content the proxy forwards and
+    /// receives — locally only, never exported — so repair can extend the
+    /// provider-seen prefix. Delete the directory to purge it.
+    #[arg(long, global = true)]
+    ledger_dir: Option<String>,
+
+    /// Keep the repair ledger in memory only; nothing is written to disk.
+    #[arg(long, global = true)]
+    no_ledger: bool,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +194,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rates = load_rates(cli.rates.as_deref())?;
     let tokenizer = Tokenizer::resolve(&cli.tokenizer)
         .map_err(|e| Fault::tokenizer_unavailable(&cli.tokenizer, e))?;
+    // Built before the command is taken out of `cli` (a partial move).
+    let ledger = build_ledger(&cli)?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
@@ -184,6 +207,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &cli.backend,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 &cli.bind,
                 !cli.no_inject_usage,
@@ -222,6 +246,36 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Build the canonical ledger from `--ledger-dir` / `--no-ledger`. Default:
+/// persisted under the user's cache directory, so the canonical chain
+/// survives a proxy restart. `--no-ledger` keeps it in memory only.
+fn build_ledger(cli: &Cli) -> Result<Arc<SharedLedger>, Box<dyn std::error::Error>> {
+    let dir = match &cli.ledger_dir {
+        Some(p) => std::path::PathBuf::from(p),
+        None => default_ledger_dir(),
+    };
+    let ledger = if cli.no_ledger {
+        SharedLedger::new()
+    } else {
+        SharedLedger::on_disk(dir.clone())
+            .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?
+    };
+    Ok(Arc::new(ledger))
+}
+
+/// The default ledger directory: `~/.cache/cachemax/ledger` (honoring
+/// `XDG_CACHE_HOME` when set). Written without a platform crate: two env
+/// vars cover the supported platforms.
+fn default_ledger_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let cache = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"));
+    std::path::PathBuf::from(cache)
+        .join("cachemax")
+        .join("ledger")
+}
+
 /// Build the adapter for `--backend` and run the proxy with it. The listener is
 /// bound here so a bad/unavailable address surfaces as the D3 error contract
 /// rather than a raw OS error.
@@ -229,6 +283,7 @@ async fn dispatch_serve(
     backend: &str,
     tokenizer: Tokenizer,
     rates: Rates,
+    ledger: Arc<SharedLedger>,
     upstream: String,
     bind: &str,
     inject_usage: bool,
@@ -242,6 +297,7 @@ async fn dispatch_serve(
                 OpenAiAdapter,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 listener,
                 inject_usage,
@@ -253,6 +309,7 @@ async fn dispatch_serve(
                 AnthropicAdapter,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 listener,
                 inject_usage,
@@ -264,6 +321,7 @@ async fn dispatch_serve(
                 LlamaCppAdapter,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 listener,
                 inject_usage,
@@ -275,6 +333,7 @@ async fn dispatch_serve(
                 VllmAdapter,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 listener,
                 inject_usage,
@@ -286,6 +345,7 @@ async fn dispatch_serve(
                 MlxLmAdapter,
                 tokenizer,
                 rates,
+                ledger,
                 upstream,
                 listener,
                 inject_usage,

@@ -62,6 +62,7 @@ fn micro_profile_hot_path_stages() {
         turn: 1,
         resent_history_tokens: 2000,
         broke_prefix: false,
+        prefix_hashes: Vec::new(),
     };
     let t = Instant::now();
     for _ in 0..N {

@@ -134,14 +134,27 @@ metrics-only — never message content.
 | `--bind <addr>` | Loopback address (default `127.0.0.1:8787`). |
 | `--tokenizer <name>` | Prefix-hash tokenizer (default `cl100k_base`). |
 | `--rates <file>` | Override the built-in rate table. |
+| `--ledger-dir <path>` | Where the local repair ledger lives (default `~/.cache/cachemax/ledger`). |
+| `--no-ledger` | Keep the repair ledger in memory only; write nothing to disk. |
 | `--verbose` | Debug logging. Metadata only — never message content. |
 
 ## Security
 
 Loopback-only by default, no auth (single user). Cloud keys are pass-through:
-never stored, never logged. Metrics live in memory only and nothing is written
-to disk unless you run `export`. Binding non-loopback is explicit (`--bind`) and
-should be done only on a trusted host.
+never stored, never logged. Metrics live in memory only, and metrics export
+(`cachemax export`) writes nothing but per-turn counts — never message content.
+
+One thing does touch disk: the **repair ledger**. To repair a broken cache
+prefix, cachemax must remember the exact message content it forwarded and
+received, so `serve` persists that record locally under
+`~/.cache/cachemax/ledger/` (one JSONL file per session). It stays on your
+machine, is never included in exports or logs, and you can delete the directory
+at any time, or run with `--no-ledger` to keep it in memory only. A purge
+command ships with the repair release; until then, deleting the directory is
+the purge.
+
+Binding non-loopback is explicit (`--bind`) and should be done only on a
+trusted host.
 
 ## Docs
 

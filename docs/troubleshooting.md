@@ -142,3 +142,16 @@ cachemax export --out ./session.jsonl
 
 `cached_input_mult` and `cache_write_mult` are fractions of the full input rate
 and default to `0.5` and `0.0` when omitted.
+
+## ledger
+
+**Problem:** `serve` reports the ledger directory unusable.
+
+**Cause:** the `--ledger-dir` path (default `~/.cache/cachemax/ledger`) cannot
+be created or written — permissions, a read-only volume, or the path is a file.
+
+**Fix:** pass a writable `--ledger-dir`, or `--no-ledger` to keep the ledger in
+memory only (repair then works within a single run and forgets the chain on
+restart). The ledger stores the message content cachemax forwards and receives,
+locally, so repair can extend the provider-seen prefix; it is never exported or
+logged. Delete the directory to purge it.
