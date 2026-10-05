@@ -12,5 +12,6 @@ pub mod proxy;
 pub mod rates;
 pub mod record;
 pub mod repair;
+pub mod replay;
 pub mod sessions;
 pub mod tokenize;

@@ -18,8 +18,8 @@ fn main() {
     ];
     // Two "concurrent" plans for the same session before either appends.
     let mut g = store.0.lock().unwrap();
-    let p1 = plan_request(&mut g, &t, &conv);
-    let p2 = plan_request(&mut g, &t, &conv);
+    let p1 = plan_request(&mut g, &t, &conv, None);
+    let p2 = plan_request(&mut g, &t, &conv, None);
     println!("p1 turn={} session={}", p1.turn, p1.session_id);
     println!("p2 turn={} session={}", p2.turn, p2.session_id);
 }
