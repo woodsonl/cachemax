@@ -984,3 +984,32 @@ async fn two_declared_keys_never_cross_even_with_identical_bytes() {
         );
     }
 }
+
+#[tokio::test]
+async fn un_keyed_traffic_does_not_merge_into_a_keyed_session() {
+    // A keyed conversation is isolated from prefix inference: an un-keyed
+    // request whose history extends the keyed session's prefix must start its
+    // own session, not be measured in the named one.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send_affinity(&rig, &weather_turn0(), "conv-weather").await;
+    last_record(&rig, 1).await;
+    // The same first turn, but un-keyed: a separate conversation.
+    send(&rig, &weather_turn0()).await;
+    last_record(&rig, 2).await;
+
+    let guard = rig.sessions.lock();
+    assert_eq!(
+        guard.len(),
+        2,
+        "the un-keyed request did not join the keyed session"
+    );
+    let keyed = guard.session(1).unwrap();
+    assert_eq!(
+        keyed.records.len(),
+        1,
+        "the keyed session holds only its own turn"
+    );
+}

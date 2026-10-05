@@ -166,10 +166,14 @@ proxy, so the number is the provider's own cache, not ours) and prints a
 table of cached tokens — median and max — per form, plus how many distinct
 upstream instances answered. Auth is read from an environment variable
 (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `--api-key-env <VAR>`); the key
-is never printed or written. A single send is not a measurement on a routed
-endpoint — different instances have different cache namespaces — so read
-`--n`'s max, not one line; the table says so when more than one instance
-answered.
+is never printed or written. `--upstream-url` follows the same convention as
+`serve` (a `/v1` suffix is not doubled); `--backend anthropic` posts to
+`/v1/messages`, `openai` to `/v1/chat/completions`. A single send is not a
+measurement on a routed endpoint — different instances have different cache
+namespaces — so read `--n`'s max, not one line; the table says so when more
+than one instance answered. A form with no readable reading shows `—` (the
+reason goes to stderr) and drives no recovery figure; if nothing was
+measurable at all, the command faults rather than printing a table of zeros.
 
 ### Declaring conversation affinity
 
@@ -185,7 +189,9 @@ x-cachemax-session: my-agent-run-42
 
 Every request under the same key is one session, whatever the bytes — the
 client's word is the authority, no prefix-fork inference. Distinct keys
-never cross, even with identical history. Omit the header for the default
+never cross, even with identical history, and a keyed conversation is
+isolated from un-keyed traffic: an unrelated request that happens to share
+a prefix is never merged into it. Omit the header for the default
 prefix-based behavior.
 
 ## Commands

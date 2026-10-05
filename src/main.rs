@@ -123,6 +123,15 @@ impl Fault {
         }
     }
 
+    fn replay_execute_no_measurement(endpoint: String) -> Self {
+        Fault {
+            problem: "replay --execute measured nothing",
+            cause: format!("no send to {endpoint} returned a readable cache reading"),
+            fix: "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages); a streaming-only endpoint answers with a body this command cannot read",
+            docs: "replay-execute",
+        }
+    }
+
     fn breakpoints_require_anthropic() -> Self {
         Fault {
             problem: "breakpoint management is anthropic-only",
@@ -562,31 +571,35 @@ async fn run_replay_execute(
         backend,
         api_key,
         samples,
-        timeout: std::time::Duration::from_secs(120),
     };
-    let client = reqwest::Client::builder().timeout(cfg.timeout).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
 
     let mut out = std::io::stdout().lock();
     use std::io::Write;
+    let mut any_measured = false;
     for request in requests {
         let pair = cachemax::repair::replay_pair(request);
-        let report = cachemax::replay::ChainReport {
-            session_id: request.session_id,
-            turn: request.turn,
-            model: request.model.clone(),
-            a_drifted: cachemax::replay::FormSample::empty("a_drifted"),
-            b_canonical: cachemax::replay::FormSample::empty("b_canonical"),
-        };
         let report = cachemax::replay::execute_pair(
             &client,
             &cfg,
-            &report,
+            request.session_id,
+            request.turn,
+            &request.model,
             &pair["a_drifted"],
             &pair["b_canonical"],
         )
         .await;
+        any_measured |= report.a_drifted.measured() || report.b_canonical.measured();
         write!(out, "{}", cachemax::replay::render_report(&report))?;
         out.flush().ok();
+    }
+    if !any_measured {
+        // Every send failed or was unreadable. Rendering a table of `—` and
+        // exiting 0 would look like a valid null measurement; the CLI's own
+        // contract is to fault loudly instead.
+        return Err(Fault::replay_execute_no_measurement(cfg.endpoint.clone()).into());
     }
     Ok(())
 }

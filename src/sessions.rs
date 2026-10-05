@@ -56,6 +56,12 @@ pub struct Collision {
 /// client that diverges every turn would otherwise grow it without bound.
 const COLLISION_LOG_CAP: usize = 256;
 
+/// Cap on declared-key bindings (`x-cachemax-session`). The map is keyed by a
+/// client-controlled header value, so it is bounded like the collision log: a
+/// client sending a fresh key per request evicts the least-recently-active
+/// binding rather than growing memory without bound.
+const KEY_BINDING_CAP: usize = 1024;
+
 /// Append to `log`, keeping only the most recent [`COLLISION_LOG_CAP`] entries.
 fn push_bounded(log: &mut Vec<Collision>, c: Collision) {
     if log.len() == COLLISION_LOG_CAP {
@@ -99,10 +105,14 @@ impl SessionStore {
         self.tick += 1;
         let tick = self.tick;
 
-        // 1. Extension: session is a prefix of the request.
+        // 1. Extension: session is a prefix of the request. Keyed sessions are
+        // excluded: a client that named its conversation must not have an
+        // unrelated un-keyed request silently merged into it.
+        let keyed: std::collections::HashSet<u64> = self.keys.values().copied().collect();
         let extending = self
             .sessions
             .values()
+            .filter(|s| !keyed.contains(&s.id))
             .filter(|s| !s.prefix_hashes.is_empty() && is_prefix(&s.prefix_hashes, prefix_hashes))
             .max_by(|a, b| {
                 a.prefix_hashes
@@ -129,10 +139,13 @@ impl SessionStore {
             };
         }
 
-        // 2. Break: shares a non-empty prefix but diverges.
+        // 2. Break: shares a non-empty prefix but diverges. Keyed sessions are
+        // excluded here too — an un-keyed request must never re-base a named
+        // conversation's prefix.
         let breaking = self
             .sessions
             .values()
+            .filter(|s| !keyed.contains(&s.id))
             .filter(|s| !s.prefix_hashes.is_empty())
             .filter(|s| shared_prefix_len(&s.prefix_hashes, prefix_hashes) > 0)
             .max_by(|a, b| {
@@ -203,7 +216,11 @@ impl SessionStore {
         if let Some(&id) = self.keys.get(key) {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.last_active = tick;
-                if prefix_hashes.len() > s.prefix_hashes.len() {
+                // The client's word is the authority: whatever prefix it
+                // re-sends *is* the conversation's prefix. Re-base on any
+                // correction (a truncation re-bases down), so the session's
+                // recorded chain matches what the keyed client actually sent.
+                if s.prefix_hashes != prefix_hashes {
                     s.prefix_hashes = prefix_hashes.to_vec();
                 }
             }
@@ -224,12 +241,30 @@ impl SessionStore {
                 last_active: tick,
             },
         );
-        self.keys.insert(key.to_string(), id);
+        self.bind_key(key, id);
         Resolution {
             session_id: id,
             continued: false,
             broke_prefix: false,
         }
+    }
+
+    /// Bind a key to a session, evicting the least-recently-active binding
+    /// when the map is full. The map is client-controlled (a header value), so
+    /// it is bounded the way the collision log is — a client sending a fresh
+    /// key per request must not grow it without bound.
+    fn bind_key(&mut self, key: &str, id: u64) {
+        if self.keys.len() >= KEY_BINDING_CAP && !self.keys.contains_key(key) {
+            if let Some(oldest) = self
+                .keys
+                .iter()
+                .min_by_key(|(_, sid)| self.sessions.get(*sid).map_or(u64::MAX, |s| s.last_active))
+                .map(|(k, _)| k.clone())
+            {
+                self.keys.remove(&oldest);
+            }
+        }
+        self.keys.insert(key.to_string(), id);
     }
 
     /// Append a finalized record. The lock guard is released before returning.
@@ -488,15 +523,54 @@ mod tests {
 
     #[test]
     fn a_keyed_session_absorbs_the_longest_prefix() {
-        // The keyed path still grows the recorded prefix, so a later
-        // un-keyed request can match this session by prefix continuity.
+        // Within the keyed path, the recorded prefix tracks whatever the
+        // client re-sends — grow on extension, re-base on correction — so the
+        // session's chain matches the conversation the key actually names.
         let mut store = SessionStore::new();
         let a = store.resolve_keyed("conv-7", &[1, 2]);
         assert_eq!(a.session_id, 1);
         let b = store.resolve_keyed("conv-7", &[1, 2, 3, 4]);
         assert_eq!(b.session_id, 1);
-        let c = store.resolve(&[1, 2, 3, 4, 5]);
-        assert_eq!(c.session_id, 1, "un-keyed continuity still finds it");
-        assert!(c.continued);
+        let c = store.resolve_keyed("conv-7", &[9, 9]);
+        assert_eq!(c.session_id, 1, "the key still names one session");
+    }
+
+    #[test]
+    fn an_un_keyed_request_never_merges_into_a_keyed_session() {
+        // A keyed session must be isolated from prefix inference: an unrelated
+        // un-keyed request that happens to share a prefix must not be measured
+        // in the named conversation, nor re-base its chain.
+        let mut store = SessionStore::new();
+        let keyed = store.resolve_keyed("conv-7", &[1, 2, 3, 4]);
+        let other = store.resolve(&[1, 2, 3, 4, 5]);
+        assert_ne!(
+            other.session_id, keyed.session_id,
+            "un-keyed traffic does not join a named conversation"
+        );
+        // Even a prefix *break* against the keyed prefix must not land in it.
+        let breaker = store.resolve(&[1, 2, 9]);
+        assert_ne!(breaker.session_id, keyed.session_id);
+        // And the keyed session's prefix is untouched by that traffic.
+        let again = store.resolve_keyed("conv-7", &[1, 2, 3, 4]);
+        assert_eq!(again.session_id, keyed.session_id);
+    }
+
+    #[test]
+    fn key_bindings_are_bounded() {
+        // A client sending a fresh key per request must not grow memory
+        // without bound: the map evicts the least-recently-active binding.
+        let mut store = SessionStore::new();
+        for i in 0..(KEY_BINDING_CAP + 100) {
+            store.resolve_keyed(&format!("key-{i}"), &[i as u64]);
+        }
+        assert!(
+            store.keys.len() <= KEY_BINDING_CAP,
+            "bindings stayed bounded: {}",
+            store.keys.len()
+        );
+        // The most recent binding survives.
+        let last = format!("key-{}", KEY_BINDING_CAP + 99);
+        let r = store.resolve_keyed(&last, &[1]);
+        assert!(r.continued, "the newest key is still bound");
     }
 }
