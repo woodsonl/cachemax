@@ -19,6 +19,14 @@ pub struct Session {
     pub records: Vec<Record>,
     /// Monotonic tick of the last append or resolve, for fork tie-breaks.
     pub last_active: u64,
+    /// Created through a declared affinity key (`x-cachemax-session`). Such a
+    /// session is permanently outside prefix inference — `resolve` never
+    /// extends, breaks, or re-bases it — because a client that named its
+    /// conversation must not have unrelated traffic merged into it, ever.
+    /// The flag (not the live binding) carries the exclusion, so a binding
+    /// evicted at the cap cannot leak the conversation back into un-keyed
+    /// matching.
+    pub keyed: bool,
 }
 
 impl Session {
@@ -59,7 +67,10 @@ const COLLISION_LOG_CAP: usize = 256;
 /// Cap on declared-key bindings (`x-cachemax-session`). The map is keyed by a
 /// client-controlled header value, so it is bounded like the collision log: a
 /// client sending a fresh key per request evicts the least-recently-active
-/// binding rather than growing memory without bound.
+/// binding — together with the session it names — rather than growing memory
+/// without bound. Eviction is a real expiry: the named conversation's next
+/// request starts a fresh session, because the alternative (keeping every
+/// binding) is unbounded memory on a client-controlled value.
 const KEY_BINDING_CAP: usize = 1024;
 
 /// Append to `log`, keeping only the most recent [`COLLISION_LOG_CAP`] entries.
@@ -106,13 +117,12 @@ impl SessionStore {
         let tick = self.tick;
 
         // 1. Extension: session is a prefix of the request. Keyed sessions are
-        // excluded: a client that named its conversation must not have an
-        // unrelated un-keyed request silently merged into it.
-        let keyed: std::collections::HashSet<u64> = self.keys.values().copied().collect();
+        // excluded permanently (by flag): a client that named its conversation
+        // must not have an unrelated un-keyed request silently merged into it.
         let extending = self
             .sessions
             .values()
-            .filter(|s| !keyed.contains(&s.id))
+            .filter(|s| !s.keyed)
             .filter(|s| !s.prefix_hashes.is_empty() && is_prefix(&s.prefix_hashes, prefix_hashes))
             .max_by(|a, b| {
                 a.prefix_hashes
@@ -145,7 +155,7 @@ impl SessionStore {
         let breaking = self
             .sessions
             .values()
-            .filter(|s| !keyed.contains(&s.id))
+            .filter(|s| !s.keyed)
             .filter(|s| !s.prefix_hashes.is_empty())
             .filter(|s| shared_prefix_len(&s.prefix_hashes, prefix_hashes) > 0)
             .max_by(|a, b| {
@@ -183,6 +193,17 @@ impl SessionStore {
         }
 
         // 3. New session.
+        let id = self.open_session(prefix_hashes, false);
+        Resolution {
+            session_id: id,
+            continued: false,
+            broke_prefix: false,
+        }
+    }
+
+    /// Allocate a fresh session for this prefix; `keyed` marks it permanently
+    /// outside prefix inference (see [`Session::keyed`]).
+    fn open_session(&mut self, prefix_hashes: &[u64], keyed: bool) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.sessions.insert(
@@ -191,14 +212,11 @@ impl SessionStore {
                 id,
                 prefix_hashes: prefix_hashes.to_vec(),
                 records: Vec::new(),
-                last_active: tick,
+                last_active: self.tick,
+                keyed,
             },
         );
-        Resolution {
-            session_id: id,
-            continued: false,
-            broke_prefix: false,
-        }
+        id
     }
 
     /// Resolve by an explicit client-declared affinity key
@@ -208,8 +226,10 @@ impl SessionStore {
     /// name." A known key returns its session (a continuation, even when the
     /// bytes re-sent are a truncated or re-based history — the client's word
     /// is the authority); a new key allocates a session and binds it. The
-    /// prefix hashes are still recorded/absorbed so a later un-keyed request
-    /// can still match this session by prefix.
+    /// session's recorded prefix tracks what the keyed client actually sends
+    /// (grow on extension, re-base on correction) so its chain matches the
+    /// named conversation. Un-keyed requests never match a keyed session:
+    /// [`Self::resolve`] excludes them by flag, permanently.
     pub fn resolve_keyed(&mut self, key: &str, prefix_hashes: &[u64]) -> Resolution {
         self.tick += 1;
         let tick = self.tick;
@@ -223,24 +243,20 @@ impl SessionStore {
                 if s.prefix_hashes != prefix_hashes {
                     s.prefix_hashes = prefix_hashes.to_vec();
                 }
+                return Resolution {
+                    session_id: id,
+                    continued: true,
+                    broke_prefix: false,
+                };
             }
-            return Resolution {
-                session_id: id,
-                continued: true,
-                broke_prefix: false,
-            };
+            // The binding names a session that no longer exists (only
+            // eviction removes sessions, and it removes the binding too —
+            // this is defense against future paths, not dead code). Treat
+            // the key as unknown rather than returning a session id with no
+            // session behind it.
+            self.keys.remove(key);
         }
-        self.next_id += 1;
-        let id = self.next_id;
-        self.sessions.insert(
-            id,
-            Session {
-                id,
-                prefix_hashes: prefix_hashes.to_vec(),
-                records: Vec::new(),
-                last_active: tick,
-            },
-        );
+        let id = self.open_session(prefix_hashes, true);
         self.bind_key(key, id);
         Resolution {
             session_id: id,
@@ -249,10 +265,13 @@ impl SessionStore {
         }
     }
 
-    /// Bind a key to a session, evicting the least-recently-active binding
-    /// when the map is full. The map is client-controlled (a header value), so
-    /// it is bounded the way the collision log is — a client sending a fresh
-    /// key per request must not grow it without bound.
+    /// Bind a key to a session, evicting the least-recently-active binding —
+    /// and the session it names — when the map is full. The map is keyed by a
+    /// client-controlled header value, so it is bounded like the collision
+    /// log. Eviction is a real expiry, and it is total: leaving the session
+    /// behind would (a) grow memory without bound and (b) drop a formerly
+    /// named conversation back into un-keyed prefix matching, where unrelated
+    /// traffic could silently merge into it.
     fn bind_key(&mut self, key: &str, id: u64) {
         if self.keys.len() >= KEY_BINDING_CAP && !self.keys.contains_key(key) {
             if let Some(oldest) = self
@@ -261,7 +280,9 @@ impl SessionStore {
                 .min_by_key(|(_, sid)| self.sessions.get(*sid).map_or(u64::MAX, |s| s.last_active))
                 .map(|(k, _)| k.clone())
             {
-                self.keys.remove(&oldest);
+                if let Some(evicted) = self.keys.remove(&oldest) {
+                    self.sessions.remove(&evicted);
+                }
             }
         }
         self.keys.insert(key.to_string(), id);
@@ -558,7 +579,9 @@ mod tests {
     #[test]
     fn key_bindings_are_bounded() {
         // A client sending a fresh key per request must not grow memory
-        // without bound: the map evicts the least-recently-active binding.
+        // without bound: the map evicts the least-recently-active binding —
+        // together with the session it names, or the "bounded" map would
+        // leave every conversation's session resident forever.
         let mut store = SessionStore::new();
         for i in 0..(KEY_BINDING_CAP + 100) {
             store.resolve_keyed(&format!("key-{i}"), &[i as u64]);
@@ -568,9 +591,21 @@ mod tests {
             "bindings stayed bounded: {}",
             store.keys.len()
         );
-        // The most recent binding survives.
+        assert!(
+            store.sessions.len() <= KEY_BINDING_CAP,
+            "evicted sessions left with their bindings: {}",
+            store.sessions.len()
+        );
+        // The most recent binding survives — and an evicted key's re-sending
+        // client starts a FRESH session (the expiry is real), never a
+        // continuation of the orphaned conversation.
         let last = format!("key-{}", KEY_BINDING_CAP + 99);
         let r = store.resolve_keyed(&last, &[1]);
         assert!(r.continued, "the newest key is still bound");
+        let evicted = store.resolve_keyed("key-0", &[1]);
+        assert!(
+            !evicted.continued,
+            "an expired key starts a new session, not a phantom continuation"
+        );
     }
 }

@@ -810,12 +810,34 @@ pub async fn handle_chat<A: Adapter + 'static>(
 
     // Opt-in conversation affinity: a client that names its session gets
     // exactly that session, with no prefix-fork inference. Absent → purely
-    // prefix-based continuity, unchanged.
-    let affinity = headers
-        .get("x-cachemax-session")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    // prefix-based continuity, unchanged. A present-but-unusable value is a
+    // silent downgrade to exactly the fork-per-drift behavior the feature
+    // exists to prevent, so each way it is unusable is logged (metadata only).
+    let mut values = headers.get_all("x-cachemax-session").iter();
+    let first = values.next();
+    let duplicated = values.next().is_some();
+    let usable = first.and_then(|v| v.to_str().ok());
+    let downgraded = |why: &str| {
+        tracing::warn!(why, "ignoring x-cachemax-session; matching by prefix");
+    };
+    let affinity = match usable {
+        Some(_) if duplicated => {
+            downgraded("duplicated header");
+            None
+        }
+        Some("") => None,
+        Some(s) if s.len() > 256 => {
+            downgraded("value exceeds 256 bytes");
+            None
+        }
+        Some(s) => Some(s.to_owned()),
+        None => {
+            if first.is_some() {
+                downgraded("value is not visible ASCII");
+            }
+            None
+        }
+    };
 
     let mut plan = {
         let mut guard = state.sessions.lock();
@@ -867,6 +889,14 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 None if ledger.session_has_chains(plan.session_id) => {
                     (None, serde_json::Value::Null, true, false)
                 }
+                // A keyed request whose session has no chain starts a NEW
+                // conversation — the client said so. The most-recent-chain
+                // probe below exists to reattach forked un-keyed traffic; a
+                // declared conversation must never be classified against a
+                // foreign chain (shared framework prefixes make that look
+                // plausible, and repair-on would rewrite real history with
+                // another conversation's response).
+                None if affinity.is_some() => (None, serde_json::Value::Null, false, false),
                 None => {
                     let probed_session = ledger.most_recent_chain_session(&model);
                     (

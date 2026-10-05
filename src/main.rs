@@ -18,6 +18,10 @@ const DEFAULT_BIND: &str = "127.0.0.1:8787";
 /// Docs base for error-contract links.
 const DOCS: &str = "https://github.com/woodsonl/cachemax/blob/main/docs/troubleshooting.md";
 
+/// Sends above which `replay --execute` demands `--yes`. Sends are
+/// billable; the gate makes the total a decision instead of a surprise.
+const REPLAY_CONFIRM_SENDS: usize = 40;
+
 /// The D3 error contract: every failure names the problem, the cause, the fix,
 /// and a docs link. No raw panic by default.
 #[derive(Debug)]
@@ -123,11 +127,55 @@ impl Fault {
         }
     }
 
-    fn replay_execute_no_measurement(endpoint: String) -> Self {
+    fn replay_execute_no_measurement(endpoint: String, failures: &[String], keyless: bool) -> Self {
+        // Summarize what actually happened, so the fix hint names the real
+        // cause: rejected bodies (400s) are a schema problem, auth failures
+        // a key problem, and only unreadable 200s a streaming problem.
+        let mut statuses: Vec<String> = Vec::new();
+        for f in failures {
+            let head = f.split(':').next().unwrap_or(f).trim().to_string();
+            if !statuses.iter().any(|s| s.contains(&head)) {
+                statuses.push(head);
+            }
+        }
+        let cause = if failures.is_empty() {
+            format!("no send to {endpoint} returned a readable cache reading")
+        } else {
+            let shown = statuses
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "all {} send(s) to {endpoint} failed or carried no cache figure: {shown}",
+                failures.len()
+            )
+        };
+        let auth_issue = statuses
+            .iter()
+            .any(|s| s.contains("401") || s.contains("403"))
+            || (keyless && !failures.is_empty());
+        let rejected = statuses.iter().any(|s| s.contains("400"));
+        let fix: &'static str = match (auth_issue, rejected) {
+            (true, true) => "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages); no API key was sent — set the backend's env var or --api-key-env; HTTP 400 means the endpoint rejected the replayed body",
+            (true, false) => "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages); no API key was sent — set the backend's env var or --api-key-env",
+            (false, true) => "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages); HTTP 400 means the endpoint rejected the replayed body",
+            (false, false) => "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages)",
+        };
         Fault {
             problem: "replay --execute measured nothing",
-            cause: format!("no send to {endpoint} returned a readable cache reading"),
-            fix: "check --upstream-url and --backend (the path differs: openai /v1/chat/completions, anthropic /v1/messages); a streaming-only endpoint answers with a body this command cannot read",
+            cause,
+            fix,
+            docs: "replay-execute",
+        }
+    }
+
+    fn replay_execute_unconfirmed(total_sends: usize) -> Self {
+        Fault {
+            problem: "replay --execute needs confirmation",
+            cause: format!("{total_sends} billable sends would be made (--yes not set)"),
+            fix: "re-run with --yes to confirm, or scope the run with --limit <chains> and/or a smaller --n",
             docs: "replay-execute",
         }
     }
@@ -262,9 +310,20 @@ enum Command {
         #[arg(long)]
         api_key_env: Option<String>,
         /// Samples per form (with --execute). One reading on a routed
-        /// endpoint is a routing lottery; ≥3 exposes the spread.
+        /// endpoint is a routing lottery; ≥3 exposes the spread. (--n 0
+        /// would sample nothing; it is floored to 1, the smallest honest
+        /// run, and the output says a single sample is not a measurement.)
         #[arg(long, default_value_t = 3)]
         n: usize,
+        /// Limit to the first N chains (with --execute). The default ledger
+        /// holds every recorded session; a run without a limit bills for all
+        /// of them.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Confirm runs above 40 sends (with --execute). Sends are billable;
+        /// the gate makes the total visible and opt-in before the first one.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -306,6 +365,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend,
         api_key_env,
         n,
+        limit,
+        yes,
     }) = cli.command
     {
         let dir = replay_dir;
@@ -326,8 +387,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         if execute {
-            return run_replay_execute(&requests, upstream_url, &backend, api_key_env, n.max(1))
-                .await;
+            return run_replay_execute(
+                &requests,
+                upstream_url,
+                &backend,
+                api_key_env,
+                n.max(1),
+                limit,
+                yes,
+            )
+            .await;
         }
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -547,12 +616,16 @@ fn ledger_dir_of(cli: &Cli) -> std::path::PathBuf {
 /// Drive each recorded A/B pair against a real endpoint and print what each
 /// form measurably costs. Requires `--upstream-url`; auth comes from the
 /// backend's environment variable (omitted only if the endpoint needs none).
+/// Sends are billable, so the planned total is printed before the first one
+/// and runs above [`REPLAY_CONFIRM_SENDS`] need `--yes`.
 async fn run_replay_execute(
     requests: &[cachemax::ledger::ReplayRequest],
     upstream_url: Option<String>,
     backend: &str,
     api_key_env: Option<String>,
     samples: usize,
+    limit: Option<usize>,
+    confirmed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = upstream_url.ok_or_else(|| {
         Fault::replay_execute_requires(
@@ -566,40 +639,74 @@ async fn run_replay_execute(
     let env_name = api_key_env.unwrap_or_else(|| backend.default_key_env().to_string());
     let api_key = std::env::var(&env_name).ok().filter(|s| !s.is_empty());
 
+    if limit == Some(0) {
+        return Err(Fault::replay_execute_requires(
+            "--limit",
+            "must be at least 1 (0 would plan a run that sends nothing)".to_string(),
+        )
+        .into());
+    }
+    let planned: Vec<_> = match limit {
+        Some(n) => requests.iter().take(n).collect(),
+        None => requests.iter().collect(),
+    };
+    let total_sends = planned.len() * 2 * samples;
+    println!(
+        "replay --execute: {} chain(s) × 2 forms × {samples} sample(s) = {total_sends} send(s) to {endpoint}",
+        planned.len()
+    );
+    if total_sends > REPLAY_CONFIRM_SENDS && !confirmed {
+        return Err(Fault::replay_execute_unconfirmed(total_sends).into());
+    }
+
     let cfg = cachemax::replay::ExecuteConfig {
         endpoint,
         backend,
-        api_key,
+        api_key: api_key.clone(),
         samples,
     };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        // Each send gets its own connection: a router that pins per-connection
+        // would otherwise answer every send — both forms — from one instance,
+        // and the n-sample spread the whole command exists to expose would be
+        // one warmed namespace read n times.
+        .pool_max_idle_per_host(0)
         .build()?;
 
     let mut out = std::io::stdout().lock();
     use std::io::Write;
-    let mut any_measured = false;
-    for request in requests {
-        let pair = cachemax::repair::replay_pair(request);
-        let report = cachemax::replay::execute_pair(
-            &client,
-            &cfg,
-            request.session_id,
-            request.turn,
-            &request.model,
-            &pair["a_drifted"],
-            &pair["b_canonical"],
-        )
-        .await;
-        any_measured |= report.a_drifted.measured() || report.b_canonical.measured();
+    let mut measured_chains = 0usize;
+    let mut total_failures: Vec<String> = Vec::new();
+    for request in &planned {
+        let report = cachemax::replay::execute_pair(&client, &cfg, request).await;
+        if report.a_drifted.measured() || report.b_canonical.measured() {
+            measured_chains += 1;
+        } else {
+            total_failures.extend(report.a_drifted.failures.iter().cloned());
+            total_failures.extend(report.b_canonical.failures.iter().cloned());
+        }
         write!(out, "{}", cachemax::replay::render_report(&report))?;
         out.flush().ok();
     }
-    if !any_measured {
+    if measured_chains < planned.len() {
+        writeln!(
+            out,
+            "{measured_chains} of {} chain(s) produced a measurement; the rest are listed above as gaps",
+            planned.len()
+        )?;
+    }
+    if measured_chains == 0 {
         // Every send failed or was unreadable. Rendering a table of `—` and
         // exiting 0 would look like a valid null measurement; the CLI's own
-        // contract is to fault loudly instead.
-        return Err(Fault::replay_execute_no_measurement(cfg.endpoint.clone()).into());
+        // contract is to fault loudly instead — naming what actually happened,
+        // so a rejected-request run doesn't send the user debugging streams.
+        return Err(Fault::replay_execute_no_measurement(
+            cfg.endpoint.clone(),
+            &total_failures,
+            api_key.is_none(),
+        )
+        .into());
     }
     Ok(())
 }

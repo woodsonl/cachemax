@@ -161,19 +161,32 @@ cachemax replay --execute \
   --backend openai --n 5
 ```
 
-`--execute` sends each form to the endpoint `--n` times (bypassing the
-proxy, so the number is the provider's own cache, not ours) and prints a
-table of cached tokens — median and max — per form, plus how many distinct
-upstream instances answered. Auth is read from an environment variable
-(`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `--api-key-env <VAR>`); the key
-is never printed or written. `--upstream-url` follows the same convention as
-`serve` (a `/v1` suffix is not doubled); `--backend anthropic` posts to
-`/v1/messages`, `openai` to `/v1/chat/completions`. A single send is not a
-measurement on a routed endpoint — different instances have different cache
-namespaces — so read `--n`'s max, not one line; the table says so when more
-than one instance answered. A form with no readable reading shows `—` (the
-reason goes to stderr) and drives no recovery figure; if nothing was
-measurable at all, the command faults rather than printing a table of zeros.
+`--execute` sends each form to the endpoint `--n` times — interleaved a/b,
+each send on its own connection, so one form's sends cannot warm the other's
+prefix and a connection-pinned router cannot answer every send from one
+instance by accident — and prints a table of cached tokens (median and max)
+per form, plus how many distinct upstream instances answered. A recovery
+figure is printed only when both forms were measured **and** an instance
+answered both: a delta across two cache namespaces is routing noise, not a
+repair effect. Auth is read from an environment variable (`OPENAI_API_KEY` /
+`ANTHROPIC_API_KEY`, or `--api-key-env <VAR>`); the key is never printed or
+written. `--upstream-url` follows the same convention as `serve` (a `/v1`
+suffix is not doubled); `--backend anthropic` posts to `/v1/messages`,
+restoring the recorded top-level `system` and a default `max_tokens` of 1024
+(the Messages API requires it; the ledger records none). A form with no
+readable reading shows `—` (the reason is in the run's failure list) and
+drives no recovery figure; if nothing was measurable at all, the command
+faults naming the actual failures (HTTP status, auth, unreadable body)
+rather than printing a table of zeros.
+
+The bodies are reconstructions, not the recorded requests verbatim: a
+fresh `Continue.` user turn is appended to each chain and provider params
+are not replayed — so the absolute columns describe the reconstruction,
+and the A−B delta is the measurement.
+
+Sends are billable. Before the first one, the command prints the planned
+total (chains × 2 forms × n); runs above 40 sends need `--yes`, and
+`--limit <chains>` scopes a run to the first N chains.
 
 ### Declaring conversation affinity
 
@@ -191,8 +204,13 @@ Every request under the same key is one session, whatever the bytes — the
 client's word is the authority, no prefix-fork inference. Distinct keys
 never cross, even with identical history, and a keyed conversation is
 isolated from un-keyed traffic: an unrelated request that happens to share
-a prefix is never merged into it. Omit the header for the default
-prefix-based behavior.
+a prefix is never merged into it, and a brand-new declared conversation is
+never repaired against another session's chain. Omit the header for the
+default prefix-based behavior. Two bounds keep the feature honest: values
+over 256 bytes are ignored (logged), and at 1024 live keys the
+least-recently-active binding expires together with its session — that
+conversation's next request starts a new session, because keeping every
+client-chosen key forever would be unbounded memory.
 
 ## Commands
 
@@ -219,7 +237,7 @@ prefix-based behavior.
 | `--verbose` | Debug logging. Metadata only — never message content. |
 
 `replay` takes its own flags: `--execute`, `--upstream-url`, `--backend`,
-`--api-key-env <VAR>`, and `--n <samples>`.
+`--api-key-env <VAR>`, `--n <samples>`, `--limit <chains>`, and `--yes`.
 
 ## Security
 

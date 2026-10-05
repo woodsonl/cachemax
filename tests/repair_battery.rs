@@ -1013,3 +1013,76 @@ async fn un_keyed_traffic_does_not_merge_into_a_keyed_session() {
         "the keyed session holds only its own turn"
     );
 }
+
+#[tokio::test]
+async fn an_empty_session_header_is_ignored_not_bound_as_a_key() {
+    // A present-but-empty header is absent by design: two requests carrying
+    // it must resolve by prefix like un-keyed traffic. If the proxy filter
+    // regressed, both would resolve_keyed("") and fuse into ONE key-pinned
+    // session — silent measurement corruption with a green suite.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send_affinity(&rig, &weather_turn0(), "").await;
+    last_record(&rig, 1).await;
+    // Same empty header, disjoint history (nothing shares a prefix): un-keyed
+    // rules start a fresh session.
+    let other = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "A different assistant entirely."},
+            {"role": "user", "content": "Translate this."},
+        ],
+    });
+    send_affinity(&rig, &other, "").await;
+    last_record(&rig, 2).await;
+
+    let guard = rig.sessions.lock();
+    assert_eq!(guard.len(), 2, "the empty header was never bound as a key");
+}
+
+#[tokio::test]
+async fn a_fresh_keyed_conversation_never_adopts_a_probed_foreign_chain() {
+    // The most-recent-chain probe exists to reattach forked UN-keyed
+    // traffic. A brand-new declared conversation has no chain yet; if the
+    // probe fired for it, repair-on would classify and rewrite the client's
+    // history against another conversation's response — shared framework
+    // system prompts make that look plausible. The key must win: no chain,
+    // no repair, no rewrite.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    // Seed an unrelated un-keyed conversation with a canonical chain.
+    send(&rig, &weather_turn0()).await;
+    send(&rig, &weather_turn1_reordered_args()).await;
+    records(&rig, 2).await;
+
+    // A fresh declared conversation whose history happens to share the
+    // framework-ish prefix of the seeded one (same system message): without
+    // the keyed exemption this reads as a re-send of the probed chain.
+    let fresh = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You call tools."},
+            {"role": "user", "content": "Different first question entirely."},
+        ],
+    });
+    send_affinity(&rig, &fresh, "conv-fresh").await;
+    let record = last_record(&rig, 3).await;
+
+    assert!(
+        !record.repaired,
+        "a declared new conversation is never rewritten against a foreign chain"
+    );
+    assert_eq!(record.turn, 0, "it starts its own chain at turn 0");
+
+    // The upstream saw the client's bytes verbatim — no rewrite happened.
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(upstream_saw.last().unwrap()).unwrap();
+    assert_eq!(
+        sent["messages"][1]["content"], "Different first question entirely.",
+        "the fresh conversation went out untouched"
+    );
+}
