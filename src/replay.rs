@@ -8,24 +8,33 @@
 //! (median and max), the prompt size, and how many distinct upstream
 //! instances answered.
 //!
-//! Single sends are not a measurement on a routed endpoint: the same bytes
-//! landed in different cache namespaces across instances (observed live, a
-//! 2.3%↔99.7% flip on identical bodies). `n` samples and per-form max expose
-//! that; the instance fingerprint (a hash of the response's identifying
-//! headers) names how many distinct backends answered, so a reader can weigh
-//! the spread.
-//!
-//! Honesty rules this module keeps:
-//!   - a form that got no successful send is *unmeasured*, never a zero;
-//!     its medians are `null` and it drives no recovery claim;
-//!   - a response whose usage cannot be read (an SSE body, a shape we do not
-//!     recognize) is *unmeasured*, never counted as `0` cached;
-//!   - the recovery figure is only printed when both forms were measured.
+//! Measurement-validity rules this module keeps:
+//!   - the two forms are sent interleaved (a, b, a, b, …) and each send gets
+//!     a fresh connection, so form B's readings are not warmed by form A's
+//!     sends and a connection-pinned router cannot answer every send from
+//!     one instance by accident;
+//!   - single sends are not a measurement on a routed endpoint: the same
+//!     bytes landed in different cache namespaces across instances (observed
+//!     live, a 2.3%↔99.7% flip on identical bodies). `n` samples and per-form
+//!     max expose that; the instance fingerprint (a hash of the response's
+//!     stable routing headers) names how many distinct backends answered;
+//!   - a recovery figure is printed only when both forms were measured AND
+//!     at least one instance answered both — a delta across two cache
+//!     namespaces is a routing artifact, not a repair effect;
+//!   - a form that got no readable send is *unmeasured*, never a zero: its
+//!     medians are `null` and it drives no recovery claim. A response whose
+//!     usage carries no cache figure at all (a non-caching model, a gateway
+//!     that strips the details) is likewise unmeasured — the provider did
+//!     not report a number, so there is no number.
 
 use crate::adapters::anthropic::AnthropicAdapter;
 use crate::adapters::openai::OpenAiAdapter;
 use crate::adapters::Adapter;
-use serde::Serialize;
+use crate::record::SourceLabel;
+
+/// Anthropic's Messages API requires `max_tokens`; the ledger records none.
+/// Every replayed Anthropic body carries this documented default.
+pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 1024;
 
 /// Which wire shape the endpoint speaks, for auth and usage parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +73,31 @@ impl Backend {
         }
     }
 
+    /// The request body for one form on this backend. OpenAI bodies go as
+    /// recorded; Anthropic's Messages API requires a `max_tokens` and reads
+    /// the system prompt from a top-level `system`, which the ledger recorded
+    /// separately from `messages` — both are restored here, so a recorded
+    /// chain replays as a valid request rather than a guaranteed 400.
+    pub fn prepare_body(
+        self,
+        form_body: &serde_json::Value,
+        system: &serde_json::Value,
+    ) -> serde_json::Value {
+        match self {
+            Backend::OpenAi => form_body.clone(),
+            Backend::Anthropic => {
+                let mut body = form_body.clone();
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("max_tokens".into(), ANTHROPIC_DEFAULT_MAX_TOKENS.into());
+                    if !system.is_null() {
+                        obj.insert("system".into(), system.clone());
+                    }
+                }
+                body
+            }
+        }
+    }
+
     /// Read the cache signal out of one response body with this backend's
     /// adapter. No allocation: both adapters are zero-sized.
     fn cache_signal(self, body: &[u8]) -> crate::adapters::CacheSignal {
@@ -74,14 +108,15 @@ impl Backend {
     }
 }
 
-/// One A/B pair sampled: the cached-token readings and the instance
-/// fingerprints seen for each form.
+/// One A/B form sampled: the cached-token readings and the instance
+/// fingerprints seen for that form.
 ///
 /// The summary figures are `Option<u64>`: a form that never got a successful,
 /// readable response has `None` — *unmeasured*, rendered `—`, never a
-/// fabricated `0`. `sends` is the count of successful sends, which may be
-/// fewer than requested when some failed; `sends == 0` is the unmeasured case.
-#[derive(Debug, Clone, Serialize)]
+/// fabricated `0`. `sends` counts sends whose usage was readable; a 200 with
+/// a streamed or otherwise unreadable body is not a reading and is not
+/// counted (its reason lands in `failures`).
+#[derive(Debug, Clone)]
 pub struct FormSample {
     pub form: &'static str,
     pub sends: usize,
@@ -93,22 +128,13 @@ pub struct FormSample {
     pub max_cached: Option<u64>,
     /// Distinct upstream instances (by identifying-header fingerprint).
     pub instances: Vec<String>,
+    /// Why each non-reading send produced no reading, in send order. Kept so
+    /// a total-failure run can say what actually happened (HTTP 400 vs a
+    /// streamed body vs a connection error) instead of a generic shrug.
+    pub failures: Vec<String>,
 }
 
 impl FormSample {
-    /// An unsent form: no readings, no summary. `execute_pair` fills it in.
-    pub fn unmeasured(form: &'static str) -> Self {
-        FormSample {
-            form,
-            sends: 0,
-            cached_readings: Vec::new(),
-            prompt_readings: Vec::new(),
-            median_cached: None,
-            max_cached: None,
-            instances: Vec::new(),
-        }
-    }
-
     /// Whether this form has a usable measurement at all.
     pub fn measured(&self) -> bool {
         self.sends > 0
@@ -116,7 +142,7 @@ impl FormSample {
 }
 
 /// The measurement for one recorded chain.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ChainReport {
     pub session_id: u64,
     pub turn: u32,
@@ -137,26 +163,16 @@ pub fn median(values: &[u64]) -> Option<u64> {
     Some(v[(v.len() - 1) / 2])
 }
 
-/// A stable fingerprint of the upstream that answered: its *routing* headers,
-/// sorted, hashed. Only headers that identify an instance/namespace statically
-/// are used — never per-response values like `Date` or a request id, which
-/// change on every reply from one instance and would inflate the instance
-/// count the longer a run lasts.
+/// A stable fingerprint of the upstream that answered: its *static routing*
+/// headers, sorted, hashed. Only headers that identify an instance/namespace
+/// independent of the response are used — never per-response values like
+/// `Date`, a request id, or `x-cache` (whose HIT/MISS flips reply to reply
+/// and would split one stable instance into many).
 pub fn instance_fingerprint(headers: &reqwest::header::HeaderMap) -> String {
     use std::collections::BTreeMap;
-    const KEYS: &[&str] = &[
-        "server",
-        "cf-ray",
-        "x-served-by",
-        "x-upstream",
-        "x-cache",
-        "via",
-        "x-instance-id",
-    ];
+    const KEYS: &[&str] = &["server", "cf-ray", "x-upstream", "x-instance-id"];
     let mut map: BTreeMap<&str, String> = BTreeMap::new();
     for key in KEYS {
-        // A routing header that names a *cluster* is fine; the value shape
-        // varies per provider, so keep it verbatim.
         if let Some(v) = headers.get(*key).and_then(|v| v.to_str().ok()) {
             map.insert(key, v.to_string());
         }
@@ -206,9 +222,10 @@ pub fn auth_headers(backend: Backend, api_key: Option<&str>) -> Vec<(&'static st
 }
 
 /// Read the cached and prompt token counts out of a provider response body.
-/// `None` when the body is not a JSON usage payload at all — an SSE stream, an
-/// error shape, a content type we cannot parse. That is *unmeasured*, reported
-/// as such, never as `0` cached.
+/// `None` when the body is not a JSON usage payload at all — an SSE stream,
+/// an error shape — or when the usage carries NO cache figure: the provider
+/// reported nothing, so there is nothing to measure, and reporting a measured
+/// `0` would fabricate a cache miss. A genuinely reported `0` stays a `0`.
 pub fn read_usage(backend: Backend, body: &[u8]) -> Option<(u64, u64)> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = v
@@ -216,6 +233,9 @@ pub fn read_usage(backend: Backend, body: &[u8]) -> Option<(u64, u64)> {
         .or_else(|| v.pointer("/message/usage"))
         .filter(|u| u.is_object())?;
     let sig = backend.cache_signal(body);
+    if sig.source == Some(SourceLabel::NoCacheTruth) {
+        return None;
+    }
     // Provider-reported prompt size; absent on some shapes, which is 0 prompt
     // tokens *known*, not a missing measurement (the cache reading is the
     // measurement, prompt is context).
@@ -276,7 +296,8 @@ async fn send_once(
         ));
     }
     let (cached, prompt) = read_usage(cfg.backend, &bytes).ok_or_else(|| {
-        "response carried no readable usage (streamed or non-JSON body)".to_string()
+        "response carried no readable cache figure (streamed body, or usage with no cache field)"
+            .to_string()
     })?;
     Ok(SendOutcome {
         cached,
@@ -285,65 +306,93 @@ async fn send_once(
     })
 }
 
-/// Sample one form `cfg.samples` times. Failed or unreadable sends are
-/// reported on stderr and omitted from the readings: they are no measurement,
-/// not a cache miss. The summary is `None` when no send succeeded.
-async fn sample_form(
-    client: &reqwest::Client,
-    cfg: &ExecuteConfig,
-    label: &'static str,
-    body: &serde_json::Value,
-) -> FormSample {
-    let mut cached_readings = Vec::new();
-    let mut prompt_readings = Vec::new();
-    let mut instances: Vec<String> = Vec::new();
-    for _ in 0..cfg.samples {
-        match send_once(client, cfg, body).await {
-            Ok(o) => {
-                cached_readings.push(o.cached);
-                prompt_readings.push(o.prompt);
-                if !instances.contains(&o.fingerprint) {
-                    instances.push(o.fingerprint);
-                }
-            }
-            Err(e) => eprintln!("replay: {label} send failed: {e}"),
+/// One form's accumulated readings across its sends.
+struct SampleAcc {
+    form: &'static str,
+    cached: Vec<u64>,
+    prompt: Vec<u64>,
+    instances: Vec<String>,
+    failures: Vec<String>,
+}
+
+impl SampleAcc {
+    fn new(form: &'static str) -> Self {
+        SampleAcc {
+            form,
+            cached: Vec::new(),
+            prompt: Vec::new(),
+            instances: Vec::new(),
+            failures: Vec::new(),
         }
     }
-    FormSample {
-        form: label,
-        sends: cached_readings.len(),
-        median_cached: median(&cached_readings),
-        max_cached: cached_readings.iter().copied().max(),
-        cached_readings,
-        prompt_readings,
-        instances,
+
+    async fn send(
+        &mut self,
+        client: &reqwest::Client,
+        cfg: &ExecuteConfig,
+        body: &serde_json::Value,
+    ) {
+        match send_once(client, cfg, body).await {
+            Ok(o) => {
+                self.cached.push(o.cached);
+                self.prompt.push(o.prompt);
+                if !self.instances.contains(&o.fingerprint) {
+                    self.instances.push(o.fingerprint);
+                }
+            }
+            Err(e) => self.failures.push(e),
+        }
+    }
+
+    fn finish(self) -> FormSample {
+        FormSample {
+            form: self.form,
+            sends: self.cached.len(),
+            median_cached: median(&self.cached),
+            max_cached: self.cached.iter().copied().max(),
+            cached_readings: self.cached,
+            prompt_readings: self.prompt,
+            instances: self.instances,
+            failures: self.failures,
+        }
     }
 }
 
-/// Drive one A/B pair: sample each form `cfg.samples` times and summarize.
+/// Drive one A/B pair for a recorded chain: the drifted and canonical forms
+/// are reconstructed from the request, shaped for the backend, and sampled
+/// interleaved — a, b, a, b, … — so neither form's sends warm the other's
+/// prefix advantage.
 pub async fn execute_pair(
     client: &reqwest::Client,
     cfg: &ExecuteConfig,
-    session_id: u64,
-    turn: u32,
-    model: &str,
-    a_body: &serde_json::Value,
-    b_body: &serde_json::Value,
+    request: &crate::ledger::ReplayRequest,
 ) -> ChainReport {
-    let a_drifted = sample_form(client, cfg, "a_drifted", a_body).await;
-    let b_canonical = sample_form(client, cfg, "b_canonical", b_body).await;
+    let pair = crate::repair::replay_pair(request);
+    let a_body = cfg
+        .backend
+        .prepare_body(&pair["a_drifted"], &request.request_system);
+    let b_body = cfg
+        .backend
+        .prepare_body(&pair["b_canonical"], &request.request_system);
+    let mut a = SampleAcc::new("a_drifted");
+    let mut b = SampleAcc::new("b_canonical");
+    for _ in 0..cfg.samples {
+        a.send(client, cfg, &a_body).await;
+        b.send(client, cfg, &b_body).await;
+    }
     ChainReport {
-        session_id,
-        turn,
-        model: model.to_string(),
-        a_drifted,
-        b_canonical,
+        session_id: request.session_id,
+        turn: request.turn,
+        model: request.model.clone(),
+        a_drifted: a.finish(),
+        b_canonical: b.finish(),
     }
 }
 
 /// Render the measurement table for one chain. Plain text, aligned, honest:
-/// unmeasured forms show `—`, and the recovery figure is printed only when
-/// both forms were actually measured.
+/// unmeasured forms show `—`; a recovery figure is printed only when both
+/// forms were measured AND an instance answered both (a delta across two
+/// cache namespaces is routing noise, not a repair effect).
 pub fn render_report(r: &ChainReport) -> String {
     fn cell(v: Option<u64>) -> String {
         v.map_or_else(|| "—".to_string(), |n| n.to_string())
@@ -364,20 +413,32 @@ pub fn render_report(r: &ChainReport) -> String {
             f.sends,
             cell(f.median_cached),
             cell(f.max_cached),
+            // Prompt size is context for the reading, not the measurement;
+            // render-time only.
             cell(median(&f.prompt_readings)),
             f.instances.len()
         ));
     }
+    let shared_instance = !r.a_drifted.instances.is_empty()
+        && r.a_drifted
+            .instances
+            .iter()
+            .any(|i| r.b_canonical.instances.contains(i));
     match (r.a_drifted.median_cached, r.b_canonical.median_cached) {
-        (Some(a), Some(b)) if b > a => {
+        (Some(a), Some(b)) if b > a && shared_instance => {
             out.push_str(&format!(
                 "  → canonical form recovers {} cached tokens (median) over drifted\n",
                 b - a
             ));
         }
+        (Some(_), Some(_)) if !shared_instance => {
+            out.push_str(
+                "  · forms answered by different upstream instances — no like-for-like delta\n",
+            );
+        }
         (Some(_), Some(_)) => {}
         _ => out.push_str(
-            "  · not a measurement: a form had no readable reading (see stderr for the failed sends)\n",
+            "  · not a measurement: a form had no readable reading (see the logged failures)\n",
         ),
     }
     if r.a_drifted.instances.len() > 1 || r.b_canonical.instances.len() > 1 {
@@ -438,6 +499,28 @@ mod tests {
     }
 
     #[test]
+    fn usage_without_a_cache_field_is_unmeasured_not_a_measured_zero() {
+        // Non-caching model, or a gateway that strips the details: usage is
+        // readable, the cache figure was never exposed. There is no number —
+        // reporting 0 would fabricate a cache miss.
+        assert_eq!(
+            read_usage(Backend::OpenAi, br#"{"usage":{"prompt_tokens":100}}"#),
+            None
+        );
+        assert_eq!(
+            read_usage(Backend::Anthropic, br#"{"usage":{"input_tokens":100}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reported_zero_stays_a_measured_zero() {
+        let body =
+            br#"{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+        assert_eq!(read_usage(Backend::OpenAi, body), Some((0, 100)));
+    }
+
+    #[test]
     fn openai_usage_reads_cached_and_prompt() {
         let body =
             br#"{"usage":{"prompt_tokens":2140,"prompt_tokens_details":{"cached_tokens":1455}}}"#;
@@ -451,12 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_nested_message_usage_is_read() {
+        let body = br#"{"message":{"usage":{"input_tokens":2100,"cache_read_input_tokens":900}}}"#;
+        assert_eq!(read_usage(Backend::Anthropic, body), Some((900, 2100)));
+    }
+
+    #[test]
     fn a_body_with_no_usage_is_unmeasured_not_zero() {
         // An SSE stream, an error shape, a plain-text body: no JSON usage,
         // so no reading — reported as such, never as `0` cached.
         assert_eq!(read_usage(Backend::OpenAi, b"{}"), None);
         assert_eq!(read_usage(Backend::OpenAi, b"data: {\"x\":1}\n\n"), None);
         assert_eq!(read_usage(Backend::OpenAi, b"not json"), None);
+    }
+
+    #[test]
+    fn anthropic_bodies_carry_the_required_max_tokens_and_system() {
+        // Anthropic's Messages API rejects a body without `max_tokens`, and
+        // reads the system prompt from the top level, not from `messages`.
+        let form =
+            serde_json::json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}]});
+        let system = serde_json::json!("You call tools.");
+        let body = Backend::Anthropic.prepare_body(&form, &system);
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["system"], "You call tools.");
+        assert_eq!(body["messages"][0]["content"], "hi");
+
+        // A chain recorded with no system stays valid; no null "system" key.
+        let body = Backend::Anthropic.prepare_body(&form, &serde_json::Value::Null);
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("system").is_none());
+
+        // OpenAI bodies go as recorded — no injected fields.
+        let body = Backend::OpenAi.prepare_body(&form, &system);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("system").is_none());
     }
 
     #[test]
@@ -502,5 +614,22 @@ mod tests {
         d.insert("server", HeaderValue::from_static("cloudflare"));
         d.insert("cf-ray", HeaderValue::from_static("abc123-SJC"));
         assert_ne!(instance_fingerprint(&a), instance_fingerprint(&d));
+    }
+
+    #[test]
+    fn cache_state_headers_do_not_split_one_instance() {
+        // `x-cache` flips MISS→HIT reply to reply on many CDNs. One stable
+        // instance must not read as a routed spread just because its cache
+        // warmed up mid-run.
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut miss = HeaderMap::new();
+        miss.insert("server", HeaderValue::from_static("nginx"));
+        miss.insert("cf-ray", HeaderValue::from_static("abc123-SJC"));
+        miss.insert("x-cache", HeaderValue::from_static("MISS"));
+        let mut hit = HeaderMap::new();
+        hit.insert("server", HeaderValue::from_static("nginx"));
+        hit.insert("cf-ray", HeaderValue::from_static("abc123-SJC"));
+        hit.insert("x-cache", HeaderValue::from_static("HIT"));
+        assert_eq!(instance_fingerprint(&miss), instance_fingerprint(&hit));
     }
 }

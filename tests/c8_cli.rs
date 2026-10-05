@@ -165,6 +165,8 @@ fn replay_help_lists_the_execute_surface() {
         "--backend",
         "--api-key-env",
         "--n",
+        "--limit",
+        "--yes",
     ] {
         assert!(s.contains(needle), "replay --help missing {needle}");
     }
@@ -204,5 +206,46 @@ fn replay_execute_without_an_endpoint_faults_with_the_contract() {
     assert!(err.contains("problem:"), "D3 contract, got: {err}");
     assert!(err.contains("--upstream-url"), "names the flag, got: {err}");
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn replay_limit_zero_faults_rather_than_meaning_all() {
+    // --limit 0 reads as "send nothing"; mapping it to unlimited would bill
+    // for every chain. It faults with the contract instead.
+    let dir = std::env::temp_dir().join(format!("cachemax-limit0-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let mut ledger = cachemax::ledger::Ledger::on_disk(dir.clone()).unwrap();
+        ledger.append(
+            1,
+            cachemax::ledger::CanonicalTurn {
+                turn: 0,
+                model: "gpt-4o".into(),
+                request_messages: serde_json::json!([{"role": "user", "content": "hi"}]),
+                request_system: serde_json::Value::Null,
+                response_messages: vec![],
+                prefix_hashes: vec![1],
+                breakpoints: 0,
+            },
+        );
+    }
+    let out = cachemax()
+        .args([
+            "replay",
+            "--execute",
+            "--ledger-dir",
+            dir.to_str().unwrap(),
+            "--upstream-url",
+            "http://127.0.0.1:1",
+            "--limit",
+            "0",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "--limit 0 must fault");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--limit"), "got: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }

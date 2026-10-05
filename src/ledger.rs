@@ -89,6 +89,16 @@ pub struct CanonicalTurn {
     pub breakpoints: u64,
 }
 
+/// The outcome of offering a finalized turn to the chain: accepted into the
+/// canonical chain, an equal-turn duplicate (audited, chain untouched), or a
+/// strictly-older straggler (ignored entirely).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remembered {
+    Accepted,
+    DuplicateTurn,
+    Regressed,
+}
+
 /// The on-disk line: the turn plus the session it belongs to. One JSON object
 /// per line in `<ledger-dir>/<session>.jsonl`.
 #[derive(Serialize, Deserialize)]
@@ -165,28 +175,43 @@ impl Ledger {
         Ok(ledger)
     }
 
-    /// Record one complete turn. Memory always; disk when persistent. A turn
-    /// numbered at or below the remembered turn for the same session+model is
-    /// ignored — an out-of-order finalize (concurrent requests that planned
-    /// the same turn) must not regress the chain.
+    /// Record one complete turn. Every finalized request is audited except a
+    /// strictly-older straggler; the remembered chain (the canonical view) is
+    /// first-finalized per turn — an out-of-order or concurrent same-turn
+    /// finalize never regresses or replaces it.
     pub fn append(&mut self, session_id: u64, turn: CanonicalTurn) {
-        if self.remember(session_id, turn.clone()) {
-            self.flush_line(session_id, &turn);
+        // Every finalized request except a strictly-older straggler is
+        // audited — an equal-turn racer is a distinct provider exchange and
+        // belongs on the record — while the remembered chain keeps the FIRST
+        // finalization for a turn.
+        match self.remember(session_id, turn.clone()) {
+            Remembered::Regressed => {}
+            Remembered::Accepted | Remembered::DuplicateTurn => self.flush_line(session_id, &turn),
         }
     }
 
-    /// Memory-side insert with the eviction bound applied. Returns whether
-    /// the turn was accepted (false when it would regress the chain).
-    fn remember(&mut self, session_id: u64, turn: CanonicalTurn) -> bool {
+    /// Memory-side insert with the eviction bound applied.
+    fn remember(&mut self, session_id: u64, turn: CanonicalTurn) -> Remembered {
         let per_model = self.sessions.entry(session_id).or_insert_with(|| {
             self.order.push(session_id);
             HashMap::new()
         });
-        let regresses = per_model
-            .get(&turn.model)
-            .is_some_and(|prev| prev.turn > turn.turn);
-        if regresses {
-            return false;
+        let remembered = match per_model.get(&turn.model) {
+            // The first finalization for a turn is the canonical history: a
+            // same-turn racer (two concurrent requests under one affinity
+            // key) must never replace it, or repair-on would rewrite the
+            // client's real history against a response it never continued.
+            Some(prev) if prev.turn >= turn.turn => {
+                if prev.turn == turn.turn {
+                    Remembered::DuplicateTurn
+                } else {
+                    Remembered::Regressed
+                }
+            }
+            Some(_) | None => Remembered::Accepted,
+        };
+        if remembered != Remembered::Accepted {
+            return remembered;
         }
         self.recent
             .retain(|(s, m)| *s != session_id || *m != turn.model);
@@ -199,7 +224,7 @@ impl Ledger {
             let victim = self.order.remove(0);
             self.sessions.remove(&victim);
         }
-        true
+        Remembered::Accepted
     }
 
     /// Append one complete JSON line to the session's file. A single
@@ -308,6 +333,7 @@ impl Ledger {
                         turn: turn.turn,
                         model: model.clone(),
                         messages: chain,
+                        request_system: turn.request_system.clone(),
                     })
                 })
             })
@@ -374,6 +400,10 @@ pub struct ReplayRequest {
     /// The request body's `messages`: the chain as forwarded, extended by
     /// a fresh user turn.
     pub messages: serde_json::Value,
+    /// The chain's top-level `system`, exactly as forwarded (Null for
+    /// OpenAI-dialect chains). Anthropic's Messages API reads the system
+    /// prompt from the top level, so `replay --execute` restores it there.
+    pub request_system: serde_json::Value,
 }
 
 impl SharedLedger {
@@ -892,6 +922,25 @@ mod tests {
     }
 
     #[test]
+    fn an_equal_turn_never_replaces_the_first_finalized_chain() {
+        // Two requests under one affinity key plan the same turn; whichever
+        // finalizes FIRST is the canonical history. A racing same-turn
+        // finalizer must not replace it (repair-on would otherwise rewrite
+        // the client's real history against a response it never continued).
+        let dir = temp_dir("equal-turn");
+        let mut ledger = Ledger::on_disk(dir.clone()).unwrap();
+        ledger.append(1, turn(0, "first"));
+        ledger.append(1, turn(0, "racer"));
+        let last = ledger.last_turn(1, "gpt-4o").unwrap();
+        assert_eq!(
+            last.request_messages,
+            json!([{"role": "user", "content": "first"}]),
+            "the first finalization for a turn is the chain"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn canonical_chain_extends_the_request_with_the_response() {
         let mut ledger = Ledger::in_memory();
         ledger.append(7, turn(3, "hi"));
@@ -1299,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_with_duplicate_turn_numbers_takes_the_last_line() {
+    fn reload_keeps_the_first_finalized_line_for_a_turn() {
         let dir = temp_dir("dupturn");
         let path = dir.join("9.jsonl");
         let line = |marker: &str| {
@@ -1314,8 +1363,8 @@ mod tests {
         let chain = ledger.canonical_messages(9, "gpt-4o").unwrap();
         assert_eq!(
             chain[0],
-            json!({"role": "user", "content": "second"}),
-            "the last line for a turn wins on reload"
+            json!({"role": "user", "content": "first"}),
+            "the first finalization for a turn wins on reload, matching live behavior"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

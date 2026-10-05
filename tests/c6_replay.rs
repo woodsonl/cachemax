@@ -117,6 +117,7 @@ async fn replay_pair_is_semantically_identical_and_byte_different() {
         turn: 1,
         model: "gpt-4o".into(),
         messages: serde_json::Value::Array(messages),
+        request_system: serde_json::Value::Null,
     };
 
     // The pair: B is the chain exactly; A is the drifted client form.
