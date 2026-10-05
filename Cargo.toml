@@ -20,7 +20,13 @@ tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps parsed JSON objects in document order, so a
+# `serde_json::Value` round-trips the key order of the bytes we forwarded.
+# The ledger's "exactly as forwarded" invariant — and later repair's
+# prefix-extension of our own serialization — depend on it. Without it,
+# re-serializing a parsed body (usage injection, history rewriting) would
+# silently sort every object's keys.
+serde_json = { version = "1", features = ["preserve_order"] }
 futures = "0.3"
 async-stream = "0.3"
 bytes = "1"

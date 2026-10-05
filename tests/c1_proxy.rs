@@ -91,6 +91,7 @@ async fn boot_proxy(upstream: String) -> String {
         adapter: Arc::new(OpenAiAdapter),
         tokenizer: Tokenizer::default_encoder().unwrap(),
         sessions: Arc::new(SharedSessions::new()),
+        ledger: Arc::new(cachemax::ledger::SharedLedger::new()),
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
         client: reqwest::Client::new(),
@@ -297,6 +298,7 @@ async fn boot_proxy_with_state(upstream: String) -> (String, Arc<SharedSessions>
         adapter: Arc::new(OpenAiAdapter),
         tokenizer: Tokenizer::default_encoder().unwrap(),
         sessions: sessions.clone(),
+        ledger: Arc::new(cachemax::ledger::SharedLedger::new()),
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
         client: reqwest::Client::new(),
@@ -364,6 +366,7 @@ fn engine_measured_counts_clamp_to_history_span() {
         turn: 1,
         resent_history_tokens: 100,
         broke_prefix: false,
+        prefix_hashes: Vec::new(),
     };
     let rates = Rates::default();
 
@@ -414,6 +417,7 @@ fn incomplete_turns_carry_no_cost() {
         turn: 1,
         resent_history_tokens: 1000,
         broke_prefix: false,
+        prefix_hashes: Vec::new(),
     };
     let obs = Observation {
         ttft_ms: None,
@@ -523,6 +527,7 @@ async fn upstream_error_is_recorded_incomplete_not_a_fake_miss() {
         adapter: Arc::new(OpenAiAdapter),
         tokenizer: Tokenizer::default_encoder().unwrap(),
         sessions: Arc::new(SharedSessions::new()),
+        ledger: Arc::new(cachemax::ledger::SharedLedger::new()),
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: format!("http://{addr}"),
         client: reqwest::Client::new(),
@@ -629,6 +634,7 @@ async fn vllm_metrics_delta_is_wired_into_the_record() {
         adapter: Arc::new(VllmAdapter),
         tokenizer: Tokenizer::default_encoder().unwrap(),
         sessions: sessions.clone(),
+        ledger: Arc::new(cachemax::ledger::SharedLedger::new()),
         rates: cachemax::rates::Rates::builtin(),
         // Includes /v1 so the metrics URL strips it back to the origin.
         upstream_url: format!("http://{u}/v1"),

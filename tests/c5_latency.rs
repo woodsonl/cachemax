@@ -80,6 +80,7 @@ async fn proxy_for(upstream: String) -> String {
         adapter: Arc::new(OpenAiAdapter),
         tokenizer: Tokenizer::default_encoder().unwrap(),
         sessions: Arc::new(SharedSessions::new()),
+        ledger: Arc::new(cachemax::ledger::SharedLedger::new()),
         rates: cachemax::rates::Rates::builtin(),
         upstream_url: upstream,
         client: reqwest::Client::new(),

@@ -11,6 +11,7 @@
 //! [`observe`], [`finalize`], [`RequestPlan`]) are tested without a socket.
 
 use crate::adapters::Adapter;
+use crate::ledger::{CanonicalTurn, Dialect, ResponseAssembler, SharedLedger};
 use crate::rates::Rates;
 use crate::record::{Record, SourceLabel, Status};
 use crate::sessions::{SessionStore, SharedSessions};
@@ -38,6 +39,10 @@ pub struct RequestPlan {
     pub resent_history_tokens: u64,
     /// This request broke a tracked session's prefix (measured as a miss).
     pub broke_prefix: bool,
+    /// The request's cumulative prefix-hash sequence, as resolved for session
+    /// continuity. The ledger records it per turn as a cross-check; the
+    /// canonical chain's authority is the messages themselves.
+    pub prefix_hashes: Vec<u64>,
 }
 
 /// Compute the plan for an incoming request from its messages.
@@ -79,6 +84,7 @@ pub fn plan_request(
         turn,
         resent_history_tokens,
         broke_prefix: resolution.broke_prefix,
+        prefix_hashes: hashes,
     }
 }
 
@@ -246,10 +252,20 @@ pub struct StreamObserver {
     scanned: usize,
     /// Cap the retained copy; the tail is a fallback for content-free streams.
     cap: usize,
+    /// Incremental reassembly of the assistant message(s) for the ledger.
+    /// Retains only the message being assembled (never the whole stream), so
+    /// observation stays bounded no matter how long the response runs.
+    assembler: ResponseAssembler,
 }
 
 impl StreamObserver {
     pub fn new() -> Self {
+        Self::for_dialect(Dialect::OpenAi)
+    }
+
+    /// An observer whose response capture speaks `dialect` (the upstream
+    /// backend's wire shape; see [`Dialect::from_backend`]).
+    pub fn for_dialect(dialect: Dialect) -> Self {
         Self {
             started: Instant::now(),
             ttft_ms: None,
@@ -258,6 +274,7 @@ impl StreamObserver {
             usage_doc: None,
             scanned: 0,
             cap: 64 * 1024,
+            assembler: ResponseAssembler::new(dialect),
         }
     }
 
@@ -268,6 +285,7 @@ impl StreamObserver {
             self.saw_first_byte = true;
             self.ttft_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
         }
+        self.assembler.on_chunk(chunk);
         self.tail.extend_from_slice(chunk);
         if self.tail.len() > self.cap {
             let drop = self.tail.len() - self.cap;
@@ -281,6 +299,13 @@ impl StreamObserver {
             self.usage_doc = Some(last_json_event(&self.tail));
         }
         self.scanned = self.tail.len();
+    }
+
+    /// The reassembled assistant message(s) exactly as the provider returned
+    /// them — what the ledger remembers for this turn. Empty when the
+    /// response could not be reassembled; absence is a fact, never filled.
+    pub fn response_messages(&self) -> Vec<serde_json::Value> {
+        self.assembler.finish()
     }
 
     /// Finalize the observation into a record. `complete` is false when the
@@ -297,10 +322,13 @@ impl StreamObserver {
         complete: bool,
         engine_cached: Option<u64>,
     ) -> Record {
-        // Prefer the retained usage event; fall back to the (bounded) tail.
+        // Prefer the retained usage event (SSE); else the whole retained JSON
+        // body (non-streaming responses are held in full by the assembler);
+        // else the bounded tail.
         let doc = self
             .usage_doc
             .clone()
+            .or_else(|| self.assembler.full_body().map(<[u8]>::to_vec))
             .unwrap_or_else(|| last_json_event(&self.tail));
         let (mut cached_tokens, cache_written_tokens, mut source) = observe_doc(adapter, &doc);
         if let Some(n) = engine_cached {
@@ -340,6 +368,12 @@ struct Finalizer<A: Adapter> {
     model: String,
     rates: Rates,
     sessions: Arc<SharedSessions>,
+    /// The canonical ledger: complete turns are remembered here, exactly as
+    /// forwarded and received.
+    ledger: Arc<SharedLedger>,
+    /// The `messages` array exactly as forwarded upstream this turn (already
+    /// reflecting any proxy-side injection). Captured before forwarding.
+    as_sent_messages: serde_json::Value,
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
@@ -384,6 +418,20 @@ impl<A: Adapter> Finalizer<A> {
             complete,
             engine_cached,
         );
+        if complete {
+            // The canonical turn: the messages exactly as forwarded, extended
+            // by the assistant message(s) exactly as received. Only complete
+            // turns enter the chain — an incomplete turn's partial response
+            // was never a message the client could re-send.
+            let turn = CanonicalTurn {
+                turn: self.plan.turn,
+                model: self.model.clone(),
+                request_messages: self.as_sent_messages.clone(),
+                response_messages: self.observer.response_messages(),
+                prefix_hashes: self.plan.prefix_hashes.clone(),
+            };
+            self.ledger.lock().append(self.plan.session_id, turn);
+        }
         crate::export::log_finalize(&record);
         self.sessions.lock().append(record);
     }
@@ -424,6 +472,9 @@ pub struct AppState<A: Adapter> {
     pub adapter: Arc<A>,
     pub tokenizer: Tokenizer,
     pub sessions: Arc<SharedSessions>,
+    /// The canonical ledger (see [`crate::ledger`]). Content-bearing by
+    /// design; local-only. `--no-ledger` runs it in memory only.
+    pub ledger: Arc<SharedLedger>,
     pub rates: Rates,
     pub upstream_url: String,
     pub client: reqwest::Client,
@@ -439,6 +490,7 @@ pub async fn serve<A: Adapter + 'static>(
     adapter: A,
     tokenizer: Tokenizer,
     rates: Rates,
+    ledger: Arc<SharedLedger>,
     upstream_url: String,
     listener: tokio::net::TcpListener,
     inject_usage: bool,
@@ -449,6 +501,7 @@ pub async fn serve<A: Adapter + 'static>(
         adapter: Arc::new(adapter),
         tokenizer,
         sessions: Arc::new(SharedSessions::new()),
+        ledger,
         rates,
         upstream_url,
         inject_usage,
@@ -609,34 +662,36 @@ async fn sample_prom(
 /// JSON object with `"stream": true` and no `stream_options.include_usage`, set
 /// it. Non-streaming bodies, non-OpenAI dialects, and bodies already opting in
 /// are returned unchanged.
-fn with_usage_requested(body: &Bytes, inject: bool) -> Bytes {
+///
+/// Mutates `doc` in place — the caller's single parse serves session planning,
+/// the canonical ledger, and the forwarded bytes — and returns the bytes to
+/// forward: the re-serialized `doc` when injection applied, else the client's
+/// original bytes, untouched.
+fn with_usage_requested(doc: &mut serde_json::Value, original: &Bytes, inject: bool) -> Bytes {
     if !inject {
-        return body.clone();
+        return original.clone();
     }
-    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return body.clone();
-    };
-    if v.get("stream").and_then(|s| s.as_bool()) != Some(true) {
-        return body.clone();
+    if doc.get("stream").and_then(|s| s.as_bool()) != Some(true) {
+        return original.clone();
     }
-    let already = v
+    let already = doc
         .pointer("/stream_options/include_usage")
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
     if already {
-        return body.clone();
+        return original.clone();
     }
-    if !v
+    if !doc
         .get("stream_options")
         .map(|s| s.is_object())
         .unwrap_or(false)
     {
-        v["stream_options"] = serde_json::json!({});
+        doc["stream_options"] = serde_json::json!({});
     }
-    v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
-    match serde_json::to_vec(&v) {
+    doc["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
+    match serde_json::to_vec(doc) {
         Ok(b) => Bytes::from(b),
-        Err(_) => body.clone(),
+        Err(_) => original.clone(),
     }
 }
 
@@ -646,21 +701,26 @@ pub async fn handle_chat<A: Adapter + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let messages = match messages_from(&body) {
-        Some(m) => m,
-        None => {
-            return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
-        }
+    // One parse of the request body. The same document serves session
+    // planning (flattened messages), the canonical ledger (the as-forwarded
+    // `messages` value), and usage injection (which mutates it before the
+    // forwarded bytes are serialized from it).
+    let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
     };
-    let model = model_from(&body);
+    let Some(messages) = messages_from_doc(&doc) else {
+        return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
+    };
+    let model = model_from_doc(&doc);
 
     let plan = {
         let mut guard = state.sessions.lock();
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
-    // Forward first. The request body is passed through untouched; auth and
-    // provider-identification headers are forwarded so cloud keys keep working.
+    // Forward first. The request body is passed through untouched unless
+    // usage injection applies; auth and provider-identification headers are
+    // forwarded so cloud keys keep working.
     let url = upstream_chat_url(&state.upstream_url);
     // vLLM exposes no per-request cache figure in the response; the only
     // measurement is the delta of its `/metrics` counters across the request.
@@ -685,7 +745,14 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Only the OpenAI dialect understands `stream_options`; Anthropic's
     // Messages API would reject it, so never inject there.
     let inject = state.inject_usage && matches!(state.adapter.name(), "openai" | "vllm");
-    let upstream = match req.body(with_usage_requested(&body, inject)).send().await {
+    let forwarded = with_usage_requested(&mut doc, &body, inject);
+    // The ledger remembers the messages exactly as forwarded — after any
+    // injection, byte-for-byte the `messages` the provider received.
+    let as_sent_messages = doc
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let upstream = match req.body(forwarded).send().await {
         Ok(r) => r,
         Err(e) => {
             let record = build_record(
@@ -720,6 +787,8 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // handed to the observer, which never blocks the forward path.
     let adapter = state.adapter.clone();
     let sessions = state.sessions.clone();
+    let ledger = state.ledger.clone();
+    let dialect = Dialect::from_backend(state.adapter.name());
     let rates = state.rates.clone();
     let stream = async_stream::stream! {
         // The finalizer records exactly once, whichever comes first: the end of
@@ -728,12 +797,14 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // plain tail after the loop would never run on disconnect, losing the
         // turn entirely; the guard's Drop finalizes it as Incomplete instead.
         let mut fin = Finalizer {
-            observer: StreamObserver::new(),
+            observer: StreamObserver::for_dialect(dialect),
             plan,
             adapter,
             model,
             rates,
             sessions,
+            ledger,
+            as_sent_messages,
             complete: true,
             done: false,
             metrics,
@@ -762,10 +833,10 @@ pub async fn handle_chat<A: Adapter + 'static>(
         .unwrap()
 }
 
-/// Extract messages from an OpenAI-dialect request body. Dialect-neutral output.
-fn messages_from(body: &[u8]) -> Option<Vec<Message>> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let arr = v.get("messages")?.as_array()?;
+/// Extract messages from an already-parsed OpenAI-dialect request body.
+/// Dialect-neutral output.
+fn messages_from_doc(doc: &serde_json::Value) -> Option<Vec<Message>> {
+    let arr = doc.get("messages")?.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
     for m in arr {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -778,11 +849,12 @@ fn messages_from(body: &[u8]) -> Option<Vec<Message>> {
     Some(out)
 }
 
-/// Extract the model name from a request body (for rate lookup).
-fn model_from(body: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+/// Extract the model name from an already-parsed request body (for rate
+/// lookup and the ledger's per-model chain).
+fn model_from_doc(doc: &serde_json::Value) -> String {
+    doc.get("model")
+        .and_then(|m| m.as_str())
+        .map(String::from)
         .unwrap_or_default()
 }
 
@@ -840,24 +912,41 @@ mod tests {
 
     #[test]
     fn usage_is_requested_on_openai_streaming_only() {
-        let stream = Bytes::from_static(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
-        let out: serde_json::Value =
-            serde_json::from_slice(&with_usage_requested(&stream, true)).unwrap();
-        assert_eq!(out["stream_options"]["include_usage"], true);
+        let run = |body: &'static [u8], inject: bool| {
+            let bytes = Bytes::from_static(body);
+            let mut doc: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let out = with_usage_requested(&mut doc, &bytes, inject);
+            (out, doc)
+        };
+        let (out, doc) = run(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#, true);
+        assert_eq!(doc["stream_options"]["include_usage"], true);
+        let reparsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(reparsed["stream_options"]["include_usage"], true);
+        // Injection preserves the rest of the document's key order.
+        assert_eq!(out.to_vec(), br#"{"model":"gpt-4o","stream":true,"messages":[],"stream_options":{"include_usage":true}}"#.to_vec());
 
         // Non-streaming untouched.
         let nonstream = Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#);
-        let out = with_usage_requested(&nonstream, true);
+        let out = with_usage_requested(
+            &mut serde_json::from_slice(&nonstream).unwrap(),
+            &nonstream,
+            true,
+        );
         assert_eq!(&out[..], &nonstream[..]);
 
         // Opt-out untouched.
-        let out = with_usage_requested(&stream, false);
+        let stream = Bytes::from_static(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+        let out = with_usage_requested(
+            &mut serde_json::from_slice(&stream).unwrap(),
+            &stream,
+            false,
+        );
         assert_eq!(&out[..], &stream[..]);
 
         // Already opted in: unchanged, not duplicated.
         let opted =
             Bytes::from_static(br#"{"stream":true,"stream_options":{"include_usage":true}}"#);
-        let out = with_usage_requested(&opted, true);
+        let out = with_usage_requested(&mut serde_json::from_slice(&opted).unwrap(), &opted, true);
         assert_eq!(&out[..], &opted[..]);
     }
 
@@ -902,6 +991,7 @@ mod tests {
             turn: 1,
             resent_history_tokens: 1550,
             broke_prefix: false,
+            prefix_hashes: Vec::new(),
         };
         let obs = Observation {
             ttft_ms: Some(120.0),
@@ -944,6 +1034,7 @@ mod tests {
             turn: 2,
             resent_history_tokens: 1810,
             broke_prefix: false,
+            prefix_hashes: Vec::new(),
         };
         let mut o = StreamObserver::new();
         o.on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
@@ -1021,6 +1112,7 @@ mod tests {
             turn: 1,
             resent_history_tokens: 2000,
             broke_prefix: false,
+            prefix_hashes: Vec::new(),
         };
         let mut o = StreamObserver::new();
         o.on_chunk(
@@ -1099,7 +1191,8 @@ mod tests {
             {"role":"system","content":"sys"},
             {"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}
         ]}"#;
-        let msgs = messages_from(body).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let msgs = messages_from_doc(&doc).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text, "sys");
         assert_eq!(msgs[1].text, "ab");
