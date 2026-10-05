@@ -18,21 +18,25 @@
 //! request already carries on tool definitions, which are left alone and
 //! counted toward it.
 //!
-//! Two rules keep it honest:
-//!
-//! - **Client management is respected.** A request that carries MORE
-//!   breakpoints than the proxy placed last turn is client-managed: it
-//!   passes through untouched, unless `--force-breakpoints`. The ledger
-//!   remembers the count the proxy as-sent, so a compliant client echoing
-//!   those bytes back never exceeds it — echoed placements are recognized
-//!   as ours and simply re-derived, which is also what makes management
-//!   idempotent.
-//! - **Never duplicate.** Placement starts from a strip of existing hints
-//!   in `system`/`messages`, so a block never carries two markers.
+//! Whose breakpoints are whose — the decline rule. The proxy only ever
+//! writes bare `{"type": "ephemeral"}` markers, on a system last block or
+//! a user message's last suitable block. A request whose hints are all of
+//! that shape, and no more of them than the proxy placed last turn (the
+//! ledger remembers the count it as-sent), reads as an echo of its own
+//! work and is re-derived — which is what makes management idempotent and
+//! lets stale echoed placements step forward. Anything else — a hint with
+//! a `ttl`, a hint on an assistant message, one deeper in history than the
+//! proxy would place, more than the proxy ever placed — is the client
+//! managing its own breakpoints and passes through untouched, unless
+//! `--force-breakpoints`. Placement always starts from a strip of
+//! existing hints in `system`/`messages`, so a block never carries two
+//! markers.
 //!
 //! Breakpoints are cache hints, not content: the repair match model
 //! ignores `cache_control` entirely (see `crate::repair`), so a client
-//! echoing a stale placement is drift-free, never "repaired".
+//! echoing a stale placement is drift-free, never "repaired" — and a
+//! rewritten element never inherits the canonical side's hints (they are
+//! re-derived here, or the client's own).
 
 use serde_json::Value;
 
@@ -43,7 +47,7 @@ const LIMIT: usize = 4;
 /// the fourth slot).
 const USER_BLOCKS: usize = 3;
 
-/// The hint the provider understands; ephemeral is the documented default.
+/// The marker the proxy places — the documented default hint.
 fn ephemeral() -> Value {
     serde_json::json!({"type": "ephemeral"})
 }
@@ -58,68 +62,143 @@ fn is_hint(block: &Value) -> bool {
     })
 }
 
-/// Count the cache hints in a request document, everywhere they occur:
-/// on content blocks (an object naming a `type`), and on tool definitions
-/// (inside `tools`, where the objects carry no `type` of their own).
+/// Whether a hint value is exactly what the proxy writes. Anything richer
+/// (a `ttl`, an extension field) is a client's own policy.
+fn is_ours(cc: &Value) -> bool {
+    *cc == ephemeral()
+}
+
+/// What the client's request carries, for the decline decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Survey {
+    /// Hints in `system`/`messages` — the growing-prefix placements this
+    /// feature manages. Tool-definition hints are excluded: static, and
+    /// never the proxy's to move.
+    pub managing: usize,
+    /// True when any of those hints is one the proxy's rule would never
+    /// place: not a bare `{"type": "ephemeral"}`, on an assistant
+    /// message, or on a system block other than the last.
+    pub foreign: bool,
+}
+
+/// Read the request's hint placement: how many hints sit where this
+/// feature manages them, and whether any has a shape the proxy would
+/// never produce.
+pub fn survey(doc: &Value) -> Survey {
+    let mut s = Survey::default();
+    // System: only the last block is ever ours.
+    if let Some(Value::Array(blocks)) = doc.get("system") {
+        for (i, block) in blocks.iter().enumerate() {
+            if let Some(cc) = hint_value(block) {
+                s.managing += 1;
+                if i + 1 != blocks.len() || !is_ours(cc) {
+                    s.foreign = true;
+                }
+            }
+        }
+    }
+    // Messages: only user-role content is ever ours.
+    if let Some(Value::Array(messages)) = doc.get("messages") {
+        for msg in messages {
+            let role = msg.get("role").and_then(Value::as_str);
+            each_hint(msg, &mut |cc| {
+                s.managing += 1;
+                if role != Some("user") || !is_ours(cc) {
+                    s.foreign = true;
+                }
+            });
+        }
+    }
+    s
+}
+
+/// The object-valued `cache_control` of a typed block, if it is a hint.
+fn hint_value(block: &Value) -> Option<&Value> {
+    let map = block.as_object()?;
+    if !map.contains_key("type") {
+        return None;
+    }
+    map.get("cache_control").filter(|cc| cc.is_object())
+}
+
+/// Call `f` with the hint value of every typed content block in `v`.
+fn each_hint<F: FnMut(&Value)>(v: &Value, f: &mut F) {
+    match v {
+        Value::Object(map) => {
+            if let Some(cc) = hint_value(v) {
+                f(cc);
+            }
+            for (_, val) in map {
+                each_hint(val, f);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                each_hint(item, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Count the cache hints in a request document: content-block hints
+/// everywhere outside the `tools` subtree, plus each tool definition's
+/// own hint (tool objects carry no `type`, but their hints count against
+/// the provider limit; payload keys nested deeper are not hints).
 pub fn count(doc: &Value) -> usize {
-    fn walk(v: &Value, in_tools: bool) -> usize {
+    fn walk(v: &Value) -> usize {
         match v {
             Value::Object(map) => {
-                let hint = if in_tools {
-                    map.get("cache_control").is_some_and(Value::is_object)
-                } else {
-                    is_hint(v)
-                };
-                usize::from(hint)
-                    + map
-                        .iter()
-                        .map(|(k, val)| walk(val, in_tools || k == "tools"))
-                        .sum::<usize>()
+                usize::from(is_hint(v)) + map.iter().map(|(_, val)| walk(val)).sum::<usize>()
             }
-            Value::Array(items) => items.iter().map(|i| walk(i, in_tools)).sum(),
+            Value::Array(items) => items.iter().map(walk).sum(),
             _ => 0,
         }
     }
-    walk(doc, false)
+    let mut n = 0;
+    if let Value::Object(map) = doc {
+        for (k, val) in map {
+            if k != "tools" {
+                n += walk(val);
+            }
+        }
+    }
+    if let Some(Value::Array(tools)) = doc.get("tools") {
+        n += tools
+            .iter()
+            .filter(|t| t.get("cache_control").is_some_and(Value::is_object))
+            .count();
+    }
+    n
 }
 
 /// The outcome of one management pass over a request document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Managed {
-    /// The request carried client-authored breakpoints (more than the
-    /// proxy ever placed on this conversation): left untouched. Only
-    /// `--force-breakpoints` overrides.
+    /// The request carries client-authored breakpoints: left untouched,
+    /// per `--manage-breakpoints` without `--force-breakpoints`.
     pub declined: bool,
     /// Breakpoints in the request as it now stands, everywhere they occur.
     pub total: usize,
 }
 
 /// Manage breakpoints on an Anthropic-dialect request document.
-///
-/// `client_placed` counts the hints the client's request carried;
 /// `ours_last_turn` is what the proxy placed on the previous as-sent
-/// request of this session+model (the ledger's count). Echoed-back proxy
-/// placements never exceed that count, so anything above it is the
-/// client's own management.
-pub fn manage(
-    doc: &mut Value,
-    force: bool,
-    client_placed: usize,
-    ours_last_turn: usize,
-) -> Managed {
-    if client_placed > ours_last_turn && !force {
+/// request of this session+model (the ledger's count).
+pub fn manage(doc: &mut Value, force: bool, survey: &Survey, ours_last_turn: usize) -> Managed {
+    if !force && (survey.foreign || survey.managing > ours_last_turn) {
         tracing::info!(
             target: "cachemax_breakpoints",
-            hints = client_placed,
+            hints = survey.managing,
             "client manages its own breakpoints; leaving them untouched"
         );
         return Managed {
             declined: true,
-            total: client_placed,
+            total: count(doc),
         };
     }
     strip(doc);
-    // Hints the proxy never places (tool definitions) still count against
+    // Tool-definition hints the proxy never places still count against
     // the provider's limit.
     let budget = LIMIT.saturating_sub(count(doc));
     place(doc, budget);
@@ -130,46 +209,50 @@ pub fn manage(
 }
 
 /// Strip cache hints from `system` and `messages` (never `tools`), in
-/// place. Returns how many were removed.
-fn strip(doc: &mut Value) -> usize {
-    fn walk(v: &mut Value) -> usize {
-        match v {
-            Value::Object(map) => {
-                let mut removed = 0;
-                // `is_hint`, read through the map (the object shape it checks).
-                if map.contains_key("type")
-                    && map.get("cache_control").is_some_and(Value::is_object)
-                {
-                    map.remove("cache_control");
-                    removed += 1;
-                }
-                for (_, val) in map.iter_mut() {
-                    removed += walk(val);
-                }
-                removed
-            }
-            Value::Array(items) => items.iter_mut().map(walk).sum(),
-            _ => 0,
-        }
-    }
-    let mut removed = 0;
+/// place.
+fn strip(doc: &mut Value) {
     for section in ["system", "messages"] {
         if let Some(section) = doc.get_mut(section) {
-            removed += walk(section);
+            strip_hints_in_place(section);
         }
     }
-    removed
+}
+
+/// Remove every content-block cache hint in `v`, recursively, in place.
+/// Shared with the repair rewriter, which must never let the canonical
+/// side's hints ride into a rewritten element.
+pub(crate) fn strip_hints_in_place(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if map.contains_key("type") {
+                if let Some(cc) = map.get("cache_control") {
+                    if cc.is_object() {
+                        map.remove("cache_control");
+                    }
+                }
+            }
+            for (_, val) in map.iter_mut() {
+                strip_hints_in_place(val);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_hints_in_place(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Place breakpoints per the incremental guidance, within `budget`.
-/// Returns how many were placed.
-fn place(doc: &mut Value, budget: usize) -> usize {
+fn place(doc: &mut Value, budget: usize) {
     let mut placed = 0;
     if budget == 0 {
-        return 0;
+        return;
     }
     // The last system block; a plain-string system becomes block form so it
-    // can carry the hint at all.
+    // can carry the hint at all. A non-object block (or a null) is not a
+    // placeable block — skipped, never coerced.
     if let Some(system) = doc.get_mut("system") {
         let as_string = system.as_str().map(str::to_string);
         if let Some(s) = as_string {
@@ -179,7 +262,11 @@ fn place(doc: &mut Value, budget: usize) -> usize {
                 ]);
                 placed += 1;
             }
-        } else if let Some(last) = system.as_array_mut().and_then(|b| b.last_mut()) {
+        } else if let Some(last) = system
+            .as_array_mut()
+            .and_then(|b| b.last_mut())
+            .filter(|b| b.is_object())
+        {
             // Key presence, not object-ness: a block whose `cache_control`
             // holds something else carries payload, never a hint.
             if last.get("cache_control").is_none() {
@@ -231,7 +318,6 @@ fn place(doc: &mut Value, budget: usize) -> usize {
             }
         }
     }
-    placed
 }
 
 #[cfg(test)]
@@ -247,7 +333,7 @@ mod tests {
         json!({"role": "assistant", "content": [{"type": "text", "text": text}]})
     }
 
-    /// The message indices whose content carries a hint, in order.
+    /// The message indices whose content carries a cache hint, in order.
     fn hinted_messages(doc: &Value) -> Vec<usize> {
         doc["messages"]
             .as_array()
@@ -263,6 +349,12 @@ mod tests {
             .collect()
     }
 
+    /// Manage a fresh document (nothing ours last turn).
+    fn manage_fresh(doc: &mut Value, force: bool) -> Managed {
+        let s = survey(doc);
+        manage(doc, force, &s, 0)
+    }
+
     #[test]
     fn places_system_plus_last_three_user_blocks() {
         let mut doc = json!({
@@ -276,7 +368,7 @@ mod tests {
                 user("q5"),
             ],
         });
-        let m = manage(&mut doc, false, 0, 0);
+        let m = manage_fresh(&mut doc, false);
         assert!(!m.declined);
         assert_eq!(m.total, 4, "the provider limit");
         assert!(is_hint(&doc["system"][0]));
@@ -291,7 +383,7 @@ mod tests {
             "system": "be brief",
             "messages": [{"role": "user", "content": "hello"}],
         });
-        let m = manage(&mut doc, false, 0, 0);
+        let m = manage_fresh(&mut doc, false);
         assert_eq!(m.total, 2);
         assert_eq!(
             doc["system"],
@@ -301,6 +393,20 @@ mod tests {
             doc["messages"][0]["content"],
             json!([{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}])
         );
+    }
+
+    #[test]
+    fn a_non_object_system_block_is_skipped_not_panicked() {
+        // A nonstandard system array element must neither panic (IndexMut
+        // on a non-object) nor be coerced into a typeless block; the
+        // message side still gets its placements.
+        let mut doc = json!({
+            "system": ["be brief"],
+            "messages": [user("q1")],
+        });
+        let m = manage_fresh(&mut doc, false);
+        assert_eq!(doc["system"], json!(["be brief"]), "left as it came");
+        assert_eq!(m.total, 1, "only the user block");
     }
 
     #[test]
@@ -316,7 +422,7 @@ mod tests {
                 ]}),
             ],
         });
-        let m = manage(&mut doc, false, 0, 0);
+        let m = manage_fresh(&mut doc, false);
         assert_eq!(m.total, 2, "q1 and the tool result");
         assert!(is_hint(&doc["messages"][2]["content"][0]));
         assert!(
@@ -326,24 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn never_exceeds_the_limit_with_tool_hints_present() {
+    fn tool_definition_hints_are_budget_not_decline() {
         // Tool-definition hints carry no `type` of their own but count
-        // against the provider limit all the same. The ledger's count
-        // includes them (the request went out carrying them), so an echo
-        // is recognized; a fresh conversation is not.
-        let mut doc = json!({
-            "tools": [
-                {"name": "f", "description": "d", "input_schema": {},
-                 "cache_control": {"type": "ephemeral"}},
-                {"name": "g", "description": "d", "input_schema": {},
-                 "cache_control": {"type": "ephemeral"}},
-            ],
-            "messages": [user("q1"), assistant("a1"), user("q2")],
-        });
-        // Unknown hints on a fresh conversation: client-managed, declined.
-        let m = manage(&mut doc, false, 2, 0);
-        assert!(m.declined);
-        // Echoed (ours last turn carried them): re-derived within budget.
+        // against the provider limit. They are not "management" — a
+        // client hinting its tools from turn 0 still gets its message
+        // breakpoints managed within the remaining budget.
         let tools = json!([
             {"name": "f", "description": "d", "input_schema": {},
              "cache_control": {"type": "ephemeral"}},
@@ -354,8 +447,8 @@ mod tests {
             "tools": tools.clone(),
             "messages": [user("q1"), assistant("a1"), user("q2")],
         });
-        let m = manage(&mut doc, false, 2, 2);
-        assert!(!m.declined);
+        let m = manage_fresh(&mut doc, false);
+        assert!(!m.declined, "tool hints alone never decline");
         // 2 tool hints leave budget 2: both user blocks, exactly at the
         // provider limit.
         assert_eq!(m.total, 4, "tools kept + budget-respecting placements");
@@ -364,15 +457,37 @@ mod tests {
     }
 
     #[test]
+    fn nested_tool_payload_keys_are_not_hints() {
+        // A `cache_control` key buried in a tool's schema is payload: it
+        // counts neither toward the limit nor the survey.
+        let mut doc = json!({
+            "tools": [{
+                "name": "f", "description": "d",
+                "input_schema": {"cache_control": {"doc": "payload"}},
+            }],
+            "messages": [user("q1"), assistant("a1"), user("q2"), assistant("a2"), user("q3")],
+        });
+        assert_eq!(count(&doc), 0, "no real hints anywhere yet");
+        let s = survey(&doc);
+        assert_eq!((s.managing, s.foreign), (0, false));
+        let m = manage_fresh(&mut doc, false);
+        assert!(!m.declined);
+        assert_eq!(m.total, 3, "full placement: the payload key cost nothing");
+    }
+
+    #[test]
     fn management_is_idempotent() {
         let mut doc = json!({
             "system": [{"type": "text", "text": "be brief"}],
             "messages": [user("q1"), assistant("a1"), user("q2")],
         });
-        let first = manage(&mut doc, false, 0, 0);
+        let first = manage_fresh(&mut doc, false);
         let snapshot = doc.clone();
-        // The client echoes exactly what went out: same count, no extras.
-        let second = manage(&mut doc, false, first.total, first.total);
+        // The client echoes exactly what went out: same hints, same shapes.
+        let second = {
+            let s = survey(&doc);
+            manage(&mut doc, false, &s, first.total)
+        };
         assert!(!second.declined, "echoed placements are ours, re-derived");
         assert_eq!(second.total, first.total);
         assert_eq!(doc, snapshot, "strip + re-place lands on the same bytes");
@@ -397,8 +512,11 @@ mod tests {
                 user("q4"),
             ],
         });
-        let m = manage(&mut doc, false, 1, 1);
-        assert!(!m.declined);
+        let m = {
+            let s = survey(&doc);
+            manage(&mut doc, false, &s, 1)
+        };
+        assert!(!m.declined, "a stale echo within the count is still ours");
         assert_eq!(
             hinted_messages(&doc),
             vec![2, 4, 6],
@@ -407,23 +525,89 @@ mod tests {
     }
 
     #[test]
-    fn client_managed_breakpoints_are_respected() {
+    fn assistant_block_hints_are_client_managed() {
+        // The proxy never hints assistant content; a client that does is
+        // managing, and passes through untouched.
+        let mut doc = json!({
+            "system": [{"type": "text", "text": "be brief"}],
+            "messages": [
+                user("q1"),
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "a1", "cache_control": {"type": "ephemeral"}},
+                ]},
+            ],
+        });
+        let snapshot = doc.clone();
+        let m = manage_fresh(&mut doc, false);
+        assert!(m.declined);
+        assert_eq!(doc, snapshot, "not one byte touched");
+    }
+
+    #[test]
+    fn ttl_hints_are_client_managed() {
+        // A hint richer than the bare marker (a ttl) is the client's own
+        // retention policy, never something to strip or replace.
         let mut doc = json!({
             "system": [{"type": "text", "text": "be brief"}],
             "messages": [
                 {"role": "user", "content": [
-                    {"type": "text", "text": "q1", "cache_control": {"type": "ephemeral"}},
-                    {"type": "text", "text": "extra", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "q1",
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}},
                 ]},
-                user("q2"),
             ],
         });
         let snapshot = doc.clone();
-        // Two client-authored hints, none of them ours last turn.
-        let m = manage(&mut doc, false, 2, 0);
+        let m = manage_fresh(&mut doc, false);
         assert!(m.declined);
-        assert_eq!(m.total, 2);
-        assert_eq!(doc, snapshot, "not one byte touched");
+        assert_eq!(doc, snapshot, "the client's ttl hint survives verbatim");
+    }
+
+    #[test]
+    fn non_last_system_block_hints_are_client_managed() {
+        let mut doc = json!({
+            "system": [
+                {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "last"},
+            ],
+            "messages": [user("q1")],
+        });
+        let snapshot = doc.clone();
+        let m = manage_fresh(&mut doc, false);
+        assert!(m.declined, "only the LAST system block is ever ours");
+        assert_eq!(doc, snapshot);
+    }
+
+    #[test]
+    fn more_hints_than_we_ever_placed_is_client_managed() {
+        // Shapes are ours, count is beyond anything the proxy placed:
+        // the client is stepping its own breakpoints.
+        let mut doc = json!({
+            "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "q1", "cache_control": {"type": "ephemeral"}},
+                ]},
+                assistant("a1"),
+                {"role": "user", "content": [
+                    {"type": "text", "text": "q2", "cache_control": {"type": "ephemeral"}},
+                ]},
+                assistant("a2"),
+                {"role": "user", "content": [
+                    {"type": "text", "text": "q3", "cache_control": {"type": "ephemeral"}},
+                ]},
+                assistant("a3"),
+                {"role": "user", "content": [
+                    {"type": "text", "text": "q4", "cache_control": {"type": "ephemeral"}},
+                ]},
+            ],
+        });
+        let snapshot = doc.clone();
+        let m = {
+            let s = survey(&doc);
+            manage(&mut doc, false, &s, 4)
+        };
+        assert!(m.declined, "five bare hints where four is our maximum");
+        assert_eq!(doc, snapshot);
     }
 
     #[test]
@@ -432,16 +616,21 @@ mod tests {
             "system": [{"type": "text", "text": "be brief"}],
             "messages": [
                 {"role": "user", "content": [
-                    {"type": "text", "text": "q1", "cache_control": {"type": "ephemeral"}},
-                    {"type": "text", "text": "extra", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "q1",
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}},
                 ]},
                 user("q2"),
             ],
         });
-        let m = manage(&mut doc, true, 2, 0);
+        let m = manage_fresh(&mut doc, true);
         assert!(!m.declined);
         assert_eq!(m.total, 3, "system + both user blocks, re-derived");
         assert_eq!(hinted_messages(&doc), vec![0, 1]);
+        assert_eq!(
+            doc["messages"][0]["content"][0]["cache_control"],
+            ephemeral(),
+            "the client's ttl hint is replaced by the bare marker"
+        );
     }
 
     #[test]
@@ -458,7 +647,7 @@ mod tests {
             ],
         });
         assert_eq!(count(&doc), 0);
-        let m = manage(&mut doc, false, 0, 0);
+        let m = manage_fresh(&mut doc, false);
         assert!(!m.declined);
         assert_eq!(
             doc["messages"][0]["content"][0]["cache_control"], "not-a-hint",
@@ -476,7 +665,7 @@ mod tests {
             "system": "",
             "messages": [{"role": "user", "content": ""}],
         });
-        let m = manage(&mut doc, false, 0, 0);
+        let m = manage_fresh(&mut doc, false);
         assert_eq!(m.total, 0);
         assert_eq!(doc["system"], "", "nothing to place a hint on");
     }

@@ -347,11 +347,15 @@ pub fn apply_canonical(
             break;
         };
         // Recompute the relation: only equivalent-but-not-exact elements are
-        // replaced, and only with the byte-stable canonical form.
+        // replaced, and only with the byte-stable canonical form — its
+        // content, never its cache hints. Hints are placement policy:
+        // breakpoint management re-derives them, and under a client-managed
+        // request, inheriting the canonical side's would push the total
+        // past the provider's limit.
         match relation(element, canonical_element) {
             Rel::Equivalent(_) => {
                 tokens += tokens_of(tokenizer, std::slice::from_ref(canonical_element));
-                *element = canonical_element.clone();
+                *element = strip_cache_control(canonical_element).into_owned();
                 replaced += 1;
             }
             Rel::Exact | Rel::Different => {}
@@ -423,54 +427,26 @@ fn relation(a: &Value, b: &Value) -> Rel {
 
 /// A copy of `v` with content-block cache hints removed — an object that
 /// names a `type` and carries an object-valued `cache_control`. Borrowed
-/// when there is nothing to strip, so hint-free requests pay no allocation.
+/// when there is nothing to strip, so hint-free requests pay no
+/// allocation. The in-place walk lives in [`crate::breakpoints`]; one
+/// predicate, one home.
 fn strip_cache_control(v: &Value) -> std::borrow::Cow<'_, Value> {
-    match v {
-        Value::Object(map) => {
-            let mut out: Option<Map<String, Value>> = None;
-            for (k, val) in map {
-                if k == "cache_control" && map.contains_key("type") && val.is_object() {
-                    out.get_or_insert_with(|| map.clone()).remove(k);
-                    continue;
-                }
-                match strip_cache_control(val) {
-                    std::borrow::Cow::Borrowed(b) => {
-                        if let Some(o) = &mut out {
-                            o.insert(k.clone(), b.clone());
-                        }
-                    }
-                    std::borrow::Cow::Owned(s) => {
-                        out.get_or_insert_with(|| map.clone()).insert(k.clone(), s);
-                    }
-                }
-            }
-            match out {
-                Some(o) => std::borrow::Cow::Owned(Value::Object(o)),
-                None => std::borrow::Cow::Borrowed(v),
-            }
+    fn carries_hint(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => is_hint_shaped(map) || map.values().any(carries_hint),
+            Value::Array(items) => items.iter().any(carries_hint),
+            _ => false,
         }
-        Value::Array(items) => {
-            let mut out: Option<Vec<Value>> = None;
-            for (i, item) in items.iter().enumerate() {
-                match strip_cache_control(item) {
-                    std::borrow::Cow::Borrowed(_) => {
-                        if let Some(o) = &mut out {
-                            o.push(item.clone());
-                        }
-                    }
-                    std::borrow::Cow::Owned(s) => {
-                        let o = out.get_or_insert_with(|| items[..i].to_vec());
-                        o.push(s);
-                    }
-                }
-            }
-            match out {
-                Some(o) => std::borrow::Cow::Owned(Value::Array(o)),
-                None => std::borrow::Cow::Borrowed(v),
-            }
-        }
-        _ => std::borrow::Cow::Borrowed(v),
     }
+    fn is_hint_shaped(map: &serde_json::Map<String, Value>) -> bool {
+        map.contains_key("type") && map.get("cache_control").is_some_and(Value::is_object)
+    }
+    if !carries_hint(v) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    let mut owned = v.clone();
+    crate::breakpoints::strip_hints_in_place(&mut owned);
+    std::borrow::Cow::Owned(owned)
 }
 
 /// Rewrite every tool-call `arguments` string as its parsed JSON value, so
@@ -1139,5 +1115,50 @@ mod tests {
         })];
         let c = classify(&client, &canonical);
         assert_eq!(c.semantic_break, Some(0));
+    }
+
+    #[test]
+    fn a_rewrite_never_inherits_the_canonical_side_hints() {
+        // The chain's element carries the proxy's breakpoints; the drifted
+        // re-send is rewritten to its content, hint-free. Hints are
+        // placement policy — re-derived by breakpoint management or the
+        // client's own — and a rewrite smuggling them in could push a
+        // client-managed request past the provider's block limit.
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "Please  summarize",
+             "cache_control": {"type": "ephemeral"}},
+        ]})];
+        let mut client = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "Please summarize"},
+        ]})];
+        let c = classify(&client, &canonical);
+        let rw = apply_canonical(&mut client, &c, &canonical, &tok()).unwrap();
+        assert_eq!(rw.elements_replaced, 1);
+        assert_eq!(
+            client[0]["content"][0]["text"], "Please  summarize",
+            "the canonical content went in"
+        );
+        assert!(
+            client[0]["content"][0].get("cache_control").is_none(),
+            "the canonical side's hint did not"
+        );
+    }
+
+    #[test]
+    fn hint_ttl_differences_are_not_content() {
+        // A ttl changes retention policy, not the cached prefix's content;
+        // the match model ignores hints entirely, so this is an exact
+        // match. (Under --manage-breakpoints, ttl hints read as
+        // client-managed and pass through untouched — see
+        // crate::breakpoints.)
+        let canonical = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+        ]})];
+        let client = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        ]})];
+        let c = classify(&client, &canonical);
+        assert!(c.report_matches);
+        assert_eq!(c.tokens_at_risk, 0);
     }
 }

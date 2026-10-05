@@ -781,10 +781,6 @@ pub async fn handle_chat<A: Adapter + 'static>(
         return (StatusCode::BAD_REQUEST, "could not parse messages").into_response();
     };
     let model = model_from_doc(&doc);
-    // Counted before any proxy mutation: what the CLIENT carried. Breakpoint
-    // management compares this against what the proxy placed last turn to
-    // tell client-authored hints from its own echoed back.
-    let client_breakpoints = crate::breakpoints::count(&doc);
 
     let mut plan = {
         let mut guard = state.sessions.lock();
@@ -893,6 +889,9 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // client-managed. Other backends never take this path.
     let breakpoints =
         (state.manage_breakpoints && state.adapter.name() == "anthropic").then(|| {
+            // Surveyed before the stage's own mutations: what the CLIENT
+            // carried, in the shapes and positions that say whose it is.
+            let survey = crate::breakpoints::survey(&doc);
             let ours_last_turn = state
                 .ledger
                 .lock()
@@ -901,7 +900,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             crate::breakpoints::manage(
                 &mut doc,
                 state.force_breakpoints,
-                client_breakpoints,
+                &survey,
                 ours_last_turn as usize,
             )
         });

@@ -23,6 +23,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -346,6 +347,91 @@ async fn management_composes_with_repair() {
         Some(cachemax::repair::DriftKind::TextNormalization)
     );
     assert_eq!(record.breakpoint_count, Some(3));
+}
+
+#[tokio::test]
+async fn a_drifted_rewrite_never_leaks_our_hints_into_a_client_managed_request() {
+    // The composition the scalar rules got wrong: the client drifts its
+    // history AND manages its own hints (here: an assistant-block hint
+    // with a ttl — shapes the proxy never writes). Repair rewrites the
+    // drifted element to canonical content; those replacements must not
+    // carry the chain's hints, or the declined pass-through would forward
+    // more hints than the provider's 4-block limit accepts.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On, true, false).await;
+
+    // Turn 0: the proxy places its hints (system + the user block).
+    let turn0 = serde_json::json!({
+        "model": "claude-3",
+        "system": [{"type": "text", "text": "be brief"}],
+        "messages": [user("Please  summarize")],
+    });
+    send(&rig, &turn0).await;
+    last_record(&rig, 1).await;
+
+    // Turn 1: whitespace-drifted history in the client's own serialization
+    // (no echoed hints) plus its own ttl hint on the assistant block.
+    let chain = rig
+        .ledger
+        .lock()
+        .canonical_messages(1, "claude-3")
+        .expect("turn 0 is canonical");
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": [{"type": "text", "text": "Please summarize"}],
+    })];
+    let mut hinted_assistant = chain[1].clone();
+    hinted_assistant["content"][0]["cache_control"] =
+        serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    messages.push(hinted_assistant);
+    messages.push(user("Now  more"));
+    let turn1 = serde_json::json!({
+        "model": "claude-3",
+        "system": [{"type": "text", "text": "be brief"}],
+        "messages": messages,
+    });
+    send(&rig, &turn1).await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent1: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    // Repair canonicalized the drifted element — content only.
+    assert_eq!(
+        sent1["messages"][0]["content"][0]["text"],
+        "Please  summarize"
+    );
+    assert!(record.repaired);
+    // The client's own hint survived verbatim (ttl included)…
+    assert_eq!(
+        sent1["messages"][1]["content"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+    );
+    // …the client's own hint survived verbatim (ttl included), nothing was
+    // placed alongside it (declined), and nothing leaked in: one hint in
+    // the whole document, the client's.
+    assert_eq!(cachemax::breakpoints::count(&sent1), 1);
+    assert_eq!(hinted_messages(&sent1), vec![1]);
+    assert!(!system_hinted(&sent1));
+    assert_eq!(record.breakpoint_count, Some(1));
+    // The drifted re-send forked the session store; the declined turn is
+    // the fork's turn 0, and it claims none of the client's hints as ours.
+    assert_eq!(
+        rig.ledger
+            .lock()
+            .last_turn(2, "claude-3")
+            .map(|t| t.breakpoints),
+        Some(0),
+        "a declined turn claims none of the client's hints as ours"
+    );
+    assert_eq!(
+        rig.ledger
+            .lock()
+            .last_turn(1, "claude-3")
+            .map(|t| t.breakpoints),
+        Some(2),
+        "turn 0's placements stay recorded"
+    );
 }
 
 #[tokio::test]
