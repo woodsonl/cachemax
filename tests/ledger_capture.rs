@@ -248,6 +248,113 @@ async fn an_incomplete_turn_never_enters_the_chain() {
 }
 
 #[tokio::test]
+async fn an_anthropic_dialect_turn_is_captured_end_to_end() {
+    // The router must select the response dialect from the backend adapter;
+    // if it regressed to always-OpenAi, Anthropic capture would silently go
+    // empty and later repair would pass everything through untouched.
+    use cachemax::adapters::anthropic::AnthropicAdapter;
+
+    let events: Vec<Bytes> = vec![
+        Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n"),
+        Bytes::from_static(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"),
+        Bytes::from_static(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Salut\"}}\n\n"),
+        Bytes::from_static(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"),
+        Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+    ];
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let events = events.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    for e in events {
+                        yield Ok::<Bytes, std::io::Error>(e);
+                    }
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let ledger = Arc::new(SharedLedger::new());
+    let state = Arc::new(proxy::AppState {
+        adapter: Arc::new(AnthropicAdapter),
+        tokenizer: Tokenizer::default_encoder().unwrap(),
+        sessions: Arc::new(SharedSessions::new()),
+        ledger: ledger.clone(),
+        rates: cachemax::rates::Rates::builtin(),
+        upstream_url: format!("http://{a}"),
+        client: reqwest::Client::new(),
+        inject_usage: true,
+    });
+    let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr = pl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(pl, proxy::router(state)).await.unwrap() });
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet",
+        "messages": [{"role": "user", "content": "Bonjour"}],
+    })
+    .to_string();
+    let _ = reqwest::Client::new()
+        .post(format!("http://{paddr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    await_ledger(&ledger, |l| l.last_turn(1, "claude-3-5-sonnet").is_some()).await;
+
+    let chain = ledger
+        .lock()
+        .canonical_messages(1, "claude-3-5-sonnet")
+        .unwrap();
+    assert_eq!(
+        chain[chain.len() - 1],
+        serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Salut"}]}),
+        "the Anthropic wire shape reassembled to the element a client re-sends"
+    );
+}
+
+#[tokio::test]
+async fn malformed_or_missing_messages_is_a_400_and_the_ledger_stays_empty() {
+    let upstream = json_upstream(serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "x"}}],
+    }))
+    .await;
+    let ledger = Arc::new(SharedLedger::new());
+    let proxy_url = boot(upstream, ledger.clone()).await;
+
+    for bad in [
+        Bytes::from_static(br#"{"model":"gpt-4o"}"#),
+        Bytes::from_static(br#"{"model":"gpt-4o","messages":"nope"}"#),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        ledger.lock().last_turn(1, "gpt-4o").is_none(),
+        "a rejected request must never reach the ledger"
+    );
+}
+
+#[tokio::test]
 async fn the_disk_ledger_persists_turns_across_a_restart() {
     let dir = std::env::temp_dir().join(format!(
         "cachemax-c1-disk-{}-{}",

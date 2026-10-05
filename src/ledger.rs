@@ -187,6 +187,12 @@ impl Ledger {
     /// Append one complete JSON line to the session's file. A single
     /// `write_all` of the full line keeps the file line-atomic under
     /// O_APPEND: a reader sees the whole line or none of it.
+    ///
+    /// Blocking IO, called synchronously from the finalize path: once per
+    /// turn, after the upstream stream has ended (or on disconnect, where
+    /// `Drop` cannot `await`), a single small append on local disk. A slow
+    /// disk delays that response's close, never its bytes; the client stream
+    /// itself is never touched by this write.
     fn flush_line(&self, session_id: u64, turn: &CanonicalTurn) {
         let Some(dir) = &self.dir else { return };
         let line = serde_json::to_vec(&LedgerLine {
@@ -1127,6 +1133,123 @@ mod tests {
         for openai_shaped in ["openai", "vllm", "llamacpp", "mlxlm"] {
             assert_eq!(Dialect::from_backend(openai_shaped), Dialect::OpenAi);
         }
+    }
+
+    #[test]
+    fn crlf_lines_and_data_without_space_reassemble() {
+        // SSE permits `data:` without the space and `\r\n` line endings; both
+        // tolerance branches must survive the assembler.
+        let events = [
+            r#"{"choices":[{"delta":{"role":"assistant","content":"a"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"b"}}]}"#,
+        ];
+        let mut a = ResponseAssembler::new(Dialect::OpenAi);
+        a.on_chunk(format!("data: {}\r\n\r\n", events[0]).as_bytes());
+        a.on_chunk(format!("data:{}\r\n", events[1]).as_bytes());
+        a.on_chunk(b"data: [DONE]\r\n\r\n");
+        assert_eq!(
+            a.finish(),
+            vec![json!({"role": "assistant", "content": "ab"})]
+        );
+    }
+
+    #[test]
+    fn multibyte_utf8_content_split_across_chunks_reassembles() {
+        // Chunk boundaries that cut a codepoint in half must still reassemble:
+        // lines are only ever split on `\n`, which never splits a codepoint,
+        // so a complete line is always valid UTF-8.
+        let payload = "héllo 🌍 ok";
+        let event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content": payload}}]})
+        );
+        for size in [1usize, 2, 5, 13] {
+            let mut a = ResponseAssembler::new(Dialect::OpenAi);
+            for chunk in event.as_bytes().chunks(size) {
+                a.on_chunk(chunk);
+            }
+            assert_eq!(
+                a.finish(),
+                vec![json!({"role": "assistant", "content": payload})],
+                "split size {size} must not corrupt multibyte content"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_messages_is_none_for_non_array_request_messages() {
+        // Via the proxy this cannot happen (the 400 gate runs first), but the
+        // ledger's contract is `None`, never a guessed chain.
+        let mut ledger = Ledger::in_memory();
+        let mut t = turn(0, "x");
+        t.request_messages = json!("not-an-array");
+        ledger.append(1, t);
+        assert!(ledger.canonical_messages(1, "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn reload_with_duplicate_turn_numbers_takes_the_last_line() {
+        let dir = temp_dir("dupturn");
+        let path = dir.join("9.jsonl");
+        let line = |marker: &str| {
+            serde_json::to_string(&LedgerLine {
+                session_id: 9,
+                turn: turn(4, marker),
+            })
+            .unwrap()
+        };
+        std::fs::write(&path, format!("{}\n{}\n", line("first"), line("second"))).unwrap();
+        let ledger = Ledger::on_disk(dir.clone()).unwrap();
+        let chain = ledger.canonical_messages(9, "gpt-4o").unwrap();
+        assert_eq!(
+            chain[0],
+            json!({"role": "user", "content": "second"}),
+            "the last line for a turn wins on reload"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_applies_the_session_cap() {
+        let dir = temp_dir("capreload");
+        for s in 1..=(SESSIONS_CAP as u64 + 6) {
+            let line = serde_json::to_string(&LedgerLine {
+                session_id: s,
+                turn: turn(0, "x"),
+            })
+            .unwrap();
+            std::fs::write(dir.join(format!("{s}.jsonl")), format!("{line}\n")).unwrap();
+        }
+        let ledger = Ledger::on_disk(dir.clone()).unwrap();
+        let surviving = (1..=(SESSIONS_CAP as u64 + 6))
+            .filter(|s| ledger.last_turn(*s, "gpt-4o").is_some())
+            .count();
+        assert_eq!(surviving, SESSIONS_CAP, "reload respects the memory bound");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_call_delta_without_index_merges_into_the_last_slot() {
+        // Real providers omit `index` on single-call streams after the first
+        // fragment; the fallback must continue the last slot, not drop the
+        // fragment or open a phantom one.
+        let mut a = ResponseAssembler::new(Dialect::OpenAi);
+        for ev in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"f","arguments":"{"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"}"}}]}}]}"#,
+        ] {
+            a.on_chunk(format!("data: {ev}\n\n").as_bytes());
+        }
+        assert_eq!(
+            a.finish(),
+            vec![json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+            })]
+        );
     }
 
     #[test]
