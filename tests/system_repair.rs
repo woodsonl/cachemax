@@ -509,3 +509,87 @@ async fn recorded_ttft_covers_the_upstream_wait() {
         record.ttft_ms
     );
 }
+
+#[tokio::test]
+async fn a_system_without_a_recorded_baseline_is_unexamined_not_matching() {
+    // A chain recorded before systems were captured carries no baseline:
+    // the next turn's system goes unexamined. The record must say so —
+    // `None`, not a whole-span match that covers a span never compared.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+    let mut messages = rig.ledger.lock().canonical_messages(1, "claude-3").unwrap();
+    messages.push(user("q2"));
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be terse.",
+            "messages": messages,
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent["system"], "Be terse.",
+        "the unexamined system forwards untouched"
+    );
+    assert!(!record.repaired);
+    assert_eq!(
+        record.matches_canonical, None,
+        "an unexamined span is not asserted as matching"
+    );
+}
+
+#[tokio::test]
+async fn a_known_message_mismatch_survives_an_unexamined_system() {
+    // Unexamined system plus PROVEN message drift: the mismatch is fact and
+    // must reach the dashboard (which renders drift on Some(false)) —
+    // downgrading it to None would hide a mismatch the classifier found.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+    let mut messages = rig.ledger.lock().canonical_messages(1, "claude-3").unwrap();
+    messages[0] = user("q  1"); // whitespace drift in the recorded turn itself
+    messages.push(user("q2"));
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be terse.",
+            "messages": messages,
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    assert!(!record.repaired);
+    assert_eq!(
+        record.matches_canonical,
+        Some(false),
+        "proven message drift is reported even with the system unexamined"
+    );
+}

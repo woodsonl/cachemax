@@ -84,6 +84,9 @@ pub struct Record {
     /// the re-sent history matches the canonical chain under semantic JSON
     /// equality (object key order is not drift; string leaves are). Some
     /// `false`: drift (see `drift_kind`) or an unrepairable hard stop.
+    /// `None` also when the top-level `system` had no recorded baseline to
+    /// examine (a chain from before systems were recorded): the claim covers
+    /// `messages` only, and an unexamined span is not asserted as matching.
     #[serde(default)]
     pub matches_canonical: Option<bool>,
     /// The classified flavor of the drift, when there was one.
