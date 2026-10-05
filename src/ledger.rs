@@ -94,6 +94,10 @@ pub struct Ledger {
     sessions: HashMap<u64, HashMap<String, CanonicalTurn>>,
     /// Session ids in first-append order, for eviction.
     order: Vec<u64>,
+    /// (session, model) pairs in append order, most recent last. Lets a
+    /// forked session (a truncated or re-based request) find the chain it
+    /// actually extends, keyed by model.
+    recent: Vec<(u64, String)>,
     dir: Option<PathBuf>,
 }
 
@@ -104,6 +108,7 @@ impl Ledger {
         Self {
             sessions: HashMap::new(),
             order: Vec::new(),
+            recent: Vec::new(),
             dir: None,
         }
     }
@@ -115,6 +120,7 @@ impl Ledger {
         let mut ledger = Self {
             sessions: HashMap::new(),
             order: Vec::new(),
+            recent: Vec::new(),
             dir: Some(dir.clone()),
         };
         std::fs::create_dir_all(&dir)?;
@@ -173,6 +179,9 @@ impl Ledger {
         if regresses {
             return false;
         }
+        self.recent
+            .retain(|(s, m)| *s != session_id || *m != turn.model);
+        self.recent.push((session_id, turn.model.clone()));
         per_model.insert(turn.model.clone(), turn);
         // Evict oldest-created sessions beyond the cap. First-append order is
         // creation order; refreshing on activity would require a tick
@@ -237,6 +246,15 @@ impl Ledger {
         }
     }
 
+    /// Forget everything in memory (the purge operation; the on-disk trail
+    /// is the caller's to delete). Subsequent requests classify as first
+    /// turns until new chains form.
+    pub fn clear(&mut self) {
+        self.sessions.clear();
+        self.order.clear();
+        self.recent.clear();
+    }
+
     /// The latest remembered turn for a session+model.
     pub fn last_turn(&self, session_id: u64, model: &str) -> Option<&CanonicalTurn> {
         self.sessions.get(&session_id)?.get(model)
@@ -248,6 +266,18 @@ impl Ledger {
         self.sessions
             .get(&session_id)
             .is_some_and(|per_model| !per_model.is_empty())
+    }
+
+    /// The most recently appended-to session that has a chain for `model`.
+    /// A request whose leading history was truncated or re-based resolves
+    /// to a *new* session (no shared prefix-hash), and this finds the
+    /// conversation it actually extends — same model only.
+    pub fn most_recent_chain_session(&self, model: &str) -> Option<u64> {
+        self.recent
+            .iter()
+            .rev()
+            .find(|(_, m)| m == model)
+            .map(|(s, _)| *s)
     }
 
     /// The canonical message chain for a session+model: the messages of the

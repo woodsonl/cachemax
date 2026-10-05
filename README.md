@@ -140,6 +140,7 @@ tokens at risk. Still metrics only: never message content.
 | `--bind <addr>` | Loopback address (default `127.0.0.1:8787`). |
 | `--tokenizer <name>` | Prefix-hash tokenizer (default `cl100k_base`). |
 | `--rates <file>` | Override the built-in rate table. |
+| `--repair <mode>` | `dry-run` (default) \| `on` \| `off`. Rewrite drifted history to the canonical serialization the provider already saw (`on`); every rewrite is logged. Per-request header `x-cachemax-repair: on\|off` overrides. |
 | `--ledger-dir <path>` | Where the local repair ledger lives (default `~/.cache/cachemax/ledger`). |
 | `--no-ledger` | Keep the repair ledger in memory only; write nothing to disk. |
 | `--verbose` | Debug logging. Metadata only — never message content. |

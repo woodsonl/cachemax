@@ -401,6 +401,9 @@ struct Finalizer<A: Adapter> {
     /// The drift report computed on the request path. Patched into the
     /// record at finalize; dry-run never lets it touch the request.
     drift_report: DriftReport,
+    /// The rewrite that was applied (`on` mode, drift present, chain
+    /// extendable). `None` means the request went out untouched.
+    rewrite: Option<repair::Rewrite>,
     /// False once an upstream read error was seen.
     complete: bool,
     done: bool,
@@ -446,6 +449,10 @@ impl<A: Adapter> Finalizer<A> {
             engine_cached,
         );
         apply_drift_claim(&mut record, &self.drift_report);
+        if let Some(rw) = &self.rewrite {
+            record.repaired = true;
+            record.canonicalized_tokens = rw.canonicalized_tokens;
+        }
         if complete {
             // The canonical turn: the messages exactly as forwarded, extended
             // by the assistant message(s) exactly as received. Only complete
@@ -759,31 +766,93 @@ pub async fn handle_chat<A: Adapter + 'static>(
         plan_request(&mut guard, &state.tokenizer, &messages)
     };
 
-    // Drift classification (dry-run default): does this request extend the
-    // canonical chain we forwarded last time? Never mutates the request in
-    // any mode except `on` (which lands with the repair batch); dry-run only
-    // produces the report the record carries.
-    let drift_report = if state.repair == RepairMode::Off {
-        DriftReport::unexamined(RepairMode::Off)
+    // The repair stage: classify the re-sent history against the canonical
+    // chain, then — only in `on` mode — rewrite drifted elements to the
+    // canonical serialization. Dry-run (the default) and off never touch a
+    // byte. The per-request header overrides the configured mode.
+    let effective_mode = match headers
+        .get("x-cachemax-repair")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on") => RepairMode::On,
+        Some("off") => RepairMode::Off,
+        Some(other) => {
+            tracing::warn!(value = %other, "ignoring unknown x-cachemax-repair override");
+            state.repair
+        }
+        None => state.repair,
+    };
+    let (drift_report, rewrite) = if effective_mode == RepairMode::Off {
+        (DriftReport::unexamined(RepairMode::Off), None)
     } else {
-        let (chain, other_models) = {
+        // Which chain does this request extend? Its own session's, or —
+        // when the session forked (truncated or re-based leading history
+        // shares no prefix-hash, so the store allocated a new session) —
+        // the most recently written chain for this model. A model switch
+        // gets no cross-chain fallback: chains are per model by design.
+        let (chain, model_switched, forked) = {
             let ledger = state.ledger.lock();
-            let chain = ledger.canonical_messages(plan.session_id, &model);
-            let other_models = ledger.session_has_chains(plan.session_id);
-            (chain, other_models)
+            let own = ledger.canonical_messages(plan.session_id, &model);
+            match own {
+                Some(c) => (Some(c), false, false),
+                None if ledger.session_has_chains(plan.session_id) => (None, true, false),
+                None => {
+                    let forked = ledger.most_recent_chain_session(&model).is_some();
+                    (
+                        ledger
+                            .most_recent_chain_session(&model)
+                            .and_then(|s| ledger.canonical_messages(s, &model)),
+                        false,
+                        forked,
+                    )
+                }
+            }
         };
-        let client_values = doc
+        let mut client_values = doc
             .get("messages")
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default();
-        let classification = repair::classify_turn(
+        let mut classification = repair::classify_turn(
             &client_values,
             chain.as_deref(),
-            other_models,
+            model_switched,
             &state.tokenizer,
         );
-        repair::report(&classification, state.repair)
+        if forked && classification.equivalent_run == 0 {
+            // The fallback chain does not align either: a genuinely new
+            // conversation that happened to resolve into a fresh session.
+            classification = repair::classify_turn(&client_values, None, false, &state.tokenizer);
+        }
+        let report = repair::report(&classification, effective_mode);
+        let mut rewrite = None;
+        if effective_mode == RepairMode::On {
+            if let Some(chain) = chain.as_deref() {
+                if let Some(rw) = repair::apply_canonical(
+                    &mut client_values,
+                    &classification,
+                    chain,
+                    &state.tokenizer,
+                ) {
+                    // The rewrite log (trust): what, why, how much. Metadata
+                    // only — the content stays in the local ledger.
+                    tracing::info!(
+                        target: "cachemax_repair",
+                        session = plan.session_id,
+                        turn = plan.turn,
+                        kind = ?report.drift_kind,
+                        elements = rw.elements_replaced,
+                        tokens = rw.canonicalized_tokens,
+                        "rewrote drifted history to canonical"
+                    );
+                    doc["messages"] = serde_json::Value::Array(client_values);
+                    rewrite = Some(rw);
+                }
+            }
+        }
+        (report, rewrite)
     };
 
     // Forward first. The request body is passed through untouched unless
@@ -813,9 +882,17 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Only the OpenAI dialect understands `stream_options`; Anthropic's
     // Messages API would reject it, so never inject there.
     let inject = state.inject_usage && matches!(state.adapter.name(), "openai" | "vllm");
-    let forwarded = with_usage_requested(&mut doc, &body, inject);
+    let mut forwarded = with_usage_requested(&mut doc, &body, inject);
+    // A rewrite re-serializes the whole document from the (mutated) parse;
+    // everything else forwards verbatim when no injection applied.
+    if rewrite.is_some() {
+        if let Ok(bytes) = serde_json::to_vec(&doc) {
+            forwarded = Bytes::from(bytes);
+        }
+    }
     // The ledger remembers the messages exactly as forwarded — after any
-    // injection, byte-for-byte the `messages` the provider received.
+    // injection or repair rewrite, byte-for-byte the `messages` the provider
+    // received.
     let as_sent_messages = doc
         .get("messages")
         .cloned()
@@ -878,6 +955,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             ledger,
             as_sent_messages,
             drift_report,
+            rewrite,
             complete: true,
             done: false,
             metrics,

@@ -302,6 +302,65 @@ pub fn report(classification: &Classification, mode: RepairMode) -> DriftReport 
     }
 }
 
+/// The outcome of a rewrite in `on` mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    /// How many elements of the re-sent history were replaced with their
+    /// canonical counterparts.
+    pub elements_replaced: usize,
+    /// The canonical serialization's token count of the replaced elements —
+    /// the actual canonicalized amount (the dry-run's `tokens_at_risk`
+    /// estimate made real). Reporting only.
+    pub canonicalized_tokens: u64,
+}
+
+/// Rewrite the client's drifted history to the canonical serialization:
+/// replace every *equivalent-but-not-exact* element under the winning
+/// alignment with its canonical counterpart, and report the outcome.
+/// Never touches exact matches, the client's new tail, or anything at/after
+/// a semantic break (plan §3.3: rewrite the prefix `[0..k)` only). Never
+/// invents content: a truncated prefix stays truncated — the dropped
+/// elements are not re-added, only the kept span is canonicalized.
+///
+/// Returns `None` when there is nothing a rewrite may do (no drift, an
+/// unrepairable hard stop, or no chain); the request must then be forwarded
+/// untouched.
+pub fn apply_canonical(
+    client: &mut [Value],
+    classification: &Classification,
+    canonical: &[Value],
+    tokenizer: &Tokenizer,
+) -> Option<Rewrite> {
+    if classification.unrepairable.is_some() || client.is_empty() || canonical.is_empty() {
+        return None;
+    }
+    let limit = classification
+        .semantic_break
+        .unwrap_or(classification.equivalent_run)
+        .min(client.len());
+    let mut replaced = 0usize;
+    let mut tokens = 0u64;
+    for (i, element) in client.iter_mut().enumerate().take(limit) {
+        let Some(canonical_element) = canonical.get(classification.canonical_offset + i) else {
+            break;
+        };
+        // Recompute the relation: only equivalent-but-not-exact elements are
+        // replaced, and only with the byte-stable canonical form.
+        match relation(element, canonical_element) {
+            Rel::Equivalent(_) => {
+                tokens += tokens_of(tokenizer, std::slice::from_ref(canonical_element));
+                *element = canonical_element.clone();
+                replaced += 1;
+            }
+            Rel::Exact | Rel::Different => {}
+        }
+    }
+    (replaced > 0).then_some(Rewrite {
+        elements_replaced: replaced,
+        canonicalized_tokens: tokens,
+    })
+}
+
 /// One alignment attempt: client history starting at `offset` in canonical.
 #[derive(Debug, Clone, Copy)]
 struct Aligned {
