@@ -185,12 +185,12 @@ async fn a_semantically_different_system_is_never_rewritten() {
     send(&rig, &turn0).await;
     last_record(&rig, 1).await;
 
-    // Turn 1 changes the system to a different instruction AND carries
-    // message drift. A different system re-bases everything downstream:
-    // nothing this turn may be rewritten, including the messages.
+    // Turn 1 changes the system to a different instruction while the
+    // messages stay an exact continuation of the chain (byte-identical
+    // prefix, new tail): the SystemPromptChanged path must fire for the
+    // system alone, with the at-risk span quantified from the canonical
+    // system — and nothing rewritten.
     let mut messages = rig.ledger.lock().canonical_messages(1, "claude-3").unwrap();
-    // Introduce message drift too (collapsed spaces in the prior user turn).
-    messages[0] = user("q  1");
     messages.push(user("q2"));
     let turn1 = serde_json::json!({
         "model": "claude-3",
@@ -207,12 +207,19 @@ async fn a_semantically_different_system_is_never_rewritten() {
         "a different system passes through untouched"
     );
     assert_eq!(
-        sent1["messages"][0],
-        user("q  1"),
-        "message drift is also left untouched behind a rebase"
+        sent1["messages"][2],
+        user("q2"),
+        "the new tail passes through untouched"
     );
-    assert!(!record1.repaired, "nothing was rewritten on a rebased turn");
-    assert_eq!(record1.canonicalized_tokens, 0);
+    assert!(
+        !record1.repaired,
+        "nothing was rewritten behind a changed system"
+    );
+    assert!(
+        record1.canonicalized_tokens > 0,
+        "the endangered span is quantified from the canonical system, got {}",
+        record1.canonicalized_tokens
+    );
 }
 
 #[tokio::test]
@@ -322,5 +329,183 @@ async fn a_system_block_with_siblings_is_never_reshaped_away() {
     assert!(
         !record1.repaired,
         "a system block with semantic siblings is not rewritten"
+    );
+}
+
+#[tokio::test]
+async fn a_model_switch_is_never_mislabeled_as_a_system_change() {
+    // Switching models starts a new chain: there is no canonical system to
+    // differ from. Reading that absence as "changed" fabricated a hard stop
+    // with an at-risk figure counted from the literal "null" (1 tk) — the
+    // switch must read as its own honest event with nothing at risk.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be terse.",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-4",
+            "system": "Be terse.",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent["system"], "Be terse.",
+        "the switched turn forwards untouched"
+    );
+    assert!(!record.repaired);
+    assert_eq!(
+        record.canonicalized_tokens, 0,
+        "a switch has no at-risk span; the 'null' figure was a fabrication"
+    );
+}
+
+#[tokio::test]
+async fn dry_run_never_rewrites_the_system() {
+    // The system rewrite sits behind the same mode gate as the message
+    // rewrite. If a regression hoisted it out of the gate, dry-run would
+    // silently mutate requests — the one thing it may never do.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::DryRun).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be  terse.",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be terse.",
+            "messages": [user("q1"), user("q2")],
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent["system"], "Be terse.",
+        "dry run forwards the client's system verbatim"
+    );
+    assert!(!record.repaired);
+}
+
+#[tokio::test]
+async fn client_managed_hints_are_never_stripped_by_a_rewrite() {
+    // repair and breakpoint management are independent flags. With manage
+    // off, the client owns hint placement: a system rewrite would strip
+    // their cache_control and silently erase their breakpoint — the proxy
+    // inducing the total cache loss it exists to prevent. The drifted
+    // system passes through untouched instead.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone()).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be  terse.",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": [
+                {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [user("q1"), user("q2")],
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent["system"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral"}),
+        "the client's breakpoint survives the drifted system"
+    );
+    assert!(!record.repaired);
+}
+
+#[tokio::test]
+async fn recorded_ttft_covers_the_upstream_wait() {
+    // The TTFT clock is seeded from request-send, so the recorded figure
+    // includes the upstream's full first-token wait. An upstream that waits
+    // 150ms before its first byte must produce a record of at least 100ms;
+    // an unseeded clock (headers→first-chunk on a buffered body) reads
+    // sub-millisecond, so the assertion fails in the right direction.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reply = serde_json::json!({
+        "id": "msg_1",
+        "content": [{"type": "text", "text": "Done."}],
+        "usage": {"input_tokens": 100, "output_tokens": 5},
+    });
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| {
+            let seen = seen.clone();
+            let reply = reply.clone();
+            async move {
+                seen.lock().unwrap().push(body.to_vec());
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let bytes = serde_json::to_vec(&reply).unwrap();
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(bytes))
+                    .unwrap()
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let rig = rig(format!("http://{a}"), RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "claude-3",
+            "system": "Be terse.",
+            "messages": [user("q1")],
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 1).await;
+    assert!(
+        record.ttft_ms.unwrap_or(0.0) >= 100.0,
+        "ttft must cover send→first-byte, got {:?}",
+        record.ttft_ms
     );
 }

@@ -6,7 +6,7 @@
 //! snapshot the page polls) and the **embedded HTML** (a single file served at
 //! `/`). The page polls `/api/state` every ~500 ms.
 
-use crate::record::{cumulative_hit_rate_net, Record, SourceLabel, Status};
+use crate::record::{Record, SourceLabel, Status};
 use serde::Serialize;
 
 /// Which backend the hero weights toward.
@@ -97,13 +97,6 @@ pub fn format_usd(v: Option<f64>) -> String {
         Some(x) => format!("${:.2}", x),
         None => UNEXPOSED.to_string(),
     }
-}
-
-/// The hero's hit-rate figure for a session's records. Net of the endpoint's
-/// foreign-prefix floor, so a routed session never reads above 100%.
-pub fn hero_hit_rate(records: &[Record]) -> String {
-    let floor = crate::record::router_prefix_floor(records);
-    format_pct(cumulative_hit_rate_net(records, floor))
 }
 
 /// The provenance tag for the session's figures: the source shared by the
@@ -205,9 +198,13 @@ pub struct DashboardState {
     pub hit_rate: String,
     pub provenance: String,
     /// Foreign cached tokens the endpoint reports on a cold turn (its own
-    /// wrapper's prefix). Subtracted from every rate this view derives;
-    /// token counts stay provider-raw. `0` on direct providers.
+    /// wrapper's prefix). Applied to a rate only when that rate reads above
+    /// 100% (the numerator carries a span the denominator cannot); token
+    /// counts stay provider-raw. `0` when no cold turn exposes a wrapper.
     pub router_prefix_tokens: u64,
+    /// Whether any turn actually needed the floor — the disclosure renders
+    /// only then, never for a direct provider's honest ≤100% rates.
+    pub router_netted: bool,
     /// Anthropic's write/read split, when the session exposes one (secondary to
     /// the binding hit rate). `None` for providers that report no write count.
     pub write_split: Option<WriteSplit>,
@@ -251,7 +248,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
     // Complete turns (turn ≥ 1) drive the numbers; turn 0 and incomplete are
     // shown in the table but excluded from the formula. Turns with no cache
     // truth or a zero denominator contribute nothing (matching
-    // `record::cumulative_hit_rate`), so the hero cannot be inflated by them.
+    // `record::cumulative_hit_rate_net`), so the hero cannot be inflated by them.
     let contributes = |r: &&Record| {
         r.status == Status::Complete
             && r.turn >= 1
@@ -328,7 +325,19 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
     // Anthropic's write/read split, when the provider exposes writes. Derived
     // rate = read / (read + creation), cumulative over complete turns.
     let written_sum: u64 = counted.iter().map(|r| r.cache_written_tokens).sum();
-    let read_sum: u64 = counted.iter().map(|r| r.cached_tokens).sum();
+    // Net of the foreign-prefix floor under the same per-turn gate as every
+    // rate: only a turn whose numerator exceeds its own history carries the
+    // wrapper's span; honest turns keep their raw reads.
+    let read_sum: u64 = counted
+        .iter()
+        .map(|r| {
+            if r.cached_tokens > r.resent_history_tokens {
+                r.cached_tokens.saturating_sub(floor)
+            } else {
+                r.cached_tokens
+            }
+        })
+        .sum();
     let write_split = if written_sum > 0 {
         let total = read_sum + written_sum;
         Some(WriteSplit {
@@ -361,6 +370,17 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         hit_rate: format_pct(net_hit),
         provenance: source_tag(source).to_string(),
         router_prefix_tokens: floor,
+        // The disclosure renders only when netting actually applied: a
+        // learned floor with no turn above 100% subtracted nothing, and
+        // saying otherwise would describe a direct provider as routed.
+        router_netted: floor > 0
+            && records.iter().any(|r| {
+                r.status == Status::Complete
+                    && r.turn >= 1
+                    && r.resent_history_tokens > 0
+                    && r.source != SourceLabel::NoCacheTruth
+                    && r.cached_tokens > r.resent_history_tokens
+            }),
         write_split,
         recovered: (recovered_sum > 0).then(|| format!("{} tk", format_tokens(recovered_sum))),
         transition,
@@ -437,11 +457,10 @@ fn tape_row(r: &Record, floor: u64) -> TapeRow {
     } else if r.turn == 0 || r.resent_history_tokens == 0 {
         vec![TapeState::Cold; CELLS]
     } else {
-        // Net of the foreign-prefix floor, exactly like the per-turn rate
-        // shown in the same row — the tape and the number beside it must
+        // Exactly the per-turn rate shown in the same row (floor applied
+        // only above 100%) — the tape and the number beside it must
         // describe the same fraction.
-        let hit = ((r.cached_tokens.saturating_sub(floor) as f64 / r.resent_history_tokens as f64)
-            * CELLS as f64)
+        let hit = (r.hit_rate_net(floor).unwrap_or(0.0) * CELLS as f64)
             .round()
             .clamp(0.0, CELLS as f64) as usize;
         let mut v = vec![TapeState::Hit; hit];
@@ -526,14 +545,31 @@ mod tests {
     }
 
     #[test]
+    fn tape_cells_follow_the_same_gate_as_the_rate() {
+        // The tape and the per-turn number describe the same fraction: a
+        // ≤100% turn renders raw (no floor applied), an impossible turn
+        // renders net of the learned floor.
+        let honest = rec(1, 300, 500); // 60% raw and net: 10 hit cells
+        let impossible = rec(1, 560, 500); // raw 112% -> net (560-128)/500 = 86.4% -> 14 cells
+        let hit_cells = |r: &Record, floor: u64| {
+            tape_row(r, floor)
+                .cells
+                .iter()
+                .filter(|c| **c == TapeState::Hit)
+                .count()
+        };
+        assert_eq!(hit_cells(&honest, 128), 10, "honest rate: raw fraction");
+        assert_eq!(hit_cells(&impossible, 128), 14, "impossible rate: netted");
+    }
+
+    #[test]
     fn mlxlm_no_cache_truth_shows_dash_not_zero_percent() {
         // mlx-lm exposes no cache truth; its rate must be `—`, never a measured
         // `0%` (spec: unexposed fields render `—`).
         let mut r = rec(1, 0, 1550);
         r.source = SourceLabel::NoCacheTruth;
-        assert_eq!(r.hit_rate(), None);
-        assert_eq!(format_pct(r.hit_rate()), "—");
-        assert_eq!(hero_hit_rate(&[r.clone()]), "—");
+        assert_eq!(r.hit_rate_net(0), None);
+        assert_eq!(format_pct(r.hit_rate_net(0)), "—");
         assert_eq!(turn_row(&r, 0).hit, "—");
     }
 
@@ -542,10 +578,9 @@ mod tests {
         // A complete turn with no re-sent history must contribute nothing to
         // the session rate (was: added cached to numerator over a 0 denominator).
         let rs = vec![rec(1, 100, 1000), rec(2, 900, 0)];
-        assert_eq!(hero_hit_rate(&rs), format_pct(Some(0.1)));
         assert_eq!(
-            hero_hit_rate(&rs),
-            format_pct(cumulative_hit_rate_net(&rs, 0))
+            format_pct(crate::record::cumulative_hit_rate_net(&rs, 0)),
+            format_pct(Some(0.1))
         );
     }
 
@@ -558,12 +593,6 @@ mod tests {
         let reported = rec(2, 50, 100);
         let rs = vec![blank, reported];
         assert_eq!(provenance(&rs), SourceLabel::ProviderReported);
-    }
-
-    #[test]
-    fn hero_matches_cumulative_formula() {
-        let rs = vec![rec(1, 1020, 1550), rec(2, 860, 1810)];
-        assert_eq!(hero_hit_rate(&rs), format_pct(Some(1880.0 / 3360.0)));
     }
 
     #[test]

@@ -81,5 +81,5 @@ fn observed_figure_survives_into_the_record() {
     assert_eq!(r.cached_tokens, 1455);
     assert_eq!(r.resent_history_tokens, 2000);
     // 1455/2000 exactly, per the binding formula.
-    assert!((r.hit_rate().unwrap() - 1455.0 / 2000.0).abs() < 1e-9);
+    assert!((r.hit_rate_net(0).unwrap() - 1455.0 / 2000.0).abs() < 1e-9);
 }

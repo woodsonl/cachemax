@@ -149,6 +149,24 @@ pub struct Classification {
     pub semantic_break: Option<usize>,
 }
 
+impl Classification {
+    /// The hard stop shared by both dialects: the system changed
+    /// semantically, so nothing is rewritten and the whole recorded span is
+    /// endangered. One constructor keeps the two sites in lockstep.
+    pub fn system_prompt_changed(tokens_at_risk: u64) -> Self {
+        Classification {
+            report_matches: false,
+            drift_kind: None,
+            turns_affected: 1,
+            tokens_at_risk,
+            unrepairable: Some(Unrepairable::SystemPromptChanged),
+            canonical_offset: 0,
+            equivalent_run: 0,
+            semantic_break: Some(0),
+        }
+    }
+}
+
 /// Classify one incoming request against the session's canonical chain.
 ///
 /// `chain` is the canonical message chain for (session, model) — `None`
@@ -195,16 +213,7 @@ pub fn classify_turn(
     let both_system = client[0].get("role").and_then(Value::as_str) == Some("system")
         && canonical[0].get("role").and_then(Value::as_str) == Some("system");
     if both_system && relation(&client[0], &canonical[0]) == Rel::Different {
-        return Classification {
-            report_matches: false,
-            drift_kind: None,
-            turns_affected: 1,
-            tokens_at_risk: tokens_of(tokenizer, canonical),
-            unrepairable: Some(Unrepairable::SystemPromptChanged),
-            canonical_offset: 0,
-            equivalent_run: 0,
-            semantic_break: Some(0),
-        };
+        return Classification::system_prompt_changed(tokens_of(tokenizer, canonical));
     }
 
     // Find the best alignment: the offset d into the canonical chain that
@@ -438,9 +447,19 @@ pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer)
     }
     // Hints are placement policy, not content: strip them on both sides
     // before the ladder, exactly as the message relation does. Breakpoint
-    // management re-places them; a hint difference is never drift.
+    // management re-places them; a hint difference is never drift. A
+    // hint-only difference is exact once stripped — the ordinary steady
+    // state of a managed session whose client rebuilds requests without
+    // the proxy's placed hint — and must classify clean.
     let client = strip_cache_control(client);
     let canonical = strip_cache_control(canonical);
+    if client == canonical {
+        return SystemRelation {
+            kind: None,
+            different: false,
+            tokens_at_risk: 0,
+        };
+    }
     let (client, canonical): (&Value, &Value) = (&client, &canonical);
     let kind = if tool_args_normalized(client) == tool_args_normalized(canonical) {
         Some(DriftKind::ToolArgReserialization)
@@ -1367,6 +1386,43 @@ mod tests {
             &tok,
         );
         assert_eq!(r.kind, Some(DriftKind::RoleContentReshaped));
+        assert!(!r.different);
+    }
+
+    #[test]
+    fn a_hint_only_system_difference_classifies_clean() {
+        // Hint presence and placement are policy, not content. A client
+        // echoing the managed session without the proxy's placed hint — or
+        // with the hint moved — differs only in policy once stripped, and
+        // must classify clean: fabricating drift here would write fake
+        // records on every turn of a managed session.
+        let tok = tok();
+        let managed = serde_json::json!([
+            {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+        ]);
+        // Client echo without the proxy's hint.
+        let r = classify_system(
+            &serde_json::json!([{"type": "text", "text": "Be terse."}]),
+            &managed,
+            &tok,
+        );
+        assert_eq!(r.kind, None, "hint-only: no drift kind");
+        assert!(!r.different, "hint-only: not a semantic change");
+        assert_eq!(r.tokens_at_risk, 0);
+        // Moved hint (client places on an earlier block).
+        let moved = serde_json::json!([
+            {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Context."},
+        ]);
+        let r = classify_system(
+            &moved,
+            &serde_json::json!([
+                {"type": "text", "text": "Be terse."},
+                {"type": "text", "text": "Context.", "cache_control": {"type": "ephemeral"}},
+            ]),
+            &tok,
+        );
+        assert_eq!(r.kind, None, "hint placement only: no drift kind");
         assert!(!r.different);
     }
 }

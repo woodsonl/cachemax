@@ -901,6 +901,27 @@ mod tests {
     }
 
     #[test]
+    fn request_system_survives_the_on_disk_round_trip() {
+        // After a restart the proxy must still know the canonical system:
+        // every Anthropic turn's classification depends on it, and a lost
+        // system would read as "changed" on the next request.
+        let dir = temp_dir("sysreload");
+        {
+            let mut ledger = Ledger::on_disk(dir.clone()).unwrap();
+            let mut t = turn(0, "a");
+            t.request_system = serde_json::json!([{"type": "text", "text": "Be terse."}]);
+            ledger.append(7, t);
+        }
+        let ledger = Ledger::on_disk(dir.clone()).unwrap();
+        assert_eq!(
+            ledger.canonical_system(7, "gpt-4o"),
+            Some(&serde_json::json!([{"type": "text", "text": "Be terse."}])),
+            "a restarted proxy still knows the canonical system, byte-exactly"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn turns_append_in_order_and_late_older_turns_do_not_regress() {
         let dir = temp_dir("order");
         let mut ledger = Ledger::on_disk(dir.clone()).unwrap();

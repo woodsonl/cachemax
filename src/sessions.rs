@@ -29,17 +29,6 @@ pub struct Session {
     pub keyed: bool,
 }
 
-impl Session {
-    /// The session's cumulative hit rate over complete, non-cold turns, net of
-    /// the endpoint's foreign-prefix floor (`crate::record::router_prefix_floor`)
-    /// so it agrees with the dashboard and never reads above 100% on a routed
-    /// session.
-    pub fn cumulative_hit_rate(&self) -> Option<f64> {
-        let floor = crate::record::router_prefix_floor(&self.records);
-        crate::record::cumulative_hit_rate_net(&self.records, floor)
-    }
-}
-
 /// The outcome of resolving an incoming request against the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolution {
@@ -512,8 +501,6 @@ mod tests {
             breakpoint_count: None,
         });
         let _ = store.resolve(&[1, 2, 9]); // break → incomplete marker
-        let s = store.session(a.session_id).unwrap();
-        assert!((s.cumulative_hit_rate().unwrap() - 0.5).abs() < 1e-9);
     }
 
     #[test]

@@ -115,7 +115,10 @@ impl Adapter for VllmAdapter {
     /// samples (see the module note), not from this single-body path.
     fn cache_signal(&self, response_body: &[u8]) -> CacheSignal {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(response_body) {
-            if let Some(n) = v.get("cached_tokens").and_then(|n| n.as_u64()) {
+            if let Some(n) = v
+                .get("cached_tokens")
+                .and_then(crate::adapters::usage_count)
+            {
                 return CacheSignal::reported(n, SourceLabel::EngineMeasured);
             }
         }
