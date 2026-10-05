@@ -26,7 +26,12 @@ serde = { version = "1", features = ["derive"] }
 # prefix-extension of our own serialization — depend on it. Without it,
 # re-serializing a parsed body (usage injection, history rewriting) would
 # silently sort every object's keys.
-serde_json = { version = "1", features = ["preserve_order"] }
+#
+# `arbitrary_precision` keeps numbers as their original text instead of
+# narrowing to f64: integers beyond 2^53 survive the parse, so the drift
+# classifier never aliases two different values into "equivalent" (and a
+# rewritten element re-serializes with the canonical number text).
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 futures = "0.3"
 async-stream = "0.3"
 bytes = "1"

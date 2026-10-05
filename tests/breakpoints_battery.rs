@@ -332,9 +332,11 @@ async fn management_composes_with_repair() {
         sent1["messages"][0]["content"][0]["text"], "Please  summarize",
         "the canonical text went out"
     );
-    // ...the top-level system passes through as the client sent it (repair
-    // rewrites `messages`; the Anthropic system prompt lives outside it)...
-    assert_eq!(sent1["system"][0]["text"], "be brief");
+    // ...the top-level system was ALSO rewritten to its canonical
+    // serialization (the Anthropic system prompt is prime cache material
+    // and rides the same ladder as messages, even though it lives outside
+    // `messages`)...
+    assert_eq!(sent1["system"][0]["text"], "be  brief");
     // ...the new tail verbatim, drift and all...
     assert_eq!(sent1["messages"][2]["content"][0]["text"], "Now  more");
     // ...and the hints are freshly placed on the result.

@@ -66,6 +66,12 @@ pub struct CanonicalTurn {
     /// serialization of this value is deterministic, so "extend the bytes we
     /// forwarded" reduces to "extend this value's serialization".
     pub request_messages: serde_json::Value,
+    /// The Anthropic-dialect top-level `system` exactly as forwarded this
+    /// turn (a string, a block array, or absent → `Null` for OpenAI-dialect
+    /// requests, which carry the system prompt inside `messages`). Repair
+    /// canonicalizes it under the same equivalence ladder as messages.
+    #[serde(default)]
+    pub request_system: serde_json::Value,
     /// The assistant message(s) exactly as the provider returned them, in the
     /// client's dialect — the element a compliant client re-sends next turn.
     /// Empty when the response could not be reassembled (unknown dialect,
@@ -340,6 +346,13 @@ impl Ledger {
         let mut chain: Vec<serde_json::Value> = request.clone();
         chain.extend(last.response_messages.iter().cloned());
         Some(chain)
+    }
+
+    /// The canonical top-level `system` for a session+model, exactly as
+    /// forwarded on the latest remembered turn. `None` when there is no
+    /// remembered turn (the caller treats that as "nothing to compare").
+    pub fn canonical_system(&self, session_id: u64, model: &str) -> Option<&serde_json::Value> {
+        Some(&self.last_turn(session_id, model)?.request_system)
     }
 }
 
@@ -843,6 +856,7 @@ mod tests {
             turn: seq,
             model: "gpt-4o".into(),
             request_messages: json!([{"role": "user", "content": marker}]),
+            request_system: serde_json::Value::Null,
             response_messages: vec![json!({"role": "assistant", "content": marker})],
             prefix_hashes: vec![seq as u64],
             breakpoints: 0,

@@ -6,7 +6,7 @@
 //! snapshot the page polls) and the **embedded HTML** (a single file served at
 //! `/`). The page polls `/api/state` every ~500 ms.
 
-use crate::record::{cumulative_hit_rate, Record, SourceLabel, Status};
+use crate::record::{cumulative_hit_rate_net, Record, SourceLabel, Status};
 use serde::Serialize;
 
 /// Which backend the hero weights toward.
@@ -99,9 +99,11 @@ pub fn format_usd(v: Option<f64>) -> String {
     }
 }
 
-/// The hero's hit-rate figure for a session's records.
+/// The hero's hit-rate figure for a session's records. Net of the endpoint's
+/// foreign-prefix floor, so a routed session never reads above 100%.
 pub fn hero_hit_rate(records: &[Record]) -> String {
-    format_pct(cumulative_hit_rate(records))
+    let floor = crate::record::router_prefix_floor(records);
+    format_pct(cumulative_hit_rate_net(records, floor))
 }
 
 /// The provenance tag for the session's figures: the source shared by the
@@ -202,6 +204,10 @@ pub struct DashboardState {
     /// Headline hit rate (formatted).
     pub hit_rate: String,
     pub provenance: String,
+    /// Foreign cached tokens the endpoint reports on a cold turn (its own
+    /// wrapper's prefix). Subtracted from every rate this view derives;
+    /// token counts stay provider-raw. `0` on direct providers.
+    pub router_prefix_tokens: u64,
     /// Anthropic's write/read split, when the session exposes one (secondary to
     /// the binding hit rate). `None` for providers that report no write count.
     pub write_split: Option<WriteSplit>,
@@ -254,8 +260,17 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
     };
     let complete: Vec<&Record> = records.iter().filter(contributes).collect();
 
+    // Routed endpoints report their own wrapper's cached tokens inside
+    // every `cached_tokens` (visible as a cold turn reading >0); the
+    // re-sent-history denominator never contains that span, so raw rates
+    // can exceed 100%. The floor is learned from the session's cold turn
+    // and subtracted from every rate the dashboard derives. The token
+    // counts stay provider-raw; only the derived rates are netted.
+    let floor = crate::record::router_prefix_floor(records);
+
     let cached_sum: u64 = complete.iter().map(|r| r.cached_tokens).sum();
     let history_sum: u64 = complete.iter().map(|r| r.resent_history_tokens).sum();
+    let net_hit = crate::record::cumulative_hit_rate_net(records, floor);
     // Recovered by repair: cache-served tokens on turns whose history was
     // rewritten (`on` mode). The provider reported these figures — the
     // rewrite is what let the request read a warm prefix at all.
@@ -287,17 +302,13 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
             .map(|r| format!("{} tk", format_tokens(r.cached_tokens)))
             .unwrap_or_else(|| UNEXPOSED.to_string()),
         reuse: last_warm
-            .map(|r| format_pct(r.hit_rate()))
+            .map(|r| format_pct(r.hit_rate_net(floor)))
             .unwrap_or_else(|| UNEXPOSED.to_string()),
     };
 
-    let turns = records.iter().map(turn_row).collect();
+    let turns = records.iter().map(|r| turn_row(r, floor)).collect();
     let cumulative = CumulativeRow {
-        hit: format_pct(if history_sum == 0 {
-            None
-        } else {
-            Some(cached_sum as f64 / history_sum as f64)
-        }),
+        hit: format_pct(net_hit),
         cached_over_history: format!(
             "{} / {}",
             format_tokens(cached_sum),
@@ -345,12 +356,9 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         },
         billed_input: format!("{} tk", format_tokens(billed_sum)),
         cache_served: format!("{} tk", format_tokens(cached_sum)),
-        hit_rate: format_pct(if history_sum == 0 {
-            None
-        } else {
-            Some(cached_sum as f64 / history_sum as f64)
-        }),
+        hit_rate: format_pct(net_hit),
         provenance: source_tag(source).to_string(),
+        router_prefix_tokens: floor,
         write_split,
         recovered: (recovered_sum > 0).then(|| format!("{} tk", format_tokens(recovered_sum))),
         transition,
@@ -360,7 +368,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
     }
 }
 
-fn turn_row(r: &Record) -> TurnRow {
+fn turn_row(r: &Record, floor: u64) -> TurnRow {
     let incomplete = r.status == Status::Incomplete;
     let cold = r.turn == 0;
     // The annotation. Mode off = not examined: no claim rendered. Clean
@@ -392,7 +400,7 @@ fn turn_row(r: &Record) -> TurnRow {
         hit: if cold || incomplete {
             UNEXPOSED.to_string()
         } else {
-            format_pct(r.hit_rate())
+            format_pct(r.hit_rate_net(floor))
         },
         cached_over_history: if cold || incomplete {
             format!("{UNEXPOSED} / {UNEXPOSED}")
@@ -520,7 +528,7 @@ mod tests {
         assert_eq!(r.hit_rate(), None);
         assert_eq!(format_pct(r.hit_rate()), "—");
         assert_eq!(hero_hit_rate(&[r.clone()]), "—");
-        assert_eq!(turn_row(&r).hit, "—");
+        assert_eq!(turn_row(&r, 0).hit, "—");
     }
 
     #[test]
@@ -529,7 +537,10 @@ mod tests {
         // the session rate (was: added cached to numerator over a 0 denominator).
         let rs = vec![rec(1, 100, 1000), rec(2, 900, 0)];
         assert_eq!(hero_hit_rate(&rs), format_pct(Some(0.1)));
-        assert_eq!(hero_hit_rate(&rs), format_pct(cumulative_hit_rate(&rs)));
+        assert_eq!(
+            hero_hit_rate(&rs),
+            format_pct(cumulative_hit_rate_net(&rs, 0))
+        );
     }
 
     #[test]
@@ -550,6 +561,41 @@ mod tests {
     }
 
     #[test]
+    fn a_routed_session_never_reads_above_one_hundred_percent() {
+        // A cold turn that already read 128 cached tokens reveals the
+        // endpoint's own wrapper prefix. The warm turn's raw reading
+        // (628/500 = 125.6%) must be netted down, per turn and cumulatively,
+        // because the denominator never contains the wrapper span.
+        let rs = vec![rec(0, 128, 0), rec(1, 628, 500)];
+        let raw = 628.0 / 500.0;
+        assert!(raw > 1.0, "the artifact this guards against");
+
+        let state = view(&rs, false, 1);
+        assert_eq!(state.router_prefix_tokens, 128, "floor is disclosed");
+        assert_eq!(
+            state.turns[1].hit,
+            format_pct(Some((628.0 - 128.0) / 500.0)),
+            "per-turn rate is net of the wrapper"
+        );
+        assert_eq!(state.hit_rate, format_pct(Some((628.0 - 128.0) / 500.0)));
+        assert_eq!(state.cumulative.hit, state.hit_rate);
+    }
+
+    #[test]
+    fn an_unrouted_session_is_untouched_by_netting() {
+        // No cold-turn reading → no floor → every figure identical to the
+        // raw formula. Direct providers must not be adjusted at all.
+        let rs = vec![rec(0, 0, 0), rec(1, 1020, 1550)];
+        let state = view(&rs, false, 1);
+        assert_eq!(state.router_prefix_tokens, 0);
+        assert_eq!(
+            state.turns[1].hit,
+            format_pct(Some(1020.0 / 1550.0)),
+            "raw rate, nothing subtracted"
+        );
+    }
+
+    #[test]
     fn tokens_group_by_thousands() {
         assert_eq!(format_tokens(1550), "1,550");
         assert_eq!(format_tokens(3880), "3,880");
@@ -560,7 +606,7 @@ mod tests {
     fn cold_turn_shows_dashes() {
         let mut r = rec(0, 0, 0);
         r.cost_usd = None;
-        let row = turn_row(&r);
+        let row = turn_row(&r, 0);
         assert!(row.cold);
         assert_eq!(row.hit, "—");
         assert_eq!(row.cached_over_history, "— / —");
@@ -584,7 +630,7 @@ mod tests {
         let mut r = rec(3, 0, 0);
         r.status = Status::Incomplete;
         r.cost_usd = None;
-        let row = turn_row(&r);
+        let row = turn_row(&r, 0);
         assert!(row.incomplete);
         assert_eq!(row.hit, "—");
         let t = tape_row(&r);
@@ -633,7 +679,7 @@ mod tests {
             Some(crate::repair::DriftKind::ToolArgReserialization),
             312,
         );
-        let row = turn_row(&r);
+        let row = turn_row(&r, 0);
         assert_eq!(row.drift.as_deref(), Some("tool_args"));
         assert_eq!(row.drift_tokens.as_deref(), Some("312 tk"));
         // And the tape leads with the drift glyph.
@@ -645,7 +691,7 @@ mod tests {
     fn an_unrepairable_turn_is_tagged_and_banged() {
         // No kind + tokens at risk = the hard-stop / semantic-inequality case.
         let r = drifted(2, None, 900);
-        let row = turn_row(&r);
+        let row = turn_row(&r, 0);
         assert_eq!(row.drift.as_deref(), Some("unrepairable"));
         let tape = tape_row(&r);
         assert_eq!(tape.cells[0], TapeState::Unrepairable);
@@ -654,8 +700,8 @@ mod tests {
     #[test]
     fn a_first_turn_or_model_switch_carries_no_at_risk_claim() {
         let r = drifted(1, None, 0);
-        assert_eq!(turn_row(&r).drift.as_deref(), Some("first-turn"));
-        assert_eq!(turn_row(&r).drift_tokens.as_deref(), Some("0 tk"));
+        assert_eq!(turn_row(&r, 0).drift.as_deref(), Some("first-turn"));
+        assert_eq!(turn_row(&r, 0).drift_tokens.as_deref(), Some("0 tk"));
     }
 
     #[test]
@@ -667,7 +713,7 @@ mod tests {
         );
         r.repaired = true;
         r.cached_tokens = 800;
-        let row = turn_row(&r);
+        let row = turn_row(&r, 0);
         assert!(row.repaired);
         assert_eq!(row.drift.as_deref(), Some("tool_args"));
         let tape = tape_row(&r);
@@ -706,10 +752,10 @@ mod tests {
         let mut clean = rec(1, 100, 200);
         clean.repair_mode = crate::repair::RepairMode::DryRun;
         clean.matches_canonical = Some(true);
-        assert!(turn_row(&clean).drift.is_none());
+        assert!(turn_row(&clean, 0).drift.is_none());
         // Unexamined (mode off): no claim at all.
         let off = rec(2, 100, 200);
-        assert!(turn_row(&off).drift.is_none());
+        assert!(turn_row(&off, 0).drift.is_none());
         assert_eq!(off.matches_canonical, None);
     }
 

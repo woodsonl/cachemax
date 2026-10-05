@@ -394,6 +394,114 @@ fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
     }
 }
 
+/// How the Anthropic-dialect top-level `system` relates to the canonical
+/// one. The same equivalence ladder as messages applies — the system prompt
+/// is prime cache material and drift there is total cache loss — with the
+/// same hard stop: a semantically different system is never rewritten.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemRelation {
+    /// The repairable drift flavor, when the system is
+    /// equivalent-but-not-exact. `None` when exact or absent.
+    pub kind: Option<DriftKind>,
+    /// Semantic inequality: repair must not touch the turn at all (the
+    /// system re-bases everything downstream).
+    pub different: bool,
+    /// The canonical system's serialized token count — the at-risk estimate
+    /// when drifted, the endangered span when different. Reporting only.
+    pub tokens_at_risk: u64,
+}
+
+/// Classify the top-level `system` of a request against the canonical
+/// chain's. Either side may be `Null` (absent): present-vs-absent is a
+/// semantic change (`different`), never invented away.
+pub fn classify_system(client: &Value, canonical: &Value, tokenizer: &Tokenizer) -> SystemRelation {
+    let client_present = !client.is_null();
+    let canonical_present = !canonical.is_null();
+    let at_risk = || {
+        serde_json::to_string(canonical)
+            .map(|s| tokenizer.count(&s) as u64)
+            .unwrap_or(0)
+    };
+    if client_present != canonical_present {
+        return SystemRelation {
+            kind: None,
+            different: true,
+            tokens_at_risk: at_risk(),
+        };
+    }
+    if !client_present || client == canonical {
+        return SystemRelation {
+            kind: None,
+            different: false,
+            tokens_at_risk: 0,
+        };
+    }
+    // Hints are placement policy, not content: strip them on both sides
+    // before the ladder, exactly as the message relation does. Breakpoint
+    // management re-places them; a hint difference is never drift.
+    let client = strip_cache_control(client);
+    let canonical = strip_cache_control(canonical);
+    let (client, canonical): (&Value, &Value) = (&client, &canonical);
+    let kind = if tool_args_normalized(client) == tool_args_normalized(canonical) {
+        Some(DriftKind::ToolArgReserialization)
+    } else if system_prose_normalized(client) == system_prose_normalized(canonical) {
+        Some(DriftKind::TextNormalization)
+    } else if system_reshaped(client) == system_reshaped(canonical) {
+        Some(DriftKind::RoleContentReshaped)
+    } else {
+        return SystemRelation {
+            kind: None,
+            different: true,
+            tokens_at_risk: at_risk(),
+        };
+    };
+    SystemRelation {
+        kind,
+        different: false,
+        tokens_at_risk: at_risk(),
+    }
+}
+
+/// Normalize the top-level `system`'s prose the way [`text_normalized`] does
+/// for message content. The system has its own certified shapes — a bare
+/// string (prose by definition), or an array of `{type, text}` blocks — so
+/// the message-shaped walker cannot reach it.
+fn system_prose_normalized(v: &Value) -> Value {
+    match v {
+        Value::String(_) => collapse_ws(v),
+        Value::Array(blocks) => Value::Array(blocks.iter().map(part_text_normalized).collect()),
+        _ => v.clone(),
+    }
+}
+
+/// Flatten the top-level `system` to its text, so a string and an equivalent
+/// block array compare equal. Mirrors [`reshaped`] for the system's shapes.
+fn system_reshaped(v: &Value) -> Value {
+    match v {
+        Value::String(_) => v.clone(),
+        Value::Array(blocks) => {
+            let mut text = String::new();
+            for b in blocks {
+                let Some(map) = b.as_object() else {
+                    return v.clone();
+                };
+                match map.get("type").and_then(Value::as_str) {
+                    Some("text") if map.contains_key("text") => {
+                        if let Some(t) = map.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        } else {
+                            return v.clone();
+                        }
+                    }
+                    _ => return v.clone(),
+                }
+            }
+            Value::String(text)
+        }
+        _ => v.clone(),
+    }
+}
+
 /// The element-relation ladder (see module docs). Ordered cheapest-first;
 /// the first equality that holds names the relation. Cache hints
 /// (`cache_control`) are stripped on both sides first: the provider does
@@ -1240,5 +1348,40 @@ mod tests {
         let c = classify(&client, &canonical);
         assert!(c.report_matches);
         assert_eq!(c.tokens_at_risk, 0);
+    }
+
+    #[test]
+    fn system_classification_covers_the_ladder_and_the_hard_stop() {
+        let tok = tok();
+        // Exact.
+        let r = classify_system(&json!("Be terse."), &json!("Be terse."), &tok);
+        assert_eq!(r.kind, None);
+        assert!(!r.different);
+        // Whitespace drift: repairable, quantified.
+        let r = classify_system(&json!("Be  terse."), &json!("Be terse."), &tok);
+        assert_eq!(r.kind, Some(DriftKind::TextNormalization));
+        assert!(!r.different);
+        assert!(r.tokens_at_risk > 0);
+        // Semantic change: the hard stop.
+        let r = classify_system(&json!("Be verbose."), &json!("Be terse."), &tok);
+        assert!(r.different, "a different system is never rewritten");
+        assert!(r.tokens_at_risk > 0, "the endangered span is quantified");
+        // Present-vs-absent is a semantic change, never invented away.
+        let r = classify_system(&json!("Be terse."), &Value::Null, &tok);
+        assert!(r.different);
+        let r = classify_system(&Value::Null, &json!("Be terse."), &tok);
+        assert!(r.different);
+        // Both absent: nothing to say.
+        let r = classify_system(&Value::Null, &Value::Null, &tok);
+        assert_eq!(r.kind, None);
+        assert!(!r.different);
+        // Block form reshaped: string vs blocks with the same text.
+        let r = classify_system(
+            &json!("Be terse."),
+            &json!([{"type": "text", "text": "Be terse."}]),
+            &tok,
+        );
+        assert_eq!(r.kind, Some(DriftKind::RoleContentReshaped));
+        assert!(!r.different);
     }
 }

@@ -14,7 +14,7 @@ use crate::adapters::Adapter;
 use crate::ledger::{CanonicalTurn, Dialect, ResponseAssembler, SharedLedger};
 use crate::rates::Rates;
 use crate::record::{Record, SourceLabel, Status};
-use crate::repair::{self, DriftReport, RepairMode};
+use crate::repair::{self, DriftKind, DriftReport, RepairMode};
 use crate::sessions::{SessionStore, SharedSessions};
 use crate::tokenize::{Message, Tokenizer};
 
@@ -308,6 +308,16 @@ impl StreamObserver {
         }
     }
 
+    /// Seed the TTFT clock from the moment the request was sent. The
+    /// observer is constructed after the response headers resolve, so its
+    /// own `Instant::now()` would measure headers→first-chunk (~µs on a
+    /// buffered JSON body), not request→first-token. TTFT is only honest
+    /// when the clock covers the send.
+    pub fn started_at(mut self, sent: Instant) -> Self {
+        self.started = sent;
+        self
+    }
+
     /// Observe one forwarded chunk. Called with the exact bytes being sent to
     /// the client; must not mutate them.
     pub fn on_chunk(&mut self, chunk: &[u8]) {
@@ -404,6 +414,10 @@ struct Finalizer<A: Adapter> {
     /// The `messages` array exactly as forwarded upstream this turn (already
     /// reflecting any proxy-side injection). Captured before forwarding.
     as_sent_messages: serde_json::Value,
+    /// The Anthropic-dialect top-level `system` exactly as forwarded this
+    /// turn (Null when the dialect carries the system inside `messages`).
+    /// Enters the ledger beside the messages it prefixes.
+    as_sent_system: serde_json::Value,
     /// The drift report computed on the request path. Patched into the
     /// record at finalize; dry-run never lets it touch the request.
     drift_report: DriftReport,
@@ -471,6 +485,9 @@ impl<A: Adapter> Finalizer<A> {
                 turn: self.plan.turn,
                 model: self.model.clone(),
                 request_messages: self.as_sent_messages.clone(),
+                // The Anthropic top-level system, as forwarded (Null when
+                // the dialect carries the system inside `messages`).
+                request_system: self.as_sent_system.clone(),
                 response_messages: self.observer.response_messages(),
                 prefix_hashes: self.plan.prefix_hashes.clone(),
                 // What WE placed (a declined pass touched nothing and must
@@ -815,21 +832,43 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // chain: the most recently written one for this model, accepted
         // below only when the client's history actually reads as a re-send
         // of it. A model switch gets no cross-chain fallback: chains are
-        // per model by design.
-        let (chain, model_switched, probed) = {
+        // per model by design. The Anthropic top-level `system` rides
+        // along: it is classified under the same ladder and repaired the
+        // same way, because system drift is total cache loss.
+        let (chain, canonical_system, model_switched, probed) = {
             let ledger = state.ledger.lock();
             match ledger.canonical_messages(plan.session_id, &model) {
-                Some(c) => (Some(c), false, false),
-                None if ledger.session_has_chains(plan.session_id) => (None, true, false),
-                None => (
+                Some(c) => (
+                    Some(c),
                     ledger
-                        .most_recent_chain_session(&model)
-                        .and_then(|s| ledger.canonical_messages(s, &model)),
+                        .canonical_system(plan.session_id, &model)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                     false,
-                    true,
+                    false,
                 ),
+                None if ledger.session_has_chains(plan.session_id) => {
+                    (None, serde_json::Value::Null, true, false)
+                }
+                None => {
+                    let probed_session = ledger.most_recent_chain_session(&model);
+                    (
+                        probed_session.and_then(|s| ledger.canonical_messages(s, &model)),
+                        probed_session
+                            .and_then(|s| ledger.canonical_system(s, &model))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        false,
+                        true,
+                    )
+                }
             }
         };
+        let client_system = doc
+            .get("system")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let sys = repair::classify_system(&client_system, &canonical_system, &state.tokenizer);
         let mut client_values = doc
             .get("messages")
             .and_then(|m| m.as_array())
@@ -841,6 +880,36 @@ pub async fn handle_chat<A: Adapter + 'static>(
             model_switched,
             &state.tokenizer,
         );
+        let mut system_rewritable = false;
+        if sys.different {
+            // A semantically different system prompt re-bases everything
+            // downstream, exactly like a changed system message: the turn
+            // is never rewritten, on either side of the dialect.
+            let tokens = sys.tokens_at_risk;
+            classification = crate::repair::Classification {
+                report_matches: false,
+                drift_kind: None,
+                turns_affected: 1,
+                tokens_at_risk: tokens,
+                unrepairable: Some(crate::repair::Unrepairable::SystemPromptChanged),
+                canonical_offset: 0,
+                equivalent_run: 0,
+                semantic_break: Some(0),
+            };
+        } else {
+            system_rewritable = sys.kind.is_some();
+            if let Some(k) = sys.kind {
+                // System drift alone means the turn is not a clean match,
+                // whatever the messages say.
+                classification.report_matches = false;
+                classification.drift_kind = Some(match classification.drift_kind {
+                    Some(existing) if existing != k => DriftKind::Mixed,
+                    _ => k,
+                });
+                classification.turns_affected += 1;
+                classification.tokens_at_risk += sys.tokens_at_risk;
+            }
+        }
         if probed && !(classification.semantic_break.is_none() && classification.equivalent_run > 0)
         {
             // The probed chain is only a candidate — the most recently
@@ -853,6 +922,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             // — that is a new conversation's first turn, honestly reported
             // and never rewritten.
             classification = repair::classify_turn(&client_values, None, false, &state.tokenizer);
+            system_rewritable = false;
         }
         let report = repair::report(&classification, effective_mode);
         let mut rewrite = None;
@@ -878,6 +948,33 @@ pub async fn handle_chat<A: Adapter + 'static>(
                     doc["messages"] = serde_json::Value::Array(client_values);
                     rewrite = Some(rw);
                 }
+            }
+            // The top-level system, when its drift is repairable: replaced
+            // with the canonical serialization (content only — hints are
+            // placement policy, re-derived by breakpoint management).
+            if system_rewritable && !canonical_system.is_null() {
+                let mut canonical = canonical_system.clone();
+                crate::breakpoints::strip_hints_in_place(&mut canonical);
+                tracing::info!(
+                    target: "cachemax_repair",
+                    session = plan.session_id,
+                    turn = plan.turn,
+                    kind = ?sys.kind,
+                    elements = 1,
+                    tokens = sys.tokens_at_risk,
+                    "rewrote drifted system prompt to canonical"
+                );
+                doc["system"] = canonical;
+                rewrite = Some(match rewrite {
+                    Some(rw) => crate::repair::Rewrite {
+                        elements_replaced: rw.elements_replaced + 1,
+                        canonicalized_tokens: rw.canonicalized_tokens + sys.tokens_at_risk,
+                    },
+                    None => crate::repair::Rewrite {
+                        elements_replaced: 1,
+                        canonicalized_tokens: sys.tokens_at_risk,
+                    },
+                });
             }
         }
         (report, rewrite)
@@ -979,6 +1076,12 @@ pub async fn handle_chat<A: Adapter + 'static>(
             plan.prefix_hashes = state.tokenizer.prefix_hashes(&sent);
         }
     }
+    // The top-level system as forwarded (after any rewrite), for the ledger.
+    let as_sent_system = doc
+        .get("system")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let sent_at = Instant::now();
     let upstream = match req.body(forwarded).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1032,7 +1135,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // plain tail after the loop would never run on disconnect, losing the
         // turn entirely; the guard's Drop finalizes it as Incomplete instead.
         let mut fin = Finalizer {
-            observer: StreamObserver::for_dialect(dialect),
+            observer: StreamObserver::for_dialect(dialect).started_at(sent_at),
             plan,
             adapter,
             model,
@@ -1040,6 +1143,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             sessions,
             ledger,
             as_sent_messages,
+            as_sent_system,
             drift_report,
             rewrite,
             breakpoints,
@@ -1254,6 +1358,21 @@ mod tests {
         assert!(o.ttft_ms.is_none(), "empty chunk is not first byte");
         o.on_chunk(b"data: {}\n\n");
         assert!(o.ttft_ms.is_some(), "first nonempty chunk sets TTFT");
+    }
+
+    #[test]
+    fn a_seeded_clock_covers_the_request_send() {
+        // The observer is constructed after response headers resolve; its
+        // own clock would measure only headers→first-chunk. Seeding from
+        // the send makes TTFT cover the upstream's whole first-token wait.
+        let sent = Instant::now() - std::time::Duration::from_millis(250);
+        let mut o = StreamObserver::for_dialect(Dialect::OpenAi).started_at(sent);
+        o.on_chunk(b"data: {}\n\n");
+        let ttft = o.ttft_ms.expect("ttft recorded");
+        assert!(
+            ttft >= 250.0,
+            "TTFT must include the pre-headers wait, got {ttft} ms"
+        );
     }
 
     #[test]
