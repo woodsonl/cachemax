@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::repair::{DriftKind, RepairMode};
+
 /// Whether a request produced a usable measurement.
 ///
 /// Orthogonal to [`SourceLabel`]: a cloud request can be `Complete` with source
@@ -59,6 +61,28 @@ pub struct Record {
     pub cost_usd: Option<f64>,
     /// Cost saved versus the no-cache counterfactual, if rates are known.
     pub cost_saved_usd: Option<f64>,
+    /// The repair mode this turn ran under. `off` turns carry no drift
+    /// claim at all.
+    #[serde(default)]
+    pub repair_mode: RepairMode,
+    /// True when the outgoing history was rewritten to the canonical chain
+    /// (`on` mode only; dry-run never rewrites).
+    #[serde(default)]
+    pub repaired: bool,
+    /// `None` when repair did not examine the turn (mode off). `Some(true)`:
+    /// the re-sent history matches the canonical chain under semantic JSON
+    /// equality (object key order is not drift; string leaves are). Some
+    /// `false`: drift (see `drift_kind`) or an unrepairable hard stop.
+    #[serde(default)]
+    pub matches_canonical: Option<bool>,
+    /// The classified flavor of the drift, when there was one.
+    #[serde(default)]
+    pub drift_kind: Option<DriftKind>,
+    /// Tokens of drifted history replaced by (`on`) or that would be
+    /// replaced by (`dry-run`) the canonical serialization. An estimate for
+    /// annotation; repair decisions never consult token counts.
+    #[serde(default)]
+    pub canonicalized_tokens: u64,
 }
 
 impl Record {
@@ -124,6 +148,11 @@ mod tests {
             cache_written_tokens: 0,
             cost_usd: None,
             cost_saved_usd: None,
+            repair_mode: crate::repair::RepairMode::Off,
+            repaired: false,
+            matches_canonical: None,
+            drift_kind: None,
+            canonicalized_tokens: 0,
         }
     }
 

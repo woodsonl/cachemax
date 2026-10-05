@@ -85,6 +85,9 @@ async fn proxy_for(upstream: String) -> String {
         upstream_url: upstream,
         client: reqwest::Client::new(),
         inject_usage: true,
+        // The product default: the budget gates what ships, and drift
+        // classification sits on the pre-forward path in dry-run.
+        repair: cachemax::repair::RepairMode::DryRun,
     });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();

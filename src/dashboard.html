@@ -61,6 +61,8 @@
   .tape .row .t{color:var(--muted);font-size:12px}
   .tape .cells{letter-spacing:2px}
   .hit{color:var(--accent-text)} .resent{color:var(--resent)} .cold{color:var(--faint)} .miss{color:var(--text)} .break{color:var(--muted)} .incomplete{color:var(--faint)}
+  .drift{color:var(--muted)} .unrepairable{color:var(--text)}
+  .dtag{font-family:var(--fm);font-size:11px;color:var(--muted);letter-spacing:.04em}
   .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-family:var(--fm);font-size:11.5px;color:var(--muted);letter-spacing:.03em}
   .legend b{color:var(--text);font-weight:500}
   .empty{color:var(--muted);font-family:var(--fb)}
@@ -129,6 +131,7 @@
       <div class="legend">
         <span><b>█</b> hit</span><span><b>▓</b> resent</span><span><b>░</b> cold</span>
         <span><b>┊</b> break</span><span><b>▚</b> miss</span><span><b>?</b> incomplete</span>
+        <span><b>~</b> drift</span><span><b>!</b> unrepairable</span>
       </div>
     </section>
   </div>
@@ -141,7 +144,7 @@
 
 <script>
 (function(){
-  var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?"};
+  var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?", drift:"~", unrepairable:"!"};
   var lastTurnCount = -1;
   var lastSessionId = null;   // for session-break detection
   var sawSession = false;     // for metrics-reset detection
@@ -163,7 +166,11 @@
     var html = state.turns.map(function(t){
       var cls = t.cold ? "cold" : (t.incomplete ? "inc" : ((t.turn===lastTurnCount)?"new":""));
       var mark = t.incomplete ? '<span class="mark">?</span>' : esc(t.hit);
-      return '<tr class="'+cls+'" tabindex="0"><td>'+t.turn+'</td><td class="num">'+mark+
+      // Dry-run drift annotation: a small mono tag after the turn number,
+      // muted until the design amendment promotes it to signal color.
+      var dtag = t.drift ? ' <span class="dtag">~ '+esc(t.drift)+
+        (t.drift_tokens ? ' · '+esc(t.drift_tokens) : '')+'</span>' : '';
+      return '<tr class="'+cls+'" tabindex="0"><td>'+t.turn+dtag+'</td><td class="num">'+mark+
         '</td><td class="num">'+esc(t.cached_over_history)+'</td><td class="num">'+esc(t.cost)+'</td></tr>';
     }).join("");
     html += '<tr class="cum"><td>cum</td><td class="num">'+esc(state.cumulative.hit)+

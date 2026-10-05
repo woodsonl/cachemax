@@ -210,7 +210,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ledger,
                 upstream,
                 &cli.bind,
-                !cli.no_inject_usage,
+                // Dry-run is the product default: classify and annotate,
+                // never rewrite. The `--repair` flag lands with the rewrite
+                // batch; until then the mode is fixed here.
+                cachemax::proxy::ServeOptions {
+                    repair: cachemax::repair::RepairMode::DryRun,
+                    inject_usage: !cli.no_inject_usage,
+                },
             )
             .await
         }
@@ -286,7 +292,7 @@ async fn dispatch_serve(
     ledger: Arc<SharedLedger>,
     upstream: String,
     bind: &str,
-    inject_usage: bool,
+    options: cachemax::proxy::ServeOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -298,9 +304,9 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                upstream,
+                upstream.clone(),
+                options.clone(),
                 listener,
-                inject_usage,
             )
             .await
         }
@@ -310,9 +316,9 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                upstream,
+                upstream.clone(),
+                options.clone(),
                 listener,
-                inject_usage,
             )
             .await
         }
@@ -322,9 +328,9 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                upstream,
+                upstream.clone(),
+                options.clone(),
                 listener,
-                inject_usage,
             )
             .await
         }
@@ -334,9 +340,9 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                upstream,
+                upstream.clone(),
+                options.clone(),
                 listener,
-                inject_usage,
             )
             .await
         }
@@ -346,9 +352,9 @@ async fn dispatch_serve(
                 tokenizer,
                 rates,
                 ledger,
-                upstream,
+                upstream.clone(),
+                options.clone(),
                 listener,
-                inject_usage,
             )
             .await
         }

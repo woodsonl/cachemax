@@ -92,6 +92,7 @@ async fn boot(upstream: String, ledger: Arc<SharedLedger>) -> String {
         upstream_url: upstream,
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
@@ -292,6 +293,7 @@ async fn an_anthropic_dialect_turn_is_captured_end_to_end() {
         upstream_url: format!("http://{a}"),
         client: reqwest::Client::new(),
         inject_usage: true,
+        repair: cachemax::repair::RepairMode::Off,
     });
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let paddr = pl.local_addr().unwrap();

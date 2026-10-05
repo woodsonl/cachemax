@@ -242,6 +242,14 @@ impl Ledger {
         self.sessions.get(&session_id)?.get(model)
     }
 
+    /// Whether the session has canonical turns under any model. Distinguishes
+    /// a model switch (chains exist, none for this model) from a first turn.
+    pub fn session_has_chains(&self, session_id: u64) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|per_model| !per_model.is_empty())
+    }
+
     /// The canonical message chain for a session+model: the messages of the
     /// latest turn exactly as forwarded, extended by the assistant message(s)
     /// exactly as received. This is what the next request should

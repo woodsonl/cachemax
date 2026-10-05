@@ -24,6 +24,11 @@ fn record(session_id: u64, turn: u32) -> Record {
         broke_prefix: false,
         cost_usd: None,
         cost_saved_usd: None,
+        repair_mode: cachemax::repair::RepairMode::Off,
+        repaired: false,
+        matches_canonical: None,
+        drift_kind: None,
+        canonicalized_tokens: 0,
     }
 }
 

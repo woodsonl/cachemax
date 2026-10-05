@@ -201,8 +201,13 @@ impl SessionStore {
     }
 
     /// Number of tracked sessions.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Whether any session is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
     }
 }
 
@@ -286,6 +291,11 @@ mod tests {
             broke_prefix: false,
             cost_usd: None,
             cost_saved_usd: None,
+            repair_mode: crate::repair::RepairMode::Off,
+            repaired: false,
+            matches_canonical: None,
+            drift_kind: None,
+            canonicalized_tokens: 0,
         });
         // Incoming [1,2,9] breaks from session 1 (shared [1,2]); it is the only
         // session sharing a prefix, so it wins.
@@ -380,6 +390,11 @@ mod tests {
             broke_prefix: false,
             cost_usd: None,
             cost_saved_usd: None,
+            repair_mode: crate::repair::RepairMode::Off,
+            repaired: false,
+            matches_canonical: None,
+            drift_kind: None,
+            canonicalized_tokens: 0,
         });
         let _ = store.resolve(&[1, 2, 9]); // break → incomplete marker
         let s = store.session(a.session_id).unwrap();
