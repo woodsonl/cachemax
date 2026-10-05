@@ -136,6 +136,22 @@ tokens at risk. `breakpoint_count` is the cache hints on the request as
 forwarded (`null` when breakpoint management is off). Still metrics only:
 never message content.
 
+### Prove it yourself: `cachemax replay`
+
+The A/B that produced the numbers above is reproducible on your own traffic:
+
+1. Run `cachemax serve` with `--repair dry-run` (the default) in front of
+   your provider for a while — the ledger records the canonical chains.
+2. Run `cachemax replay` (add `--ledger-dir <path>` for a non-default
+   location). For every recorded chain it prints one JSONL line holding the
+   same request twice: `a_drifted`, re-serialized the way agent frameworks
+   do (tool-argument keys reordered, interior whitespace collapsed), and
+   `b_canonical`, the exact bytes the provider already cached.
+3. Drive your endpoint with both bodies — `a_drifted` is the cache-miss
+   baseline, `b_canonical` is what repair forwards — and compare the
+   provider's `cached_tokens` per variant. The dashboard's *recovered by
+   repair* line shows the same delta live, on repaired turns.
+
 ## Commands
 
 | Command | What it does |
@@ -144,6 +160,7 @@ never message content.
 | `cachemax check` | Check the upstream is reachable; exit non-zero if not. |
 | `cachemax export` | Write the running proxy's session as JSONL. |
 | `cachemax purge` | Delete the on-disk repair ledger (see Security). |
+| `cachemax replay` | Print A/B request bodies (drifted vs canonical) from the recorded ledger, as JSONL — drive any endpoint with both to measure the repair delta. |
 
 | Flag | Meaning |
 |---|---|

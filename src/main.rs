@@ -221,6 +221,10 @@ enum Command {
     /// directory itself stay; a running proxy's in-memory ledger is not
     /// touched — restart to drop it.
     Purge,
+    /// Replay the recorded ledger: print per-chain, A/B request bodies
+    /// (drifted vs canonical) and the tokens each costs, as JSONL — the
+    /// input for an A/B cache measurement against any endpoint.
+    Replay,
 }
 
 #[tokio::main]
@@ -251,6 +255,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         print_purge(&dir, &report);
+        return Ok(());
+    }
+
+    // Replay reads the ledger directory directly: it has no use for a
+    // tokenizer (token columns come from the line's own counts) and must
+    // not touch the running proxy.
+    if matches!(cli.command, Some(Command::Replay)) {
+        let dir = cli
+            .ledger_dir
+            .clone()
+            .map_or_else(default_ledger_dir, std::path::PathBuf::from);
+        let requests = cachemax::ledger::Ledger::replay_requests(&dir)
+            .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
+        if requests.is_empty() {
+            println!(
+                "no chains recorded in {}; send traffic through `cachemax serve` first",
+                dir.display()
+            );
+            return Ok(());
+        }
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for request in &requests {
+            let line = cachemax::repair::replay_pair(request);
+            serde_json::to_writer(&mut out, &line)?;
+            use std::io::Write;
+            out.write_all(b"\n")?;
+        }
         return Ok(());
     }
     if let Err(e) = run(cli).await {
@@ -428,9 +460,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {path}");
             Ok(())
         }
-        // Handled before `run` (it needs no tokenizer or upstream); the
-        // compiler still wants the arm here.
-        Command::Purge => Ok(()),
+        // Handled before `run` (they need no tokenizer or upstream); the
+        // compiler still wants the arms here.
+        Command::Purge | Command::Replay => Ok(()),
     }
 }
 

@@ -648,6 +648,114 @@ fn tokens_of(tokenizer: &Tokenizer, elements: &[Value]) -> u64 {
         .sum()
 }
 
+/// The A/B replay pair for one recorded chain: the same request in the
+/// form a re-serializing client drifts into, and in the canonical form
+/// repair forwards. The drift applies the classifier's own tolerances in
+/// reverse — reordered tool-argument keys, collapsed interior whitespace
+/// runs — so both bodies are semantically identical and differ only in
+/// the bytes a provider's cache keys on. That delta is what the A/B
+/// measurement prices.
+pub fn replay_pair(request: &crate::ledger::ReplayRequest) -> Value {
+    fn drift_value(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut out = Map::new();
+                for (k, val) in map {
+                    let value = drift_value(val);
+                    out.insert(
+                        k.clone(),
+                        if k == "arguments" && val.is_string() {
+                            match serde_json::from_str::<Value>(val.as_str().unwrap_or_default()) {
+                                // Re-serialized by a different serializer:
+                                // keys sorted, spacing compacted — the
+                                // same parsed JSON, still a wire string.
+                                Ok(parsed) => {
+                                    let resorted = compact(&parsed);
+                                    Value::String(
+                                        serde_json::to_string(&resorted).unwrap_or_default(),
+                                    )
+                                }
+                                Err(_) => value,
+                            }
+                        } else if k == "content" && val.is_string() {
+                            Value::String(collapse_interior_ws(val.as_str().unwrap_or_default()))
+                        } else {
+                            value
+                        },
+                    );
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(drift_value).collect()),
+            _ => v.clone(),
+        }
+    }
+    // Compact re-serialization: sort object keys — the canonical
+    // drift this proxy exists to repair.
+    fn compact(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = Map::new();
+                for k in keys {
+                    out.insert(k.clone(), compact(&map[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(compact).collect()),
+            _ => v.clone(),
+        }
+    }
+    // Collapse interior same-line whitespace runs (the inverse of the
+    // classifier's conservative repairable-drift reading).
+    fn collapse_interior_ws(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut pending = String::new();
+        let mut line_started = false;
+        for ch in s.chars() {
+            match ch {
+                ' ' | '\t' | '\r' => {
+                    if line_started {
+                        pending.push(ch);
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                '\n' => {
+                    out.push_str(&pending);
+                    pending.clear();
+                    out.push('\n');
+                    line_started = false;
+                }
+                c => {
+                    if !pending.is_empty() {
+                        out.push(' ');
+                        pending.clear();
+                    }
+                    line_started = true;
+                    out.push(c);
+                }
+            }
+        }
+        out.push_str(&pending);
+        out
+    }
+
+    let canonical = serde_json::json!({
+        "model": request.model,
+        "messages": request.messages,
+    });
+    let drifted = drift_value(&canonical);
+    serde_json::json!({
+        "session_id": request.session_id,
+        "turn": request.turn,
+        "model": request.model,
+        "a_drifted": drifted,
+        "b_canonical": canonical,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

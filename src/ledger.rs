@@ -122,6 +122,8 @@ impl Ledger {
     /// A ledger persisted as JSONL under `dir`, reloading what is already
     /// there. Torn trailing lines (a crash mid-append) are skipped, not
     /// fatal: a lost line loses one turn of audit, never correctness.
+    /// Files are read in `<session>.jsonl` naming order so reload is
+    /// deterministic (eviction picks the oldest, consistently).
     pub fn on_disk(dir: PathBuf) -> std::io::Result<Self> {
         let mut ledger = Self {
             sessions: HashMap::new(),
@@ -130,19 +132,14 @@ impl Ledger {
             dir: Some(dir.clone()),
         };
         std::fs::create_dir_all(&dir)?;
-        // Reload oldest files first so, if the session cap is exceeded, the
-        // most recently written sessions are the ones that survive.
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)?
+        let mut files: Vec<String> = std::fs::read_dir(&dir)?
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .filter_map(|p| {
-                let m = p.metadata().ok()?;
-                m.modified().ok().map(|m| (m, p))
-            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
             .collect();
-        files.sort_by_key(|(m, _)| *m);
-        for (_, path) in files {
+        files.sort();
+        for name in files {
+            let path = dir.join(name);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -274,6 +271,38 @@ impl Ledger {
             .is_some_and(|per_model| !per_model.is_empty())
     }
 
+    /// Replay a recorded ledger directory: for every session+model chain on
+    /// disk, emit the request body that extends that chain (the canonical
+    /// request plus a fresh user turn), in original turn order. The bench
+    /// A/B driver builds both variants from these: the drifted form (what
+    /// a re-serializing client sends) and the canonical form (what repair
+    /// would forward).
+    pub fn replay_requests(dir: &std::path::Path) -> std::io::Result<Vec<ReplayRequest>> {
+        let ledger = Ledger::on_disk(dir.to_path_buf())?;
+        let mut out: Vec<ReplayRequest> = ledger
+            .sessions
+            .iter()
+            .flat_map(|(session_id, per_model)| {
+                per_model.iter().map(move |(model, turn)| ReplayRequest {
+                    session_id: *session_id,
+                    turn: turn.turn,
+                    model: model.clone(),
+                    messages: {
+                        let mut chain = turn.request_messages.clone();
+                        if let Some(arr) = chain.as_array_mut() {
+                            arr.push(serde_json::json!(
+                                {"role": "user", "content": "Continue."}
+                            ));
+                        }
+                        chain
+                    },
+                })
+            })
+            .collect();
+        out.sort_by_key(|r| (r.session_id, r.turn));
+        Ok(out)
+    }
+
     /// The most recently appended-to session that has a chain for `model`.
     /// A request whose leading history was truncated or re-based resolves
     /// to a *new* session (no shared prefix-hash), and this finds the
@@ -310,6 +339,20 @@ impl Ledger {
 /// `.await`; poisoning is recovered from because the ledger has no invariant
 /// a panicked handler could break.
 pub struct SharedLedger(pub Mutex<Ledger>);
+
+/// One replayable request reconstructed from the on-disk ledger: the
+/// canonical chain plus a fresh tail. The replay bench (C6) drives a
+/// stub/provider with the drifted and canonical serializations of this
+/// body to measure the repair delta.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayRequest {
+    pub session_id: u64,
+    pub turn: u32,
+    pub model: String,
+    /// The request body's `messages`: the chain as forwarded, extended by
+    /// a fresh user turn.
+    pub messages: serde_json::Value,
+}
 
 impl SharedLedger {
     /// An in-memory ledger (no disk). The default for tests and `--no-ledger`.
