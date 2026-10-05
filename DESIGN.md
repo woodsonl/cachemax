@@ -98,6 +98,14 @@ Dark-mode values (parallel to the front-matter tokens):
 
 Amber (`accent`) is the one signal color, in two roles only: it marks verified cache-served data (the hit rate and the tape's hit cells), and it marks the instrument's own live/active states (the status-strip live dot, focus-visible outlines). `accent` `#c47a12` is reserved for fills and glyphs (large marks, ≥3:1); body-size amber text uses `accent-text` `#8f5300` (4.87:1 on light) so the hit-rate number clears the 4.5:1 bar. It is never a button fill, never a logo, never the hero number. Cost and money are facts, so they stay in `text` ink. `accent-resent` marks resent prefix. `text-faint` marks cold, absent, and past values. Neutrals derive from the warm bone hue, so dark mode dims and slightly desaturates rather than inverting.
 
+### C5 amendment: repair states (2026-10-04)
+
+Repair adds one third amber role and keeps findings in ink:
+
+- **`◆` repaired — amber (`accent-text`), the third amber role.** The tape glyph and the turn-row annotation mark turns the instrument itself acted on: the history was rewritten and the provider re-served the cache. This is verified cache-served data achieved by the instrument — exactly what amber exists to mark — and it is why the hero's "recovered by repair" line uses the same color. The glyph (`◆`, distinct from every neighbor) keeps it legible with color removed.
+- **`~` drift and `!` unrepairable stay ink (`text-muted` / `text`).** They are findings, not actions: color was considered for red/amber flags and rejected — a third and fourth signal color would dilute amber's meaning, and the glyph already carries the verdict. The turn-row annotation names the action on repaired turns (`◆ repaired tool_args · 312 tk`) and the finding otherwise (`~ whitespace · 1,2xx tk`).
+- **"recovered by repair"** renders only when at least one turn was repaired: the line does not exist rather than reading zero (the `—`-vs-`0` rule applies to whole features too).
+
 ## Typography
 
 Display and body draw from a working-sans world; data draws from notation.
@@ -131,7 +139,7 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 - **hero-value:** mono 700, tabular, `text` color for facts; `text-faint` for the past value in a transition. Never in `accent` or any signal color.
 - **provenance-tag:** 1px `line-strong` border, mono 11px `text-muted`, uppercase. Used for `provider_reported`, `engine_measured`, and `no_cache_truth`.
 - **data-table-row:** bottom border `line`; cold rows in `text-faint`; the cumulative row gets a `line-strong` top border and weight 700. Hover raises the row to `surface`. Focus-visible adds an `accent` outline.
-- **tape-cell:** monospace glyph, color by state (hit `accent` `█`, resent `accent-resent` `▓`, cold `text-faint` `░`, miss `text` `▚`, break `text-muted` `┊`, incomplete `text-faint` `?`), always distinguishable with color removed by glyph shape (incomplete is marked by its own glyph, never conflated with cold).
+- **tape-cell:** monospace glyph, color by state (hit `accent` `█`, repaired `accent-text` `◆`, resent `accent-resent` `▓`, cold `text-faint` `░`, miss `text` `▚`, break `text-muted` `┊`, drift `text-muted` `~`, unrepairable `text` `!`, incomplete `text-faint` `?`), always distinguishable with color removed by glyph shape (incomplete is marked by its own glyph, never conflated with cold; repaired is the one amber glyph).
 - **control** (tape-mode toggle, export): body face 14px, `text` color, no fill; 1px `line-strong` underline or border only. Hover darkens the label to `text`. Focus-visible draws an `accent` outline at 2px offset. Minimum 44x44px target even when the label is smaller. Never amber-filled.
 
 ## Do's and Don'ts
@@ -158,3 +166,4 @@ Near-square throughout. Radius is 2px on every surface, input, and tag. Instrume
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-09-26 | Initial design system created | Created by /design-consultation from the design review's deferred visual-language decision. Direction A chosen from three HTML previews. Memorable thing: trust, honest numbers. |
+| 2026-10-04 | C5 repair amendment: `◆` repaired joins amber; drift/unrepairable stay ink; "recovered by repair" hero line | Repair shipped (C2–C4). Amber's meaning — verified cache-served data — extends naturally to data the instrument recovered itself; findings stay ink so amber keeps meaning exactly one thing per role. Glyphs stay legible without color. |

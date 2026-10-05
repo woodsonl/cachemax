@@ -182,7 +182,7 @@ struct Cli {
     /// Directory for the repair ledger (default: ~/.cache/cachemax/ledger).
     /// The ledger stores the exact message content the proxy forwards and
     /// receives — locally only, never exported — so repair can extend the
-    /// provider-seen prefix. Delete the directory to purge it.
+    /// provider-seen prefix. Purge it with `cachemax purge`.
     #[arg(long, global = true)]
     ledger_dir: Option<String>,
 
@@ -215,10 +215,16 @@ enum Command {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Delete the on-disk repair ledger (the exact messages the proxy
+    /// forwarded and received): every `<session>.jsonl` file directly
+    /// inside the ledger directory. Other files, subdirectories, and the
+    /// directory itself stay; a running proxy's in-memory ledger is not
+    /// touched — restart to drop it.
+    Purge,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let level = if cli.verbose {
@@ -228,10 +234,131 @@ async fn main() {
     };
     tracing_subscriber::fmt().with_max_level(level).init();
 
+    // Purge needs nothing but the ledger directory: no tokenizer, no
+    // adapter, and it must not CREATE a ledger merely by running. It
+    // ignores --no-ledger by design: it targets what a previous `serve`
+    // (with or without the flag) may have written, on disk.
+    if matches!(cli.command, Some(Command::Purge)) {
+        let dir = cli
+            .ledger_dir
+            .clone()
+            .map_or_else(default_ledger_dir, std::path::PathBuf::from);
+        let report = match purge_ledger(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        print_purge(&dir, &report);
+        return Ok(());
+    }
     if let Err(e) = run(cli).await {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// What one purge removed, and what it could not.
+#[derive(Debug, Default)]
+struct PurgeReport {
+    dir_existed: bool,
+    removed: usize,
+    failed: usize,
+    bytes: u64,
+    /// The messages for removals that failed (stderr material).
+    failures: Vec<String>,
+}
+
+/// Print the purge outcome. A purge that could not remove everything is
+/// a failure: exit non-zero rather than claim a clean directory.
+fn print_purge(dir: &std::path::Path, report: &PurgeReport) {
+    if !report.dir_existed {
+        println!("nothing to purge: {} does not exist", dir.display());
+    } else if report.failed > 0 {
+        for f in &report.failures {
+            eprintln!("{f}");
+        }
+        println!(
+            "purged {} of {} ledger file(s) from {}; the rest could not be removed",
+            report.removed,
+            report.removed + report.failed,
+            dir.display()
+        );
+        std::process::exit(1);
+    } else if report.removed == 0 {
+        println!("ledger {} already empty", dir.display());
+    } else {
+        println!(
+            "purged {} ledger file(s), {} bytes, from {}",
+            report.removed,
+            report.bytes,
+            dir.display()
+        );
+    }
+}
+
+/// Delete the ledger's own session files from `dir`. Only files named
+/// `<digits>.jsonl` — the exact name `serve` writes (`<session>.jsonl`,
+/// see `crate::ledger`) — are removed. Symlinks are never followed (a
+/// link named like a session file is skipped, its target untouched);
+/// other files, subdirectories, and the directory itself stay.
+fn purge_ledger(dir: &std::path::Path) -> Result<PurgeReport, Box<dyn std::error::Error>> {
+    if !dir.exists() {
+        return Ok(PurgeReport {
+            dir_existed: false,
+            ..PurgeReport::default()
+        });
+    }
+    if !dir.is_dir() {
+        return Err(Fault {
+            problem: "ledger directory unusable",
+            cause: format!("{} is not a directory", dir.display()),
+            fix: "pass the --ledger-dir the proxy runs with (default: ~/.cache/cachemax/ledger)",
+            docs: "ledger",
+        }
+        .into());
+    }
+    let mut report = PurgeReport {
+        dir_existed: true,
+        ..PurgeReport::default()
+    };
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| Fault::ledger_unavailable(&dir.display().to_string(), e.to_string()))?;
+        let path = entry.path();
+        // A session file is a regular file named `<digits>.jsonl`. A
+        // symlink named so is not its target: skipping it can never lose
+        // data, and following it could.
+        let is_session_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && path.extension().is_some_and(|e| e == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        if !is_session_file {
+            continue;
+        }
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.removed += 1;
+                report.bytes += bytes;
+            }
+            // A file that cannot be removed is reported, not fatal: the
+            // rest of the purge still happened.
+            Err(e) => {
+                report.failed += 1;
+                report
+                    .failures
+                    .push(format!("could not remove {}: {e}", path.display()));
+            }
+        }
+    }
+    Ok(report)
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -301,6 +428,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {path}");
             Ok(())
         }
+        // Handled before `run` (it needs no tokenizer or upstream); the
+        // compiler still wants the arm here.
+        Command::Purge => Ok(()),
     }
 }
 
@@ -499,5 +629,61 @@ mod tests {
         // silently write `cachemax-0.jsonl`.
         assert_eq!(first_session_id(""), None);
         assert_eq!(first_session_id("\n  \n"), None);
+    }
+
+    #[test]
+    fn purge_removes_only_session_files() {
+        let dir = std::env::temp_dir().join(format!("cachemax-purge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("7.jsonl");
+        let keep = dir.join("notes.txt");
+        let named = dir.join("backup.jsonl"); // not a session name
+        let nested = dir.join("sub.jsonl"); // a directory, not a file
+        std::fs::write(&a, "{\"turn\":1}\n").unwrap();
+        std::fs::write(&keep, "user data").unwrap();
+        std::fs::write(&named, "my precious data").unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let report = purge_ledger(&dir).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
+        assert!(report.bytes > 0);
+        assert!(!a.exists(), "session files are gone");
+        assert!(named.exists(), "non-session jsonl stays");
+        assert!(keep.exists(), "non-ledger files stay");
+        assert!(nested.exists(), "subdirectories stay");
+        assert!(dir.exists(), "the directory itself stays");
+
+        // A second purge is a clean no-op; a missing dir reports honestly.
+        let again = purge_ledger(&dir).unwrap();
+        assert_eq!(again.removed, 0);
+        let missing = purge_ledger(&dir.join("nope")).unwrap();
+        assert!(!missing.dir_existed && missing.removed == 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_skips_a_symlink_named_like_a_session_file() {
+        // A link named 7.jsonl pointing at user data must be skipped, not
+        // followed-then-removed: the target survives, the report is clean.
+        let dir = std::env::temp_dir().join(format!("cachemax-purge-sym-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("7.jsonl")).unwrap();
+
+        let report = purge_ledger(&dir).unwrap();
+        assert_eq!(report.removed, 0, "a link is not a session file");
+        assert!(target.exists(), "the link's target is untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_of_a_file_path_faults() {
+        let f = std::env::temp_dir().join(format!("cachemax-purge-file-{}", std::process::id()));
+        std::fs::write(&f, "x").unwrap();
+        assert!(purge_ledger(&f).is_err());
+        std::fs::remove_file(&f).ok();
     }
 }

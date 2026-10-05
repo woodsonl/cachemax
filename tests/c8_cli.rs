@@ -101,3 +101,55 @@ fn serve_on_a_taken_port_fails_with_the_error_contract() {
     assert!(err.contains("--bind"), "must offer a fix: {err}");
     assert!(err.contains("docs"), "must link docs: {err}");
 }
+
+#[test]
+fn purge_reports_honestly_at_the_cli_level() {
+    let dir = std::env::temp_dir().join(format!("cachemax-cli-purge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ledger = dir.join("42.jsonl");
+    std::fs::write(&ledger, "{\"turn\":1}\n").unwrap();
+
+    // A real purge names what it removed and exits 0.
+    let out = cachemax()
+        .args(["purge", "--ledger-dir", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out_text.contains("purged 1 ledger file(s)"),
+        "got: {out_text}"
+    );
+
+    // An already-empty dir says so; a missing dir does not pretend.
+    let empty = cachemax()
+        .args(["purge", "--ledger-dir", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("already empty"));
+
+    let missing = cachemax()
+        .args(["purge", "--ledger-dir", dir.join("nope").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("does not exist"),
+        "got: {missing:?}"
+    );
+
+    // A path that is not a directory faults with the contract.
+    let file = dir.join("afile");
+    std::fs::write(&file, "x").unwrap();
+    let fault = cachemax()
+        .args(["purge", "--ledger-dir", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!fault.status.success());
+    let err = String::from_utf8_lossy(&fault.stderr);
+    assert!(err.contains("problem:"), "D3 contract, got: {err}");
+    assert!(err.contains("docs:"), "got: {err}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

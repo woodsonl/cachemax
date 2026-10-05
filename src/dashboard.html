@@ -61,8 +61,11 @@
   .tape .row .t{color:var(--muted);font-size:12px}
   .tape .cells{letter-spacing:2px}
   .hit{color:var(--accent-text)} .resent{color:var(--resent)} .cold{color:var(--faint)} .miss{color:var(--text)} .break{color:var(--muted)} .incomplete{color:var(--faint)}
-  .drift{color:var(--muted)} .unrepairable{color:var(--text)}
+  /* C5 amendment: amber marks the instrument's own repair action;
+     findings stay muted ink. */
+  .drift{color:var(--muted)} .unrepairable{color:var(--text)} .repaired{color:var(--accent-text)}
   .dtag{font-family:var(--fm);font-size:11px;color:var(--muted);letter-spacing:.04em}
+  .dtag.repaired{color:var(--accent-text)}
   .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-family:var(--fm);font-size:11.5px;color:var(--muted);letter-spacing:.03em}
   .legend b{color:var(--text);font-weight:500}
   .empty{color:var(--muted);font-family:var(--fb)}
@@ -105,6 +108,7 @@
         <div class="row"><span>billed input</span><span class="v" id="f-billed">—</span></div>
         <div class="row"><span>cache-served</span><span class="v" id="f-cached">—</span></div>
         <div class="row"><span>hit rate</span><span class="v" id="f-hit" style="color:var(--accent-text)">—</span></div>
+        <div class="row" id="f-recovered-row" style="display:none"><span>recovered by repair</span><span class="v" id="f-recovered" style="color:var(--accent-text)">—</span></div>
       </div>
     </div>
     <div class="facts">
@@ -131,7 +135,7 @@
       <div class="legend">
         <span><b>█</b> hit</span><span><b>▓</b> resent</span><span><b>░</b> cold</span>
         <span><b>┊</b> break</span><span><b>▚</b> miss</span><span><b>?</b> incomplete</span>
-        <span><b>~</b> drift</span><span><b>!</b> unrepairable</span>
+        <span><b>◆</b> repaired</span><span><b>~</b> drift</span><span><b>!</b> unrepairable</span>
       </div>
     </section>
   </div>
@@ -144,7 +148,7 @@
 
 <script>
 (function(){
-  var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?", drift:"~", unrepairable:"!"};
+  var GLYPH = {hit:"█", resent:"▓", cold:"░", miss:"▚", break:"┊", incomplete:"?", drift:"~", repaired:"◆", unrepairable:"!"};
   var lastTurnCount = -1;
   var lastSessionId = null;   // for session-break detection
   var sawSession = false;     // for metrics-reset detection
@@ -166,9 +170,10 @@
     var html = state.turns.map(function(t){
       var cls = t.cold ? "cold" : (t.incomplete ? "inc" : ((t.turn===lastTurnCount)?"new":""));
       var mark = t.incomplete ? '<span class="mark">?</span>' : esc(t.hit);
-      // Dry-run drift annotation: a small mono tag after the turn number,
-      // muted until the design amendment promotes it to signal color.
-      var dtag = t.drift ? ' <span class="dtag">~ '+esc(t.drift)+
+      // The drift annotation: what repair did or found. A repaired turn
+      // names the action in amber; a drifted one names the finding, muted.
+      var dtag = t.drift ? ' <span class="dtag'+(t.repaired?' repaired':'')+'">'+
+        (t.repaired ? '◆ repaired ' : '~ ')+esc(t.drift)+
         (t.drift_tokens ? ' · '+esc(t.drift_tokens) : '')+'</span>' : '';
       return '<tr class="'+cls+'" tabindex="0"><td>'+t.turn+dtag+'</td><td class="num">'+mark+
         '</td><td class="num">'+esc(t.cached_over_history)+'</td><td class="num">'+esc(t.cost)+'</td></tr>';
@@ -211,6 +216,13 @@
         " · " + state.write_split.derived;
     } else {
       splitRow.style.display = "none";
+    }
+    var recRow = document.getElementById("f-recovered-row");
+    if(state.recovered){
+      recRow.style.display = "";
+      document.getElementById("f-recovered").textContent = state.recovered;
+    } else {
+      recRow.style.display = "none";
     }
     document.getElementById("session-tag").textContent =
       "Complete records only · " + state.incomplete_count + " incomplete excluded";

@@ -42,8 +42,13 @@ pub enum TapeState {
     Break,
     Incomplete,
     /// The resent history drifted from the canonical chain (repairable
-    /// flavor). Dry-run annotation.
+    /// flavor) and went out untouched: a dry-run annotation, or repair
+    /// declined. Muted — a finding, not an action.
     Drift,
+    /// Repair rewrote the history and the provider re-served the cache:
+    /// the instrument's own action, marked in amber (DESIGN.md C5
+    /// amendment — recovered cache-served data).
+    Repaired,
     /// Drift repair refused to touch: hard stop or semantic inequality.
     Unrepairable,
 }
@@ -59,6 +64,7 @@ impl TapeState {
             TapeState::Break => "┊",
             TapeState::Incomplete => "?",
             TapeState::Drift => "~",
+            TapeState::Repaired => "◆",
             TapeState::Unrepairable => "!",
         }
     }
@@ -155,6 +161,9 @@ pub struct TurnRow {
     /// At-risk tokens behind the drift annotation, formatted (`1,2xx tk`),
     /// when the turn was examined and drifted.
     pub drift_tokens: Option<String>,
+    /// True when repair rewrote this turn's history (`on` mode). The
+    /// annotation then names the action, not the finding.
+    pub repaired: bool,
 }
 
 /// The cumulative summary row.
@@ -196,6 +205,10 @@ pub struct DashboardState {
     /// Anthropic's write/read split, when the session exposes one (secondary to
     /// the binding hit rate). `None` for providers that report no write count.
     pub write_split: Option<WriteSplit>,
+    /// Cache-served tokens on repaired turns (`on` mode): what the rewrite
+    /// let the provider re-serve. `None` when nothing was repaired — the
+    /// line does not exist rather than reading zero.
+    pub recovered: Option<String>,
     /// The cold→warm transition always shown beside the hero.
     pub transition: Transition,
     pub turns: Vec<TurnRow>,
@@ -243,6 +256,14 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
 
     let cached_sum: u64 = complete.iter().map(|r| r.cached_tokens).sum();
     let history_sum: u64 = complete.iter().map(|r| r.resent_history_tokens).sum();
+    // Recovered by repair: cache-served tokens on turns whose history was
+    // rewritten (`on` mode). The provider reported these figures — the
+    // rewrite is what let the request read a warm prefix at all.
+    let recovered_sum: u64 = complete
+        .iter()
+        .filter(|r| r.repaired)
+        .map(|r| r.cached_tokens)
+        .sum();
     // Billed and cost follow the same "complete records only" rule the page
     // states: an incomplete turn's partial usage is excluded, as it is from the
     // hit rate. (Turn 0 is complete but carries no history; its own fresh input
@@ -331,6 +352,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         }),
         provenance: source_tag(source).to_string(),
         write_split,
+        recovered: (recovered_sum > 0).then(|| format!("{} tk", format_tokens(recovered_sum))),
         transition,
         turns,
         cumulative,
@@ -341,8 +363,9 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
 fn turn_row(r: &Record) -> TurnRow {
     let incomplete = r.status == Status::Incomplete;
     let cold = r.turn == 0;
-    // The dry-run annotation. Mode off = not examined: no claim rendered.
-    // Clean turns render nothing (the absence of drift is not news).
+    // The annotation. Mode off = not examined: no claim rendered. Clean
+    // turns render nothing (the absence of drift is not news). A repaired
+    // turn names the ACTION; everything else names the finding.
     let examined =
         r.repair_mode != crate::repair::RepairMode::Off && r.matches_canonical == Some(false);
     let (drift, drift_tokens) = if !examined {
@@ -389,6 +412,7 @@ fn turn_row(r: &Record) -> TurnRow {
         incomplete,
         drift,
         drift_tokens,
+        repaired: r.repaired,
     }
 }
 
@@ -416,18 +440,26 @@ fn tape_row(r: &Record) -> TapeRow {
         cells.insert(0, TapeState::Break);
         cells.insert(1, TapeState::Miss);
     }
-    // The dry-run drift annotation leads the tape the same way: `~` when the
-    // drift has a repairable flavor, `!` when repair would refuse it. Both
-    // are glyph-legible without color (DESIGN.md tape-cell rule).
-    if !incomplete
-        && r.repair_mode != crate::repair::RepairMode::Off
-        && r.matches_canonical == Some(false)
-    {
-        let state = match r.drift_kind {
-            Some(_) => TapeState::Drift,
-            None => TapeState::Unrepairable,
+    // The drift annotation leads the tape the same way: `◆` when repair
+    // rewrote the turn (the action, in amber per the C5 amendment), `~`
+    // when drift went out untouched (repairable flavor), `!` when repair
+    // would refuse it. All are glyph-legible without color (DESIGN.md
+    // tape-cell rule).
+    if !incomplete && r.repair_mode != crate::repair::RepairMode::Off {
+        let state = if r.repaired {
+            Some(TapeState::Repaired)
+        } else if r.matches_canonical == Some(false) {
+            Some(if r.drift_kind.is_some() {
+                TapeState::Drift
+            } else {
+                TapeState::Unrepairable
+            })
+        } else {
+            None
         };
-        cells.insert(0, state);
+        if let Some(state) = state {
+            cells.insert(0, state);
+        }
     }
     TapeRow {
         turn: r.turn,
@@ -571,6 +603,7 @@ mod tests {
             TapeState::Break,
             TapeState::Incomplete,
             TapeState::Drift,
+            TapeState::Repaired,
             TapeState::Unrepairable,
         ];
         let mut glyphs: Vec<&str> = states.iter().map(|s| s.glyph()).collect();
@@ -581,6 +614,7 @@ mod tests {
             states.len(),
             "each state needs a unique glyph"
         );
+        assert_eq!(TapeState::Repaired.glyph(), "◆");
     }
 
     /// A record examined in dry-run with the given drift claim.
@@ -623,6 +657,48 @@ mod tests {
         let r = drifted(1, None, 0);
         assert_eq!(turn_row(&r).drift.as_deref(), Some("first-turn"));
         assert_eq!(turn_row(&r).drift_tokens.as_deref(), Some("0 tk"));
+    }
+
+    #[test]
+    fn a_repaired_turn_names_the_action_and_leads_the_tape_in_amber() {
+        let mut r = drifted(
+            3,
+            Some(crate::repair::DriftKind::ToolArgReserialization),
+            312,
+        );
+        r.repaired = true;
+        r.cached_tokens = 800;
+        let row = turn_row(&r);
+        assert!(row.repaired);
+        assert_eq!(row.drift.as_deref(), Some("tool_args"));
+        let tape = tape_row(&r);
+        assert_eq!(
+            tape.cells[0],
+            TapeState::Repaired,
+            "the action glyph leads the tape"
+        );
+    }
+
+    #[test]
+    fn the_recovered_line_exists_only_when_something_was_repaired() {
+        // Two repaired turns with real cache reads...
+        let repaired = |turn: u32| {
+            let mut r = rec(turn, 900, 1000);
+            r.repair_mode = crate::repair::RepairMode::On;
+            r.repaired = true;
+            r
+        };
+        let with = view(&[repaired(1), repaired(2)], true, 1);
+        assert_eq!(with.recovered.as_deref(), Some("1,800 tk"));
+        // ...and none: the line does not exist, it does not read zero.
+        let without = view(&[rec(1, 900, 1000)], true, 1);
+        assert_eq!(without.recovered, None);
+        // An incomplete repaired turn contributes nothing (aggregates are
+        // complete-turns only).
+        let mut inc = repaired(3);
+        inc.status = Status::Incomplete;
+        let partial = view(&[repaired(1), inc], true, 1);
+        assert_eq!(partial.recovered.as_deref(), Some("900 tk"));
     }
 
     #[test]
