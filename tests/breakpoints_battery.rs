@@ -40,20 +40,40 @@ async fn stub_upstream(seen: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
             "output_tokens": 5,
         },
     });
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move |body: Bytes| {
-            let seen = seen.clone();
-            async move {
-                seen.lock().unwrap().push(body.to_vec());
-                let bytes = serde_json::to_vec(&reply).unwrap();
-                Response::builder()
-                    .header("content-type", "application/json")
-                    .body(Body::from(bytes))
-                    .unwrap()
-            }
-        }),
-    );
+    // The proxy posts the Anthropic dialect to the native /v1/messages;
+    // the compat route stays for any client that still speaks it.
+    let reply2 = reply.clone();
+    let seen2 = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let seen = seen2.clone();
+                let reply = reply2.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });

@@ -31,27 +31,50 @@ async fn recording_stream_upstream(
     events: Vec<Bytes>,
 ) -> String {
     let events = Arc::new(events);
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move |body: Bytes| {
-            let seen = seen.clone();
-            let events = events.clone();
-            async move {
-                seen.lock()
-                    .unwrap()
-                    .push(serde_json::from_slice(&body).unwrap());
-                let stream = async_stream::stream! {
-                    for e in events.iter() {
-                        yield Ok::<Bytes, std::io::Error>(e.clone());
-                    }
-                };
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from_stream(stream))
-                    .unwrap()
-            }
-        }),
-    );
+    let events2 = events.clone();
+    let seen2 = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let seen = seen2.clone();
+                let events = events2.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    let stream = async_stream::stream! {
+                        for e in events.iter() {
+                            yield Ok::<Bytes, std::io::Error>(e.clone());
+                        }
+                    };
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    let stream = async_stream::stream! {
+                        for e in events.iter() {
+                            yield Ok::<Bytes, std::io::Error>(e.clone());
+                        }
+                    };
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -264,23 +287,42 @@ async fn an_anthropic_dialect_turn_is_captured_end_to_end() {
         Bytes::from_static(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"),
         Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
     ];
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move || {
-            let events = events.clone();
-            async move {
-                let stream = async_stream::stream! {
-                    for e in events {
-                        yield Ok::<Bytes, std::io::Error>(e);
-                    }
-                };
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from_stream(stream))
-                    .unwrap()
-            }
-        }),
-    );
+    let events2 = events.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let events = events2.clone();
+                async move {
+                    let stream = async_stream::stream! {
+                        for e in events {
+                            yield Ok::<Bytes, std::io::Error>(e);
+                        }
+                    };
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move || {
+                let events = events.clone();
+                async move {
+                    let stream = async_stream::stream! {
+                        for e in events {
+                            yield Ok::<Bytes, std::io::Error>(e);
+                        }
+                    };
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });

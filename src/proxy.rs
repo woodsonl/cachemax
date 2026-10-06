@@ -674,6 +674,11 @@ pub fn router<A: Adapter + 'static>(state: Arc<AppState<A>>) -> Router {
         .route("/", axum::routing::get(serve_dashboard))
         .route("/api/state", axum::routing::get(dashboard_state::<A>))
         .route("/api/export", axum::routing::get(export_session::<A>))
+        // A transparent proxy serves the upstream's model list: clients
+        // (Claude Code among them) probe {base}/v1/models to validate their
+        // model selection before sending a single message. Without this
+        // route the probe 404s and the client refuses to start.
+        .route("/v1/models", axum::routing::get(forward_models::<A>))
         .route(
             "/api/violations",
             axum::routing::get(|| async {
@@ -705,6 +710,63 @@ async fn serve_dashboard() -> Response {
 }
 
 /// The live dashboard snapshot: the most recently active session's view.
+/// Forward the upstream's model list verbatim, carrying the client's auth
+/// headers — the same forwarding the message path uses.
+async fn forward_models<A: Adapter + 'static>(
+    axum::extract::State(state): axum::extract::State<Arc<AppState<A>>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    // Pagination and filter queries ride the query string: dropping it
+    // would hand every request the upstream's default first page.
+    let url = match uri.query() {
+        Some(q) => format!("{}/models?{q}", versioned_base(&state.upstream_url)),
+        None => format!("{}/models", versioned_base(&state.upstream_url)),
+    };
+    let mut req = state.client.get(&url);
+    for name in FORWARD_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            req = req.header(*name, value);
+        }
+    }
+    match req.send().await {
+        Ok(upstream) => {
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            // A failed body read is a gateway failure, not an empty list
+            // with a success status: masking it would hand clients an
+            // invalid model list that looks authoritative.
+            let body = match upstream.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from(format!("model list read failed: {e}")))
+                        .unwrap()
+                }
+            };
+            let mut builder = Response::builder().status(status);
+            for (k, v) in headers.iter() {
+                if k != axum::http::header::CONTENT_LENGTH
+                    && k != axum::http::header::TRANSFER_ENCODING
+                {
+                    builder = builder.header(k, v);
+                }
+            }
+            builder.body(Body::from(body)).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::empty())
+                    .unwrap()
+            })
+        }
+        Err(e) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("upstream unreachable: {e}")))
+            .unwrap(),
+    }
+}
+
 async fn dashboard_state<A: Adapter + 'static>(State(state): State<Arc<AppState<A>>>) -> Response {
     let (records, session_count, live) = {
         let guard = state.sessions.lock();
@@ -760,6 +822,9 @@ const FORWARD_HEADERS: &[&str] = &[
     "authorization",
     "x-api-key",
     "anthropic-version",
+    // OAuth flows (Claude subscriptions) and feature gates ride this
+    // header; dropping it changes what the upstream does with the request.
+    "anthropic-beta",
     "openai-organization",
     "openai-project",
     "http-referer",
@@ -783,6 +848,19 @@ pub fn versioned_base(base: &str) -> String {
 /// The `chat/completions` URL for `base`. See [`versioned_base`].
 fn upstream_chat_url(base: &str) -> String {
     format!("{}/chat/completions", versioned_base(base))
+}
+
+/// The native chat URL for the backend: Anthropic's Messages API lives at
+/// `/v1/messages`, and its OpenAI-compat endpoint silently drops the
+/// top-level `system` (and every `cache_control` hint) — posting the
+/// Anthropic dialect there loses the system prompt without an error, which
+/// is precisely the failure a stub can never catch.
+fn upstream_chat_url_for(base: &str, backend: &str) -> String {
+    if backend == "anthropic" {
+        format!("{}/messages", versioned_base(base))
+    } else {
+        upstream_chat_url(base)
+    }
 }
 
 /// The engine's Prometheus endpoint, for backends that expose one (`vllm`).
@@ -1268,7 +1346,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
     // Forward first. The request body is passed through untouched unless
     // usage injection applies; auth and provider-identification headers are
     // forwarded so cloud keys keep working.
-    let url = upstream_chat_url(&state.upstream_url);
+    let url = upstream_chat_url_for(&state.upstream_url, state.adapter.name());
     // vLLM exposes no per-request cache figure in the response; the only
     // measurement is the delta of its `/metrics` counters across the request.
     // Snapshot before we forward, for backends that have the endpoint.

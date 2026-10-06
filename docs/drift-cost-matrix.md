@@ -143,6 +143,20 @@ reports zero cache writes for `cache_control` payloads at any length
 model also read zero — OpenRouter does not wire Anthropic prompt caching
 on either path. That leg needs a direct Anthropic key.
 
+## api.anthropic.com · subscription OAuth (2026-10-06)
+
+The Anthropic-dialect leg, run with a Claude subscription token
+(`sk-ant-oat…`) on the native `/v1/messages` endpoint, 48 sends, n=2: every
+reading on every class is a reported zero — the subscription auth path
+reports the cache fields but never a nonzero figure, so drift cost cannot
+be measured on it. This is the third auth path surveyed and the third
+answer: omniroute normalizes, OpenRouter free does not cache, and
+Anthropic subscription OAuth does not report caching to raw API callers.
+The Anthropic-dialect classes (hint placement, system shape, the
+tools-bearing prefix with `cache_control`) remain unmeasured pending a
+console API key (`sk-ant-api…`), which is the one auth path documented to
+bill and report prompt caching.
+
 ## Reading the table
 
 - `costs N tk` — the drifted bytes lose N cached tokens to the drift; repair
