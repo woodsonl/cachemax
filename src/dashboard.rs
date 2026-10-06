@@ -407,6 +407,8 @@ fn turn_row(r: &Record, floor: u64) -> TurnRow {
             Some(crate::repair::DriftKind::TruncatedHistory) => "truncated",
             Some(crate::repair::DriftKind::RoleContentReshaped) => "reshaped",
             Some(crate::repair::DriftKind::Mixed) => "mixed",
+            Some(crate::repair::DriftKind::ToolArgsRestored) => "args_restored",
+            Some(crate::repair::DriftKind::SerializationOnly) => "wire_bytes",
             // No kind: either a hard stop (tokens at risk were quantified)
             // or nothing canonical to extend (first turn / model switch).
             None if r.canonicalized_tokens > 0 => "unrepairable",

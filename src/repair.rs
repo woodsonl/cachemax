@@ -82,6 +82,18 @@ pub enum DriftKind {
     RoleContentReshaped,
     /// More than one of the above in one turn.
     Mixed,
+    /// Value-equal but wire-different: object key order (and, in principle,
+    /// any serialization difference that survives parsing). A byte-identity
+    /// provider keys its cache on those bytes; the rewrite restores the
+    /// recorded serialization.
+    SerializationOnly,
+    /// The client's tool-call `arguments` were corrupt JSON (truncated or
+    /// broken mid-write) for a call the canonical chain records intact —
+    /// same call id, same function name. The recorded arguments are
+    /// restored: without this the upstream rejects the whole request. The
+    /// one sanctioned rule that restores content the client did not
+    /// exactly send; every application is loud-logged.
+    ToolArgsRestored,
 }
 
 /// Why repair refused to touch this turn at all.
@@ -543,10 +555,23 @@ fn relation(a: &Value, b: &Value) -> Rel {
     let b = strip_cache_control(b);
     let (a, b): (&Value, &Value) = (&a, &b);
     if a == b {
+        // Value-equal — but the wire bytes may still differ (key order;
+        // escape and number-text differences normalize at parse). A
+        // byte-identity provider caches those bytes, so wire-different is
+        // repairable drift, surfaced as its own kind: dry-run sees it, the
+        // record carries it, and the rewrite restores the recorded
+        // serialization. Comparing the stripped forms keeps a hint-only
+        // difference Exact — placement is policy, not drift.
+        if serde_json::to_vec(a).unwrap_or_default() != serde_json::to_vec(b).unwrap_or_default() {
+            return Rel::Equivalent(DriftKind::SerializationOnly);
+        }
         return Rel::Exact;
     }
-    if tool_args_normalized(a) == tool_args_normalized(b) {
+    if number_lenient(&tool_args_normalized(a)) == number_lenient(&tool_args_normalized(b)) {
         return Rel::Equivalent(DriftKind::ToolArgReserialization);
+    }
+    if malformed_args_restorable(a, b) {
+        return Rel::Equivalent(DriftKind::ToolArgsRestored);
     }
     if text_normalized(a) == text_normalized(b) {
         return Rel::Equivalent(DriftKind::TextNormalization);
@@ -555,6 +580,81 @@ fn relation(a: &Value, b: &Value) -> Rel {
         return Rel::Equivalent(DriftKind::RoleContentReshaped);
     }
     Rel::Different
+}
+
+/// Whether `client` is a tool-calling element whose ONLY defect is corrupt
+/// `arguments` JSON on calls the canonical element records intact: same
+/// call id, same function name, client arguments that fail to parse while
+/// the canonical ones parse. The trial repair substitutes the recorded
+/// arguments and requires the rest to compare clean — anything else (a
+/// different name, a parseable but different call) stays flagged. This is
+/// the aggressive rule the owner approved: the upstream would reject the
+/// request outright, so restoring the recorded arguments saves the turn,
+/// and every application is loud-logged at the rewrite site.
+fn malformed_args_restorable(client: &Value, canonical: &Value) -> bool {
+    let (Some(_), Some(canonical_calls)) = (
+        client.get("tool_calls").and_then(Value::as_array),
+        canonical.get("tool_calls").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let mut repaired = client.clone();
+    let mut changed = false;
+    let Some(out_calls) = repaired.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    for call in out_calls.iter_mut() {
+        let (Some(id), Some(name)) = (
+            call.get("id").and_then(Value::as_str),
+            call.pointer("/function/name").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        let Some(recorded) = canonical_calls
+            .iter()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            return false;
+        };
+        if recorded.pointer("/function/name").and_then(Value::as_str) != Some(name) {
+            return false;
+        }
+        let client_args = call.pointer("/function/arguments");
+        let recorded_args = recorded.pointer("/function/arguments");
+        // Only a STRING that fails to parse is corruption. An object- or
+        // null-typed `arguments` is a different shape carrying (almost
+        // always) a different value — substituting the recorded text would
+        // silently replace content the client did send, which is the one
+        // thing this rule must never do. Missing arguments likewise stays
+        // flagged.
+        let Some(client_text) = client_args.and_then(Value::as_str) else {
+            return false;
+        };
+        if serde_json::from_str::<Value>(client_text).is_ok() {
+            continue; // parseable: not this rule's business
+        }
+        let recorded_parses = recorded_args
+            .map(|a| serde_json::from_str::<Value>(a.as_str().unwrap_or("\u{0}")).is_ok())
+            .unwrap_or(false);
+        if !recorded_parses {
+            return false;
+        }
+        // Substitute the recorded arguments into the trial copy.
+        if let Some(fn_obj) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+            if let Some(ra) = recorded_args {
+                fn_obj.insert("arguments".into(), ra.clone());
+                changed = true;
+            }
+        }
+    }
+    changed && {
+        // With the recorded arguments substituted, the remainder must
+        // compare clean under the ordinary ladder — anything else means the
+        // corruption was not the only difference.
+        let a = number_lenient(&tool_args_normalized(&repaired));
+        let b = number_lenient(&tool_args_normalized(canonical));
+        a == b || text_normalized(&repaired) == text_normalized(canonical)
+    }
 }
 
 /// A copy of `v` with content-block cache hints removed — an object that
@@ -597,7 +697,16 @@ fn tool_args_normalized(v: &Value) -> Value {
                 out.insert(
                     k.clone(),
                     if k == "arguments" && val.is_string() && map.contains_key("name") {
-                        parsed_or_self(val)
+                        number_lenient(&parsed_or_self(val))
+                    } else if k == "content"
+                        && map.get("role").and_then(Value::as_str) == Some("tool")
+                        && val.is_string()
+                    {
+                        // Tool results carry the tool's JSON output as a
+                        // string, and frameworks re-serialize that output
+                        // as aggressively as the arguments. Same parsed
+                        // value is the same result.
+                        number_lenient(&parsed_or_self(val))
                     } else {
                         tool_args_normalized(val)
                     },
@@ -607,6 +716,57 @@ fn tool_args_normalized(v: &Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.iter().map(tool_args_normalized).collect()),
         _ => v.clone(),
+    }
+}
+
+/// Normalize a JSON number to a comparison key that treats numerically
+/// identical counts as identical (`1`, `1.0`, `1e0` are one number) while
+/// keeping identity exact at and beyond 2^53 — for integer AND float text,
+/// since the f64 round trip folds neighbors there either way. -0.0 and
+/// 0.0 are one zero. The rewrite never uses this — it restores the
+/// recorded bytes — so this only decides whether drift exists, never what
+/// gets sent.
+fn number_lenient(v: &Value) -> Value {
+    match v {
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                // unsigned_abs: i64::MIN cannot be negated. 2^53 itself is
+                // exactly representable, so the boundary is inclusive.
+                if i.unsigned_abs() <= 9_007_199_254_740_992 {
+                    serde_json::Value::from(i as f64)
+                } else {
+                    v.clone()
+                }
+            } else if n.as_u64().is_some() {
+                // Above i64::MAX is necessarily beyond 2^53: exact text.
+                v.clone()
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.abs() < 9_007_199_254_740_992.0 {
+                    // Below 2^53 an f64 value is one value however it was
+                    // written; at and beyond, neighbors alias in f64, so the
+                    // exact text is kept for floats too. -0.0 and 0.0 are
+                    // one zero.
+                    if f == 0.0 {
+                        serde_json::Value::from(0.0f64)
+                    } else {
+                        serde_json::Value::from(f)
+                    }
+                } else {
+                    v.clone()
+                }
+            } else {
+                v.clone()
+            }
+        }
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, val) in map {
+                out.insert(k.clone(), number_lenient(val));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(number_lenient).collect()),
+        other => other.clone(),
     }
 }
 
@@ -1128,13 +1288,17 @@ mod tests {
     }
 
     #[test]
-    fn envelope_key_order_alone_is_not_drift() {
-        // Providers tokenize parsed content, not envelope bytes: a key
-        // reorder anywhere in the message object is exact, not drift.
+    fn envelope_key_order_is_wire_drift_and_is_repairable() {
+        // Providers that cache raw token identity key the wire bytes; a key
+        // reorder in the message object is value-equal but wire-different —
+        // real, repairable drift, surfaced as its own kind so dry-run sees
+        // it and the record carries it.
         let canonical = vec![json!({"role": "user", "content": "hi", "extra": 1})];
         let client = vec![json!({"extra": 1, "content": "hi", "role": "user"})];
         let c = classify(&client, &canonical);
-        assert!(c.report_matches);
+        assert!(!c.report_matches, "wire-different is not a clean match");
+        assert_eq!(c.semantic_break, None, "but it never breaks the run");
+        assert_eq!(c.drift_kind, Some(DriftKind::SerializationOnly));
     }
 
     #[test]
