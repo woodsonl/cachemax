@@ -221,6 +221,7 @@ client-chosen key forever would be unbounded memory.
 | `cachemax export` | Write the running proxy's session as JSONL. |
 | `cachemax purge` | Delete the on-disk repair ledger (see Security). |
 | `cachemax replay` | Print A/B request bodies (drifted vs canonical) from the recorded ledger, as JSONL. With `--execute`, drive them against a real endpoint and report cached tokens per form. |
+| `cachemax drift-matrix` | Measure, per drift class, what semantically-identical-but-byte-different bodies cost against a live endpoint — the per-endpoint priority list for repair. See docs/drift-cost-matrix.md. |
 
 | Flag | Meaning |
 |---|---|

@@ -368,12 +368,30 @@ pub async fn execute_pair(
     request: &crate::ledger::ReplayRequest,
 ) -> ChainReport {
     let pair = crate::repair::replay_pair(request);
-    let a_body = cfg
-        .backend
-        .prepare_body(&pair["a_drifted"], &request.request_system);
-    let b_body = cfg
-        .backend
-        .prepare_body(&pair["b_canonical"], &request.request_system);
+    execute_bodies(
+        client,
+        cfg,
+        &request.request_system,
+        &pair["a_drifted"],
+        &pair["b_canonical"],
+    )
+    .await
+}
+
+/// Drive one A/B pair from raw bodies — the same interleaved sampling as
+/// [`execute_pair`], for callers that hold their own body pair (the
+/// drift-cost matrix runs built-in fixtures). `system` is the recorded
+/// top-level system for the Anthropic dialect (injected with `max_tokens`);
+/// `Null` for dialects where the system rides inside `messages`.
+pub async fn execute_bodies(
+    client: &reqwest::Client,
+    cfg: &ExecuteConfig,
+    system: &serde_json::Value,
+    a_body: &serde_json::Value,
+    b_body: &serde_json::Value,
+) -> ChainReport {
+    let a_body = cfg.backend.prepare_body(a_body, system);
+    let b_body = cfg.backend.prepare_body(b_body, system);
     let mut a = SampleAcc::new("a_drifted");
     let mut b = SampleAcc::new("b_canonical");
     for _ in 0..cfg.samples {
@@ -381,9 +399,9 @@ pub async fn execute_pair(
         b.send(client, cfg, &b_body).await;
     }
     ChainReport {
-        session_id: request.session_id,
-        turn: request.turn,
-        model: request.model.clone(),
+        session_id: 0,
+        turn: 0,
+        model: String::new(),
         a_drifted: a.finish(),
         b_canonical: b.finish(),
     }

@@ -8,6 +8,7 @@ pub mod breakpoints;
 pub mod dashboard;
 pub mod export;
 pub mod ledger;
+pub mod matrix;
 pub mod proxy;
 pub mod rates;
 pub mod record;
