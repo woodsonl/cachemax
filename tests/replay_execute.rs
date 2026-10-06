@@ -432,6 +432,56 @@ async fn a_streamed_body_is_unmeasured_not_zero() {
 }
 
 #[tokio::test]
+async fn the_recorded_system_reaches_the_anthropic_body() {
+    // A chain with a recorded system, replayed anthropic: the body must
+    // carry both the system and the required max_tokens. The refactor that
+    // extracted execute_bodies dropped exactly this field, and every test
+    // then used a Null system — the regression was invisible.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app_seen = seen.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let seen = app_seen;
+            async move {
+                seen.lock().unwrap().push(body.to_vec());
+                let _ = headers;
+                let reply = serde_json::json!({
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 100, "cache_read_input_tokens": 90},
+                });
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&reply).unwrap()))
+                    .unwrap()
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let mut cfg = config(format!("http://{a}"), 1);
+    cfg.backend = Backend::Anthropic;
+
+    let request = cachemax::ledger::ReplayRequest {
+        session_id: 1,
+        turn: 1,
+        model: "claude-3".into(),
+        messages: serde_json::json!([{"role": "user", "content": "hi"}]),
+        request_system: serde_json::json!([{"type": "text", "text": "Be terse."}]),
+    };
+    let out = execute_pair(&client(), &cfg, &request).await;
+    assert_eq!(out.b_canonical.sends, 1);
+
+    let sent: serde_json::Value = serde_json::from_slice(&seen.lock().unwrap()[0]).unwrap();
+    assert_eq!(
+        sent["system"][0]["text"], "Be terse.",
+        "the recorded system is restored into the anthropic body"
+    );
+    assert_eq!(sent["max_tokens"], 1024);
+}
+
+#[tokio::test]
 async fn the_openai_path_is_version_normalized_like_serve() {
     // The endpoint already ends in /v1 (the documented form); the executor
     // must not double it into /v1/v1/... — the path the stub answers.

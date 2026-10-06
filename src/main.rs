@@ -171,6 +171,21 @@ impl Fault {
         }
     }
 
+    fn matrix_unknown_classes(unknown: &[&str], valid: &[&str]) -> Self {
+        Fault {
+            problem: "unknown drift class",
+            cause: format!(
+                "{}: not a known class for this backend; valid: {}",
+                unknown.join(", "),
+                valid.join(", ")
+            ),
+            fix:
+                "run without --classes for every class, or pick from the names listed in the cause",
+
+            docs: "replay-execute",
+        }
+    }
+
     fn replay_execute_unconfirmed(total_sends: usize) -> Self {
         Fault {
             problem: "replay --execute needs confirmation",
@@ -325,6 +340,34 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Measure, per drift class, what semantically-identical-but-
+    /// byte-different request bodies cost against a live endpoint. The
+    /// output says which classes the endpoint absorbs and which ones repair
+    /// would recover cache for — the per-endpoint priority list.
+    DriftMatrix {
+        /// Endpoint base URL to POST to. Follows the serve convention (a
+        /// `/v1` suffix is not doubled).
+        #[arg(long)]
+        upstream_url: Option<String>,
+        /// Wire shape of the endpoint: `openai` or `anthropic`. Defaults
+        /// to `openai`.
+        #[arg(long, default_value = "openai")]
+        backend: String,
+        /// Environment variable holding the API key. Defaults per backend:
+        /// `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Samples per form per class. One reading is a routing lottery.
+        #[arg(long, default_value_t = 3)]
+        n: usize,
+        /// Confirm runs above 40 sends. Each class costs 2 × n sends.
+        #[arg(long)]
+        yes: bool,
+        /// Comma-separated class names to run (default: all for the
+        /// backend). Unknown names fault with the valid list.
+        #[arg(long)]
+        classes: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -422,6 +465,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         return Ok(());
+    }
+
+    // Drift-matrix reads nothing from disk: its classes are built in. It
+    // sits beside replay because it answers the same question — what does
+    // drift cost here? — from the fixture direction instead of the ledger
+    // direction.
+    if let Some(Command::DriftMatrix {
+        upstream_url,
+        backend,
+        api_key_env,
+        n,
+        yes,
+        classes: class_filter,
+    }) = cli.command
+    {
+        return run_drift_matrix(
+            upstream_url,
+            &backend,
+            api_key_env,
+            n.max(1),
+            yes,
+            class_filter.as_deref(),
+        )
+        .await;
     }
     if let Err(e) = run(cli).await {
         eprintln!("{e}");
@@ -600,6 +667,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         // Handled before `run` (they need no tokenizer or upstream); the
         // compiler still wants the arms here.
+        Command::DriftMatrix { .. } => Ok(()),
         Command::Purge | Command::Replay { .. } => Ok(()),
     }
 }
@@ -705,6 +773,97 @@ async fn run_replay_execute(
             cfg.endpoint.clone(),
             &total_failures,
             api_key.is_none(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Run every drift-class fixture against a live endpoint and print the
+/// per-class cost table. The run is billable: the planned total prints
+/// before the first send, and runs above [`REPLAY_CONFIRM_SENDS`] need
+/// `--yes`.
+async fn run_drift_matrix(
+    upstream_url: Option<String>,
+    backend: &str,
+    api_key_env: Option<String>,
+    samples: usize,
+    confirmed: bool,
+    class_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = upstream_url.ok_or_else(|| {
+        Fault::replay_execute_requires(
+            "--upstream-url",
+            "drift-matrix needs an endpoint to send to".to_string(),
+        )
+    })?;
+    let backend = cachemax::replay::Backend::parse(backend).ok_or_else(|| {
+        Fault::replay_execute_requires("--backend", "expected `openai` or `anthropic`".to_string())
+    })?;
+    let all = cachemax::matrix::classes(backend);
+    let selected: Vec<&cachemax::matrix::MatrixClass> = match class_filter {
+        None => all.iter().collect(),
+        Some(filter) => {
+            let wanted: Vec<&str> = filter.split(',').map(str::trim).collect();
+            let unknown: Vec<&str> = wanted
+                .iter()
+                .filter(|w| !all.iter().any(|c| c.name == **w))
+                .copied()
+                .collect();
+            if !unknown.is_empty() {
+                let valid: Vec<&str> = all.iter().map(|c| c.name).collect();
+                return Err(Fault::matrix_unknown_classes(&unknown, &valid).into());
+            }
+            all.iter().filter(|c| wanted.contains(&c.name)).collect()
+        }
+    };
+    let total_sends = selected.len() * 2 * samples;
+    println!(
+        "drift-matrix: {} class(es) × 2 forms × {samples} sample(s) = {total_sends} send(s) to {endpoint}",
+        selected.len()
+    );
+    if total_sends > REPLAY_CONFIRM_SENDS && !confirmed {
+        return Err(Fault::replay_execute_unconfirmed(total_sends).into());
+    }
+
+    let env_name = api_key_env.unwrap_or_else(|| backend.default_key_env().to_string());
+    let cfg = cachemax::replay::ExecuteConfig {
+        endpoint: endpoint.clone(),
+        backend,
+        api_key: std::env::var(&env_name).ok().filter(|s| !s.is_empty()),
+        samples,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        // Same discipline as replay --execute: fresh connection per send, so
+        // a connection-pinned router cannot flatten the classes into one
+        // warmed namespace.
+        .pool_max_idle_per_host(0)
+        .build()?;
+    let refs: Vec<cachemax::matrix::MatrixClass> = selected.into_iter().cloned().collect();
+    let results = cachemax::matrix::run(&client, &cfg, &refs).await;
+    print!("{}", cachemax::matrix::render(&endpoint, samples, &results));
+    if results
+        .iter()
+        .all(|r| !r.a_drifted.measured() && !r.b_canonical.measured())
+    {
+        // Every class unmeasured: printing a table of dashes and exiting 0
+        // would read as a valid null result. Fault with the causes, exactly
+        // like replay --execute.
+        let failures: Vec<String> = results
+            .iter()
+            .flat_map(|r| {
+                r.a_drifted
+                    .failures
+                    .iter()
+                    .chain(r.b_canonical.failures.iter())
+            })
+            .cloned()
+            .collect();
+        return Err(Fault::replay_execute_no_measurement(
+            endpoint,
+            &failures,
+            cfg.api_key.is_none(),
         )
         .into());
     }
