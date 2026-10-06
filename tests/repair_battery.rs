@@ -1086,3 +1086,96 @@ async fn a_fresh_keyed_conversation_never_adopts_a_probed_foreign_chain() {
         "the fresh conversation went out untouched"
     );
 }
+
+#[tokio::test]
+async fn message_key_order_drift_is_rewritten_to_the_recorded_bytes() {
+    // Serialization-only drift: the client's message objects carry the same
+    // value in a different key order. Value-equal, wire-different — a
+    // byte-identity provider keys its cache on those bytes, so the rewrite
+    // restores the recorded serialization exactly.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(&rig, &weather_turn0()).await;
+    last_record(&rig, 1).await;
+
+    // Turn 1 re-sends the chain with every message object's keys rotated.
+    let chain = rig.ledger.lock().canonical_messages(1, "gpt-4o").unwrap();
+    let rotated: Vec<serde_json::Value> = chain
+        .iter()
+        .map(|m| {
+            let obj = m.as_object().unwrap();
+            let mut out = serde_json::Map::new();
+            for (k, v) in obj.iter().rev() {
+                out.insert(k.clone(), v.clone());
+            }
+            serde_json::Value::Object(out)
+        })
+        .collect();
+    let mut messages = rotated;
+    messages.push(serde_json::json!({"role": "user", "content": "Thanks"}));
+    send(
+        &rig,
+        &serde_json::json!({"model": "gpt-4o", "messages": messages}),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let raw = String::from_utf8(upstream_saw[1].clone()).unwrap();
+    // Byte-level: the recorded key order went out, not the rotated one.
+    assert!(
+        raw.contains(r#"{"role":"system","content":"You call tools."}"#),
+        "the recorded serialization was forwarded, got: {raw}"
+    );
+    assert!(record.repaired, "serialization drift is repaired");
+}
+
+#[tokio::test]
+async fn corrupt_arguments_for_a_recorded_call_are_restored_and_logged_as_restored() {
+    // The aggressive rule, end to end: the client's arguments string is
+    // truncated mid-JSON for the very call the chain records (same id,
+    // same name). Without restoration the upstream rejects the request;
+    // with it, the recorded arguments go out and the record says the
+    // restore happened.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(seen.clone(), usage_reply(canonical_tool_call_message())).await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(&rig, &weather_turn0()).await;
+    last_record(&rig, 1).await;
+
+    let mut messages = rig.ledger.lock().canonical_messages(1, "gpt-4o").unwrap();
+    // The chain is [system, user, assistant-tool-call]; the corrupted copy
+    // replaces the recorded tool call.
+    messages[2] = serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_weather",
+                          "arguments": "{\"city\": \"Par"}}
+        ]
+    });
+    messages.push(serde_json::json!({"role": "user", "content": "Thanks"}));
+    send(
+        &rig,
+        &serde_json::json!({"model": "gpt-4o", "messages": messages}),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let raw = String::from_utf8(upstream_saw[1].clone()).unwrap();
+    assert!(
+        raw.contains(r#""arguments":"{\"city\": \"Paris\", \"unit\": \"c\"}""#),
+        "the recorded arguments were restored, got: {raw}"
+    );
+    assert!(record.repaired);
+    assert_eq!(
+        record.drift_kind,
+        Some(DriftKind::ToolArgsRestored),
+        "the restore is visible in the record, not silent"
+    );
+}

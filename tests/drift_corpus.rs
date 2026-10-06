@@ -96,7 +96,7 @@ fn integers_beyond_f64_precision_do_not_alias() {
 }
 
 #[test]
-fn node_int_vs_float_number_text_is_flagged() {
+fn node_int_vs_float_number_text_is_repaired() {
     // JSON.stringify — compact, insertion order.
     let js = "{\"city\":\"Paris\",\"unit\":\"celsius\",\"count\":\"9007199254740993\",\"ratio\":1}";
     // note: JS serializes 2^53+1 inaccurately as a Number, so frameworks
@@ -104,13 +104,17 @@ fn node_int_vs_float_number_text_is_flagged() {
     // (1 vs 1.0) is a formatting difference in a NUMBER field.
     let canonical = "{\"city\": \"Paris\", \"unit\": \"celsius\", \"count\": \"9007199254740993\", \"ratio\": 1.0}";
     let c = classify_args(js, canonical);
-    // ratio 1 (u64) vs 1.0 (f64): different number texts, and the ladder
-    // treats number leaves exactly — flagged, never rewritten. The string
-    // fields are fine; the break comes from the numeric formatting.
+    // ratio 1 (u64) vs 1.0 (f64): one number below 2^53 in two texts.
+    // Numerically identical counts are one value; the drift is the
+    // serialization, and the rewrite restores the recorded number text —
+    // so big-int identity on the wire is never at risk.
     assert_eq!(
-        c.semantic_break,
-        Some(0),
-        "int-vs-float number formatting (1 vs 1.0) is flagged, not repaired"
+        c.semantic_break, None,
+        "int-vs-float number formatting (1 vs 1.0) below 2^53 is repaired"
+    );
+    assert_eq!(
+        c.drift_kind,
+        Some(cachemax::repair::DriftKind::ToolArgReserialization)
     );
 }
 
@@ -123,11 +127,120 @@ fn float_text_round_trips_exactly() {
 }
 
 #[test]
-fn exponent_forms_of_equal_values_are_flagged() {
-    // 1e2 and 100 parse to numerically equal but textually different
-    // numbers; the ladder compares conservatively (flag, never rewrite).
+fn exponent_forms_of_equal_values_are_repaired() {
+    // 1e2 and 100 are one number in two texts; the rewrite restores the
+    // recorded text, so the drift class is repairable.
     let a = "{\"limit\": 1e2}";
     let b = "{\"limit\": 100}";
     let c = classify_args(a, b);
-    assert_eq!(c.semantic_break, Some(0));
+    assert_eq!(c.semantic_break, None);
+}
+
+#[test]
+fn unicode_escape_forms_never_read_as_drift() {
+    // "Caf\u00e9" and "Café" parse to one string value, and the proxy's
+    // own re-serialization emits the same bytes for both — so an escaped
+    // writer and a raw one produce identical forwarded bodies and the
+    // ladder reads the pair clean. No drift exists at any layer.
+    use cachemax::repair::classify_turn;
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    // The escaped side comes from parsing escaped JSON TEXT, the way a
+    // wire request actually arrives.
+    let escaped: Vec<serde_json::Value> =
+        vec![serde_json::from_str(r#"{"role":"user","content":"Caf\u00e9 central"}"#).unwrap()];
+    let raw = vec![serde_json::json!({
+        "role": "user", "content": "Café central"
+    })];
+    assert_eq!(
+        serde_json::to_vec(&escaped).unwrap(),
+        serde_json::to_vec(&raw).unwrap(),
+        "re-serialization normalizes escape forms"
+    );
+    let c = classify_turn(&escaped, Some(&raw), false, &tok);
+    assert!(c.report_matches, "escapes are not drift at any layer");
+}
+
+#[test]
+fn corrupt_arguments_with_matching_id_and_name_are_restorable() {
+    // The aggressive rule (owner approved): a truncated arguments string
+    // for a call the chain records intact — same id, same name — is
+    // restored, because the upstream would reject the request outright.
+    // The client element differs from the canonical ONLY in the corrupt
+    // arguments; anything else keeps the turn flagged.
+    use cachemax::repair::classify_turn;
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    let canonical = vec![serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_weather",
+                          "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"}}
+        ]
+    })];
+    let client = vec![serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_weather",
+                          "arguments": "{\"city\": \"Par"}}
+        ]
+    })];
+    let c = classify_turn(&client, Some(&canonical), false, &tok);
+    assert_eq!(
+        c.semantic_break, None,
+        "corrupt-but-recorded args are repairable"
+    );
+    assert_eq!(
+        c.drift_kind,
+        Some(cachemax::repair::DriftKind::ToolArgsRestored)
+    );
+
+    // A different function name under the same id is NOT the recorded call:
+    // flagged, never restored.
+    let renamed = vec![serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_forecast",
+                          "arguments": "{\"city\": \"Par"}}
+        ]
+    })];
+    let c = classify_turn(&renamed, Some(&canonical), false, &tok);
+    assert_eq!(
+        c.semantic_break,
+        Some(0),
+        "a name change under the same id is a different call"
+    );
+}
+
+#[test]
+fn tool_result_reserialization_is_repaired() {
+    // Frameworks re-serialize the tool's JSON output as aggressively as the
+    // arguments. The tool message's content string is compared parsed: same
+    // result, different serialization, repairable.
+    use cachemax::repair::classify_turn;
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    let canonical = vec![serde_json::json!({
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "{\"temp_c\": 21.5, \"sky\": \"overcast\"}"
+    })];
+    let client = vec![serde_json::json!({
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "{\"sky\":\"overcast\",\"temp_c\":21.5}"
+    })];
+    let c = classify_turn(&client, Some(&canonical), false, &tok);
+    assert_eq!(c.semantic_break, None);
+    assert_eq!(
+        c.drift_kind,
+        Some(cachemax::repair::DriftKind::ToolArgReserialization),
+        "tool payload reserialization: args and results share the class"
+    );
 }
