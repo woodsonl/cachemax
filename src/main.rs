@@ -171,6 +171,15 @@ impl Fault {
         }
     }
 
+    fn canary_requires_upstream() -> Self {
+        Fault {
+            problem: "canary has no endpoint",
+            cause: "--upstream-url was not provided".into(),
+            fix: "pass --upstream-url (the endpoint the canary should test through) and set the backend's API key env var",
+            docs: "replay-execute",
+        }
+    }
+
     fn matrix_unknown_classes(unknown: &[&str], valid: &[&str]) -> Self {
         Fault {
             problem: "unknown drift class",
@@ -340,6 +349,20 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Run the canary: a three-turn conversation through a private proxy
+    /// against a real endpoint — establish, drifted (repaired), warm —
+    /// verifying the repair claim, the cache hit, and zero invariant
+    /// violations. One run, then exit; schedule it with cron/launchd and
+    /// alert on a non-zero exit.
+    Canary {
+        /// Endpoint base URL to test through (the serve convention).
+        #[arg(long)]
+        upstream_url: Option<String>,
+        /// Environment variable holding the API key. Defaults per backend:
+        /// `OPENAI_API_KEY`.
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
     /// Measure, per drift class, what semantically-identical-but-
     /// byte-different request bodies cost against a live endpoint. The
     /// output says which classes the endpoint absorbs and which ones repair
@@ -489,6 +512,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             class_filter.as_deref(),
         )
         .await;
+    }
+    if let Some(Command::Canary {
+        upstream_url,
+        api_key_env,
+    }) = cli.command
+    {
+        let upstream = upstream_url.ok_or_else(Fault::canary_requires_upstream)?;
+        let env_name = api_key_env.unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+        let key = std::env::var(&env_name).ok().filter(|s| !s.is_empty());
+        let report = cachemax::canary::run(upstream, key).await;
+        println!("{}", cachemax::canary::render(&report));
+        if !report.failures.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     if let Err(e) = run(cli).await {
         eprintln!("{e}");
@@ -668,7 +706,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // Handled before `run` (they need no tokenizer or upstream); the
         // compiler still wants the arms here.
         Command::DriftMatrix { .. } => Ok(()),
-        Command::Purge | Command::Replay { .. } => Ok(()),
+        Command::Canary { .. } | Command::Purge | Command::Replay { .. } => Ok(()),
     }
 }
 

@@ -222,6 +222,7 @@ client-chosen key forever would be unbounded memory.
 | `cachemax purge` | Delete the on-disk repair ledger (see Security). |
 | `cachemax replay` | Print A/B request bodies (drifted vs canonical) from the recorded ledger, as JSONL. With `--execute`, drive them against a real endpoint and report cached tokens per form. |
 | `cachemax drift-matrix` | Measure, per drift class, what semantically-identical-but-byte-different bodies cost against a live endpoint — the per-endpoint priority list for repair. See docs/drift-cost-matrix.md. |
+| `cachemax canary` | Scheduled alignment check: a three-turn conversation through a private proxy against a real endpoint — establish, drifted (repaired), warm — verifying the repair claim, the cache hit, and zero invariant violations. Non-zero exit is the alert. |
 
 | Flag | Meaning |
 |---|---|
@@ -239,6 +240,18 @@ client-chosen key forever would be unbounded memory.
 
 `replay` takes its own flags: `--execute`, `--upstream-url`, `--backend`,
 `--api-key-env <VAR>`, `--n <samples>`, `--limit <chains>`, and `--yes`.
+`canary` takes `--upstream-url` and `--api-key-env <VAR>`.
+
+### Runtime invariants
+
+Every finalized turn checks its own claims: a cache figure implies a source
+that exposes one, a repair implies a receipt, an unrepairable turn implies
+nothing was rewritten, a system hard stop implies a compared baseline. A
+violation never blocks a request; it is counted, logged (`metadata only`),
+shown on the dashboard when non-zero, and exposed at `/api/violations` in
+Prometheus text format for alerting. A cron'd `cachemax canary` closes the
+loop: any drift between what the proxy claims and what it did turns the
+exit red.
 
 ## Security
 
