@@ -9,8 +9,8 @@ provider already cached, so the cache hits again and the re-sent history
 bills at cached rates instead — roughly a tenth of base input on
 Anthropic cache reads, roughly half on OpenAI. Measured on a caching
 provider, tool-argument drift alone cost 56-204 cached tokens per send
-across runs; after repair the request IS the cached serialization, so
-that penalty has nothing left to miss.
+across runs; after repair the request is the cached serialization and
+the penalty is gone.
 
 Repair pays wherever the provider caches on token identity — and where it
 doesn't, you should know that before trusting any number. One command
@@ -287,15 +287,18 @@ happened, cache hit, zero invariant violations, exit-red on any breach.
 ### When the provider reports no cache figures
 
 Some paths never expose cache numbers to API callers (the Anthropic
-subscription token surveyed among them). There, repair keeps its own
-accounting as an ESTIMATE: the classifier's at-risk span — everything from
-the first divergence to the end of the prompt, the tokens a byte-identity
-cache would have missed — priced at the difference between base input and
-cached-read rates. The estimate appears only on turns where the rewrite
-happened and no cache signal came back, is labeled as an estimate wherever
-it appears, and is dropped the moment a real measurement exists. It rests
-on two stated assumptions: the provider caches on token identity, and the
-canonical bytes hit.
+subscription token among them). There, repair keeps its own accounting as
+an estimate: the tokens the rewrite actually restored, priced at the
+difference between base input and cached-read rates for the model. The
+estimate appears only where it can be believed — the rewrite happened, and
+no cache signal came back to confirm or contradict it. A single reported
+zero is a measurement, not an absence: it wins, and the estimate steps
+aside (as does `cost_saved`, so one turn never carries two claims for the
+same counterfactual). Turns where the history was truncated or a
+system/tools drift went unrepaired claim nothing — either one re-bases the
+cache at the root, and a messages rewrite beneath it saved nothing. The
+estimate rests on two stated assumptions: the provider caches on token
+identity, and the canonical bytes hit.
 
 ### Runtime invariants
 

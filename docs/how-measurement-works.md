@@ -102,18 +102,23 @@ session is disclosed only through the >100% gate.
 
 ## The repair estimate (unreported-cache paths)
 
-When a provider answers with no cache fields — or fields that read zero
-with nothing written on every send — the measured `cached_tokens` column
-reads `—` and nothing fabricated fills it. What repair CAN state locally
-is the counterfactual: had the drifted bytes gone out, a prefix cache
-would have missed from the first divergence to the end of the prompt, and
-that span is what the classifier already quantifies (`tokens_at_risk`,
-from the ledger's own bytes and the local tokenizer). Priced at
-(input − cached-read) rates it becomes `estimated_saved_usd` on the
-record: only on repaired turns, only when no cache signal contradicts or
-confirms it, labeled as an estimate on the dashboard, and `None` whenever
-a real measurement exists. The two assumptions it rests on are stated at
-the value: the provider caches on token identity, and the canonical bytes
+When a provider answers with no cache fields, the measured `cached_tokens`
+column reads `—` and nothing fabricated fills it; a provider that reports
+zeros shows the zeros. The estimate below covers the first case and the
+session-long-zero case alike. What repair can state locally is what it
+did: the rewrite receipt, the token count of the canonical elements
+written back over the drifted ones. The count is taken before cache
+hints are stripped from what goes on the wire, so it can slightly exceed
+the bytes actually sent. Priced at (input − cached-read)
+rates it becomes `estimated_saved_usd` on the record. The gate keeps it
+honest: the rewrite must have happened; no cache signal may exist to
+confirm or contradict it (fields absent, or zero on every send of the
+session — a lone reported zero is a measurement and wins); the turn must
+not be truncated or carry unrepaired system/tools drift, since either
+re-bases the cache at the root and a messages rewrite beneath it saved
+nothing; and `cost_saved_usd` yields the turn so one counterfactual is
+never claimed twice. The two assumptions it rests on are stated at the
+value: the provider caches on token identity, and the canonical bytes
 hit. It is an accounting of what repair did, not a claim about what the
 provider did.
 
