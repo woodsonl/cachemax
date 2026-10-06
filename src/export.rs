@@ -66,6 +66,7 @@ mod tests {
             broke_prefix: false,
             cost_usd: Some(0.02),
             cost_saved_usd: Some(0.01),
+            estimated_saved_usd: None,
             repair_mode: crate::repair::RepairMode::Off,
             repaired: false,
             matches_canonical: None,
@@ -132,6 +133,7 @@ mod readme_sample {
             broke_prefix: false,
             cost_usd: Some(0.02),
             cost_saved_usd: Some(0.01),
+            estimated_saved_usd: None,
             repair_mode: crate::repair::RepairMode::Off,
             repaired: false,
             matches_canonical: None,
@@ -140,7 +142,7 @@ mod readme_sample {
             breakpoint_count: None,
         };
         let line = to_jsonl(&[r]).unwrap();
-        let expected = "{\"session_id\":1,\"turn\":1,\"status\":\"complete\",\"source\":\"provider_reported\",\"ttft_ms\":120.0,\"cached_tokens\":1020,\"cache_written_tokens\":0,\"resent_history_tokens\":1550,\"billed_input_tokens\":1750,\"broke_prefix\":false,\"cost_usd\":0.02,\"cost_saved_usd\":0.01,\"repair_mode\":\"off\",\"repaired\":false,\"matches_canonical\":null,\"drift_kind\":null,\"canonicalized_tokens\":0,\"breakpoint_count\":null}\n";
+        let expected = "{\"session_id\":1,\"turn\":1,\"status\":\"complete\",\"source\":\"provider_reported\",\"ttft_ms\":120.0,\"cached_tokens\":1020,\"cache_written_tokens\":0,\"resent_history_tokens\":1550,\"billed_input_tokens\":1750,\"broke_prefix\":false,\"cost_usd\":0.02,\"cost_saved_usd\":0.01,\"estimated_saved_usd\":null,\"repair_mode\":\"off\",\"repaired\":false,\"matches_canonical\":null,\"drift_kind\":null,\"canonicalized_tokens\":0,\"breakpoint_count\":null}\n";
         assert_eq!(line, expected, "README sample must match the serializer");
     }
 }

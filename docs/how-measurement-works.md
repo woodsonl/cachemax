@@ -100,6 +100,23 @@ netted. Known limit: a wrapper that writes its own preamble carries a
 breakpoint, defeats the write gate, and is not learned as a floor — such a
 session is disclosed only through the >100% gate.
 
+## The repair estimate (unreported-cache paths)
+
+When a provider answers with no cache fields — or fields that read zero
+with nothing written on every send — the measured `cached_tokens` column
+reads `—` and nothing fabricated fills it. What repair CAN state locally
+is the counterfactual: had the drifted bytes gone out, a prefix cache
+would have missed from the first divergence to the end of the prompt, and
+that span is what the classifier already quantifies (`tokens_at_risk`,
+from the ledger's own bytes and the local tokenizer). Priced at
+(input − cached-read) rates it becomes `estimated_saved_usd` on the
+record: only on repaired turns, only when no cache signal contradicts or
+confirms it, labeled as an estimate on the dashboard, and `None` whenever
+a real measurement exists. The two assumptions it rests on are stated at
+the value: the provider caches on token identity, and the canonical bytes
+hit. It is an accounting of what repair did, not a claim about what the
+provider did.
+
 ## What repair covers
 
 The ladder treats as repairable (rewritten to the recorded bytes): tool
