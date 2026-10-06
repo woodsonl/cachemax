@@ -1,6 +1,6 @@
 [package]
 name = "cachemax"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 description = "OpenAI-compatible prompt-cache measurement proxy: report cache reuse and its cost or speed consequence"
 license = "MIT"

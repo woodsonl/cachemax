@@ -174,10 +174,55 @@ local models normalize, the free-tier providers surveyed do not cache, and
 Anthropic subscription OAuth does not report caching to raw API callers —
 each a statement about the providers that served the runs, not a permanent
 property of any router.
-The Anthropic-dialect classes (hint placement, system shape, the
-tools-bearing prefix with `cache_control`) remain unmeasured pending a
-console API key (`sk-ant-api…`), which is the one auth path documented to
-bill and report prompt caching.
+
+## api.anthropic.com · direct API key, claude-haiku-4-5 (2026-10-06)
+
+The Anthropic-dialect leg, run with a direct Anthropic API key
+(`x-api-key` auth) against `api.anthropic.com`, native `/v1/messages`,
+`cache_control` breakpoints on the system block, n=3, 50 sends. This is
+the auth path that bills and reports prompt caching, and it read nonzero
+cache figures on the first send.
+
+A measurement-validity find preceded the numbers: Anthropic documents a
+2048-token minimum cacheable prefix; the observed floor on this path sits
+between 3884 and 5161 input tokens (bisected live; consistent with 4096).
+Fixtures below it read a false "no caching". The matrix fixtures now
+clear the observed floor with margin, and the probe sequence is recorded
+here because anyone reproducing with short prompts will see zeros and
+wrongly conclude caching is off.
+
+```
+drift-cost matrix · https://api.anthropic.com · n=3
+  class                    drifted 1st/m canonical m/m   delta send  verdict
+  tool-arg-reorder           5426/5426   5426/5426       0  3/4  absorbed
+  whitespace                    0/5542   5422/5422    5422  3/4  costs 5422 tk (first send)
+  hint-placement             5423/5880   5423/5423       0  3/4  absorbed
+  tools-reserialization      5425/5425   5425/5425       0  3/4  absorbed
+  system-shape                     0/0         0/0       0  3/4  no caching on this endpoint
+```
+
+**On this provider, the one text class measured costs the full prefix and
+the tool-JSON classes cost nothing.**
+Whitespace drift in the system costs the entire prefix: the first drifted
+send reads 0 against a 5422-token established cache, the full miss, and
+repair's whitespace class exists for exactly this — consistent with
+byte-identity for text, and only the whitespace variant was surveyed.
+Tool-argument key reorder and tool-definition reserialization read
+absorbed: the drifted
+forms hit the same cache the canonical form established, so the cache key
+does not depend on tool-JSON key order, and repair recovers nothing for
+those classes here. Hint placement is a no-op for caching (the cached
+prefix is the same content either side). The system-shape row is a fixture
+artifact, not an endpoint fact: a bare-string `system` cannot carry a
+`cache_control` block at all, so the pair is hint-free on both sides, and
+its `no caching on this endpoint` verdict describes the fixture — the
+endpoint's caching is proven by every other row.
+
+The two caching providers surveyed punish complementary classes: DeepSeek
+punishes tool JSON and absorbs less text drift; Anthropic punished the
+text class surveyed and absorbed tool JSON. Repair carries both classes,
+so it recovers on both; per endpoint, what it recovers is exactly what
+the matrix says.
 
 ## Reading the table
 
