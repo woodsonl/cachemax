@@ -120,6 +120,12 @@ fn check_invariants(record: &Record, report: &DriftReport, rewrote: bool) {
     {
         crate::invariants::note("system_hardstop_without_baseline");
     }
+    // An estimate never rides beside a measurement: the field is stamped
+    // only when no cache signal existed, so a measured figure and a
+    // nonzero estimate on one record is a gate regression.
+    if record.estimated_saved_usd.is_some() && record.cached_tokens > 0 {
+        crate::invariants::note("estimate_beside_measurement");
+    }
 }
 
 /// Stamp a record with the drift claim computed on the request path, plus
@@ -193,6 +199,7 @@ pub fn build_record(
         (None, None)
     };
     Record {
+        estimated_saved_usd: None,
         session_id: plan.session_id,
         turn: plan.turn,
         status: if complete {
@@ -516,6 +523,50 @@ impl<A: Adapter> Finalizer<A> {
         );
         apply_drift_claim(&mut record, &self.drift_report, self.rewrite.as_ref());
         check_invariants(&record, &self.drift_report, self.rewrite.is_some());
+        // The repair counterfactual — an ESTIMATE, and gated like one. The
+        // rewrite happened; the provider gave no cache figure that either
+        // confirms or contradicts the savings. That is fields-absent
+        // (NoCacheTruth), or the persistent-zero signature: every record
+        // this session (priors and current) reported zero reads and zero
+        // writes — a single reported zero can be a real miss the provider
+        // measured, and an estimate beside it would claim what the
+        // provider's own number just denied. The span priced is what
+        // repair actually restored (the rewrite receipt), never the
+        // at-risk span: the residual after a semantic break and a
+        // truncated prefix miss with or without repair, and unrepaired
+        // system/tools drift re-bases the cache at the root — none of it
+        // is savings. Wherever the estimate is stamped it owns the turn:
+        // cost_saved steps aside rather than double-counting the same
+        // counterfactual.
+        let current_zero = record.cached_tokens == 0 && record.cache_written_tokens == 0;
+        let priors_all_zero = {
+            let guard = self.sessions.lock();
+            guard
+                .session(self.plan.session_id)
+                .map(|s| {
+                    s.records
+                        .iter()
+                        .all(|r| r.cached_tokens == 0 && r.cache_written_tokens == 0)
+                })
+                .unwrap_or(true)
+        };
+        let no_cache_signal = record.source == crate::record::SourceLabel::NoCacheTruth
+            || (current_zero && priors_all_zero);
+        let restorable = self
+            .rewrite
+            .as_ref()
+            .map(|rw| rw.canonicalized_tokens)
+            .unwrap_or(0);
+        if record.repaired
+            && record.status == Status::Complete
+            && no_cache_signal
+            && restorable > 0
+            && !self.drift_report.truncated_prefix
+            && !self.drift_report.prefix_drift_unrepaired
+        {
+            record.estimated_saved_usd = self.rates.repair_estimated_saved(&self.model, restorable);
+            record.cost_saved_usd = None;
+        }
         if let Some(managed) = self.breakpoints {
             record.breakpoint_count = Some(managed.total as u64);
         }
@@ -1114,6 +1165,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             }
         };
         let mut system_rewritable = false;
+        let system_drift_existed = sys.different || sys.kind.is_some();
         if sys.different {
             // A semantically different system prompt re-bases everything
             // downstream, exactly like a changed system message: the turn
@@ -1146,6 +1198,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         let mut tools_rewritable = false;
         let mut tools_tokens = 0u64;
         let mut tools_kind = None;
+        let mut tools_drift_existed = false;
         // A recorded baseline exists: the client's tools (present or
         // dropped) are a change against it. The fold never runs on top of
         // a hard stop — a changed system already owns the turn's story,
@@ -1156,6 +1209,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             && classification.unrepairable.is_none()
         {
             if client_tools.is_null() {
+                tools_drift_existed = true;
                 classification.report_matches = false;
                 classification.turns_affected += 1;
                 classification.tokens_at_risk +=
@@ -1170,6 +1224,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 match crate::repair::tools_relation(&client_tools, &canonical_tools) {
                     crate::repair::ToolsRel::Exact => {}
                     crate::repair::ToolsRel::Equivalent(kind) => {
+                        tools_drift_existed = true;
                         classification.report_matches = false;
                         classification.drift_kind = Some(match classification.drift_kind {
                             Some(existing) if existing != kind => DriftKind::Mixed,
@@ -1183,6 +1238,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                         tools_kind = Some(kind);
                     }
                     crate::repair::ToolsRel::Different => {
+                        tools_drift_existed = true;
                         // Different definitions: a root re-base the record
                         // must not call a clean match. The span at risk is
                         // the recorded tools; nothing is rewritten.
@@ -1206,7 +1262,9 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // hints, and a survey taken after that would read the proxy's own
         // output as if the client had sent it.
         let survey = crate::breakpoints::survey(&doc);
-        let report = repair::report(&classification, effective_mode, system_examined);
+        let mut report = repair::report(&classification, effective_mode, system_examined, false);
+        let mut system_rewrote = false;
+        let mut tools_rewrote = false;
         let mut rewrite = None;
         if effective_mode == RepairMode::On {
             if let Some(chain) = chain.as_deref() {
@@ -1267,6 +1325,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                         "rewrote drifted system prompt to canonical"
                     );
                     doc["system"] = canonical;
+                    system_rewrote = true;
                     rewrite = Some(match rewrite {
                         Some(rw) => crate::repair::Rewrite {
                             elements_replaced: rw.elements_replaced + 1,
@@ -1304,6 +1363,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
                     "rewrote drifted tools to canonical"
                 );
                 doc["tools"] = recorded;
+                tools_rewrote = true;
                 rewrite = Some(match rewrite {
                     Some(rw) => crate::repair::Rewrite {
                         elements_replaced: rw.elements_replaced + 1,
@@ -1316,6 +1376,12 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 });
             }
         }
+        // Prefix drift that was NOT rewritten (declined under client
+        // placement, or semantically different/dropped): either re-bases
+        // the cache at the root, and a messages rewrite beneath it saved
+        // nothing. The estimate checks this before claiming.
+        report.prefix_drift_unrepaired =
+            (system_drift_existed && !system_rewrote) || (tools_drift_existed && !tools_rewrote);
         (report, rewrite, survey)
     };
 

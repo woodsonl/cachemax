@@ -284,6 +284,19 @@ records exactly that.
 Schedule `cachemax canary` to keep the whole story verified: repair
 happened, cache hit, zero invariant violations, exit-red on any breach.
 
+### When the provider reports no cache figures
+
+Some paths never expose cache numbers to API callers (the Anthropic
+subscription token surveyed among them). There, repair keeps its own
+accounting as an ESTIMATE: the classifier's at-risk span — everything from
+the first divergence to the end of the prompt, the tokens a byte-identity
+cache would have missed — priced at the difference between base input and
+cached-read rates. The estimate appears only on turns where the rewrite
+happened and no cache signal came back, is labeled as an estimate wherever
+it appears, and is dropped the moment a real measurement exists. It rests
+on two stated assumptions: the provider caches on token identity, and the
+canonical bytes hit.
+
 ### Runtime invariants
 
 Every finalized turn checks its own claims: a cache figure implies a source

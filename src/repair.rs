@@ -129,6 +129,16 @@ pub struct DriftReport {
     /// served from cache. An estimate for annotation; never a repair input.
     pub tokens_at_risk: u64,
     pub unrepairable: Option<Unrepairable>,
+    /// The client's history starts deeper in the canonical chain
+    /// (`canonical_offset > 0`): leading turns were dropped. A truncated
+    /// request's prefix never matches the cached chain, so repair cannot
+    /// claim cache savings for it.
+    pub truncated_prefix: bool,
+    /// System or tools drift existed and was NOT rewritten (declined under
+    /// client-managed placement, or semantically different). Either one
+    /// re-bases the cache at the root, so a messages rewrite beneath it
+    /// saved nothing measurable.
+    pub prefix_drift_unrepaired: bool,
 }
 
 impl DriftReport {
@@ -137,6 +147,8 @@ impl DriftReport {
         Self {
             mode,
             system_examined: false,
+            truncated_prefix: false,
+            prefix_drift_unrepaired: false,
             matches_canonical: false,
             drift_kind: None,
             turns_affected: 0,
@@ -323,6 +335,7 @@ pub fn report(
     classification: &Classification,
     mode: RepairMode,
     system_examined: bool,
+    prefix_drift_unrepaired: bool,
 ) -> DriftReport {
     DriftReport {
         mode,
@@ -332,6 +345,8 @@ pub fn report(
         turns_affected: classification.turns_affected,
         tokens_at_risk: classification.tokens_at_risk,
         unrepairable: classification.unrepairable,
+        truncated_prefix: classification.canonical_offset > 0,
+        prefix_drift_unrepaired,
     }
 }
 
@@ -1473,7 +1488,7 @@ mod tests {
         let canonical = msgs(&[("user", "hi  there"), ("assistant", "yo")]);
         let client = msgs(&[("user", "hi there"), ("assistant", "yo")]);
         let c = classify(&client, &canonical);
-        let r = report(&c, RepairMode::DryRun, true);
+        let r = report(&c, RepairMode::DryRun, true, false);
         assert_eq!(r.mode, RepairMode::DryRun);
         assert!(!r.matches_canonical);
         assert_eq!(r.drift_kind, Some(DriftKind::TextNormalization));

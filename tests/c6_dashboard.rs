@@ -161,6 +161,7 @@ fn rec(turn: u32, cached: u64, history: u64) -> Record {
         broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
+        estimated_saved_usd: None,
         repair_mode: cachemax::repair::RepairMode::Off,
         repaired: false,
         matches_canonical: None,
@@ -185,6 +186,7 @@ fn hash_level_mode_prints_no_fake_byte_detail() {
         broke_prefix: false,
         cost_usd: Some(0.01),
         cost_saved_usd: Some(0.005),
+        estimated_saved_usd: None,
         repair_mode: cachemax::repair::RepairMode::Off,
         repaired: false,
         matches_canonical: None,
@@ -407,4 +409,15 @@ fn anthropic_write_split_is_surfaced_beside_the_binding_rate() {
 fn no_write_count_means_no_split_row() {
     let v = dashboard::view(&[rec(1, 1000, 2000)], true, 1);
     assert!(v.write_split.is_none(), "OpenAI reports no writes");
+}
+
+#[test]
+fn a_no_cache_truth_estimate_reaches_the_hero_sum() {
+    // The estimate exists FOR the unreported paths; the sum must include
+    // NoCacheTruth turns, which the measured-figure filters exclude.
+    let mut r = rec(1, 500, 1000);
+    r.repaired = true;
+    r.estimated_saved_usd = Some(0.0027);
+    let state = cachemax::dashboard::view(&[r], true, 1);
+    assert!((state.estimated_saved_usd - 0.0027).abs() < 1e-12);
 }

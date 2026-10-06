@@ -72,6 +72,14 @@ pub struct Record {
     pub cost_usd: Option<f64>,
     /// Cost saved versus the no-cache counterfactual, if rates are known.
     pub cost_saved_usd: Option<f64>,
+    /// Repair-attributed savings ESTIMATE, recorded only when the provider
+    /// reports no cache truth AND the rewrite actually happened:
+    /// tokens_at_risk priced at (input − cached-read) rates. An estimate
+    /// resting on two assumptions — token-identity caching, canonical bytes
+    /// hitting — never blended into the measured `cached_tokens` path, and
+    /// absent whenever a real measurement exists.
+    #[serde(default)]
+    pub estimated_saved_usd: Option<f64>,
     /// The repair mode this turn ran under. `off` turns carry no drift
     /// claim at all.
     #[serde(default)]
@@ -214,6 +222,7 @@ mod tests {
             cache_written_tokens: 0,
             cost_usd: None,
             cost_saved_usd: None,
+            estimated_saved_usd: None,
             repair_mode: crate::repair::RepairMode::Off,
             repaired: false,
             matches_canonical: None,

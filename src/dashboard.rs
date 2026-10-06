@@ -205,6 +205,12 @@ pub struct DashboardState {
     /// Whether any turn actually needed the floor — the disclosure renders
     /// only then, never for a direct provider's honest ≤100% rates.
     pub router_netted: bool,
+    /// Repair-attributed savings estimate, summed over turns where the
+    /// provider reported no cache signal and the rewrite happened. An
+    /// estimate labeled as one; rendered only when nonzero, never beside a
+    /// measured recovery figure as if equivalent.
+    #[serde(default)]
+    pub estimated_saved_usd: f64,
     /// Total runtime invariant violations (claims vs behavior, checked per
     /// finalize). Zero is the steady state; anything else is a regression
     /// class firing. Rendered only when non-zero.
@@ -280,6 +286,15 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         .iter()
         .filter(|r| r.repaired)
         .map(|r| r.cached_tokens)
+        .sum();
+    // The estimate carries its own gate (stamped only when unmeasured), so
+    // the sum trusts the field — over ALL complete records, not `complete`
+    // above, whose source filter excludes NoCacheTruth turns (the
+    // subscription path this exists for).
+    let estimated_saved_sum: f64 = records
+        .iter()
+        .filter(|r| r.status == Status::Complete)
+        .filter_map(|r| r.estimated_saved_usd)
         .sum();
     // Billed and cost follow the same "complete records only" rule the page
     // states: an incomplete turn's partial usage is excluded, as it is from the
@@ -378,6 +393,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         // The disclosure renders only when netting actually applied: a
         // learned floor with no turn above 100% subtracted nothing, and
         // saying otherwise would describe a direct provider as routed.
+        estimated_saved_usd: estimated_saved_sum,
         violations: 0,
         router_netted: floor > 0
             && records.iter().any(|r| {
@@ -537,6 +553,7 @@ mod tests {
             broke_prefix: false,
             cost_usd: Some(0.01),
             cost_saved_usd: Some(0.005),
+            estimated_saved_usd: None,
             repair_mode: crate::repair::RepairMode::Off,
             repaired: false,
             matches_canonical: None,

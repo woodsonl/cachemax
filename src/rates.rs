@@ -151,6 +151,15 @@ impl Rates {
         // written portions' actual cost, plus the write premium is a *cost*.
         Some(full - actual_cached - actual_write)
     }
+
+    /// The repair counterfactual: the span repair actually restored, priced
+    /// at the difference between base input and cached-read rates. Used
+    /// only when the provider reports no cache truth — an estimate, never
+    /// a measurement, and never blended into `cost_saved`.
+    pub fn repair_estimated_saved(&self, model: &str, restored_tokens: u64) -> Option<f64> {
+        let rate = self.lookup(model)?;
+        Some(rate.input_cost(restored_tokens) * (1.0 - rate.cached_input_mult))
+    }
 }
 
 impl Default for Rates {
@@ -210,5 +219,23 @@ mod tests {
         assert_eq!(r.lookup("gpt-4o").unwrap().input_per_mtok, 99.0);
         // default cached_input_mult 0.5 still applies
         assert_eq!(r.lookup("gpt-4o").unwrap().cached_input_mult, 0.5);
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    #[test]
+    fn repair_estimate_prices_the_span_at_input_minus_cached_read() {
+        // Anthropic claude-3-5-sonnet: $3/M input, cached reads at 0.1x.
+        // 1000 at-risk tokens save 1000 × 3 × 0.9 / 1M = $0.0027.
+        let rates = Rates::builtin();
+        let saved = rates
+            .repair_estimated_saved("claude-3-5-sonnet-20241022", 1000)
+            .unwrap();
+        assert!((saved - 0.0027).abs() < 1e-9, "got {saved}");
+        // Unknown model: no rate, no estimate — never a guess.
+        assert_eq!(rates.repair_estimated_saved("mystery-model", 1000), None);
     }
 }

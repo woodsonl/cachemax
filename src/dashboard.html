@@ -228,9 +228,15 @@
       (state.router_netted
         ? " · router prefix " + state.router_prefix_tokens.toLocaleString("en-US") + " tk netted from rates above 100%"
         : "") +
+      (state.estimated_saved_usd > 0
+        ? " · est. " + fmtEstimate(state.estimated_saved_usd) + " saved by repair (no cache figures reported)"
+        : "") +
       (state.violations > 0
         ? " · ! " + state.violations.toLocaleString("en-US") + " invariant violation(s)"
         : "");
+    // Estimates are small by nature (cents per thousand turns); 4dp keeps
+    // them visible where the measured 2dp convention would round to $0.00.
+    function fmtEstimate(v) { return "$" + v.toFixed(4); }
     document.getElementById("foot-live").textContent = state.live ? "● live" : "idle";
     document.getElementById("foot-url").textContent = location.host;
 
