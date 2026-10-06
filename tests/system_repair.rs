@@ -32,20 +32,38 @@ async fn stub_upstream(seen: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
             "output_tokens": 5,
         },
     });
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move |body: Bytes| {
-            let seen = seen.clone();
-            async move {
-                seen.lock().unwrap().push(body.to_vec());
-                let bytes = serde_json::to_vec(&reply).unwrap();
-                Response::builder()
-                    .header("content-type", "application/json")
-                    .body(Body::from(bytes))
-                    .unwrap()
-            }
-        }),
-    );
+    let reply2 = reply.clone();
+    let seen2 = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let seen = seen2.clone();
+                let reply = reply2.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -472,22 +490,40 @@ async fn recorded_ttft_covers_the_upstream_wait() {
         "content": [{"type": "text", "text": "Done."}],
         "usage": {"input_tokens": 100, "output_tokens": 5},
     });
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move |body: Bytes| {
-            let seen = seen.clone();
-            let reply = reply.clone();
-            async move {
-                seen.lock().unwrap().push(body.to_vec());
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                let bytes = serde_json::to_vec(&reply).unwrap();
-                Response::builder()
-                    .header("content-type", "application/json")
-                    .body(Body::from(bytes))
-                    .unwrap()
-            }
-        }),
-    );
+    let reply2 = reply.clone();
+    let seen2 = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let seen = seen2.clone();
+                let reply = reply2.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.to_vec());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });

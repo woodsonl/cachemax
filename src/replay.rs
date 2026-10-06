@@ -217,7 +217,14 @@ pub fn auth_headers(backend: Backend, api_key: Option<&str>) -> Vec<(&'static st
         }
         Backend::Anthropic => {
             if let Some(k) = api_key {
-                out.push(("x-api-key", k.to_string()));
+                // Subscription OAuth tokens authenticate as Bearer with the
+                // OAuth beta header; console API keys use x-api-key.
+                if k.starts_with("sk-ant-oat") {
+                    out.push(("authorization", format!("Bearer {k}")));
+                    out.push(("anthropic-beta", "oauth-2025-04-20".to_string()));
+                } else {
+                    out.push(("x-api-key", k.to_string()));
+                }
             }
             out.push(("anthropic-version", "2023-06-01".to_string()));
         }
@@ -597,6 +604,20 @@ mod tests {
         let body = Backend::OpenAi.prepare_body(&form, &system, &serde_json::Value::Null);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn subscription_oauth_tokens_authenticate_as_bearer() {
+        // Claude subscription tokens (sk-ant-oat…) ride Authorization with
+        // the OAuth beta; console keys ride x-api-key. The executor must
+        // send each the way its flow expects or the upstream 401s.
+        let oat = auth_headers(Backend::Anthropic, Some("sk-ant-oat01-abc"));
+        assert!(oat.contains(&("authorization", "Bearer sk-ant-oat01-abc".to_string())));
+        assert!(oat.contains(&("anthropic-beta", "oauth-2025-04-20".to_string())));
+        assert!(!oat.contains(&("x-api-key", "sk-ant-oat01-abc".to_string())));
+        let key = auth_headers(Backend::Anthropic, Some("sk-ant-api03-xyz"));
+        assert!(key.contains(&("x-api-key", "sk-ant-api03-xyz".to_string())));
+        assert!(!key.iter().any(|(k, _)| *k == "authorization"));
     }
 
     #[test]
