@@ -47,12 +47,58 @@ prioritized here. The same matrix against a byte-identity provider
 (OpenAI direct, Anthropic without normalization) is where `costs` verdicts
 are expected; those runs are user-gated.
 
+## openrouter.ai · free tier (2026-10-05)
+
+Two free models, 3 samples per form, 36 sends each: nvidia/nemotron-3-ultra-
+550b-a55b:free and openrouter/free (auto-router). Auth via the OpenRouter
+key, `--model` selects the fixture model.
+
+```
+nvidia/nemotron-3-ultra-550b-a55b:free
+  class                    drifted m/m canonical m/m   delta send  verdict
+  tool-arg-reorder                 0/0         0/0       0  3/3  no caching on this endpoint
+  whitespace                       0/0         0/0       0  3/3  no caching on this endpoint
+  key-order                        0/0         0/0       0  2/3  no caching on this endpoint
+  number-text                      0/0         0/0       0  2/2  no caching on this endpoint
+  tools-reserialization            0/0         0/0       0  3/3  no caching on this endpoint
+  content-string-vs-array            —         0/0       —  0/2  unmeasured
+
+openrouter/free
+  class                    drifted m/m canonical m/m   delta send  verdict
+  tool-arg-reorder                 0/0         0/0       0  3/3  no caching on this endpoint
+  whitespace                       0/0         0/0       0  3/3  no caching on this endpoint
+  key-order                        0/0         0/0       0  3/3  no caching on this endpoint
+  number-text                      0/0         0/0       0  3/3  no caching on this endpoint
+  tools-reserialization          0/384         0/0       0  3/3  absorbed
+  content-string-vs-array          0/0         0/0       0  3/3  no caching on this endpoint
+```
+
+The free tier reports a cache figure (the field exists) but on the
+fixed-provider model every reading on both forms is a reported zero: the
+providers do not serve from prompt cache for free-tier traffic, or do not
+report it. Repair recovers nothing
+here because nothing is cached — a different mechanism than omniroute's
+absorption, and the verdict says so. The openrouter/free run shows the
+routing-lottery hazard of auto-routing in one number: a single drifted
+send landed on a caching instance (max 384) while every other reading
+read zero — the median held, and the max column is why readings are
+published at all.
+
+The byte-identity question (do key order, number text, argument
+reordering cost cache on a provider that caches raw tokens?) needs a paid
+model; the free tier cannot answer it. A cents-scale run on a paid
+OpenRouter model or a direct provider key is the remaining measurement.
+
 ## Reading the table
 
 - `costs N tk` — the drifted bytes lose N cached tokens to the drift; repair
   recovers them on this endpoint.
 - `absorbed` — the endpoint normalizes the class away; drift costs nothing
   there, and repair has nothing to recover for it.
+- `no caching on this endpoint` — every reading on both forms was a
+  reported zero (median AND max): the endpoint did not serve from cache at
+  all during the run. Drift costs nothing because caching costs nothing —
+  a different mechanism than absorption, stated differently.
 - `unmeasured` — every send failed or carried no cache figure; the cause is
   on stderr. A gap, never a zero.
 
