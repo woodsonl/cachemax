@@ -227,6 +227,9 @@
       "Complete records only · " + state.incomplete_count + " incomplete excluded" +
       (state.router_netted
         ? " · router prefix " + state.router_prefix_tokens.toLocaleString("en-US") + " tk netted from rates above 100%"
+        : "") +
+      (state.violations > 0
+        ? " · ! " + state.violations.toLocaleString("en-US") + " invariant violation(s)"
         : "");
     document.getElementById("foot-live").textContent = state.live ? "● live" : "idle";
     document.getElementById("foot-url").textContent = location.host;

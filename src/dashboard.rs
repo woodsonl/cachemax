@@ -205,6 +205,11 @@ pub struct DashboardState {
     /// Whether any turn actually needed the floor — the disclosure renders
     /// only then, never for a direct provider's honest ≤100% rates.
     pub router_netted: bool,
+    /// Total runtime invariant violations (claims vs behavior, checked per
+    /// finalize). Zero is the steady state; anything else is a regression
+    /// class firing. Rendered only when non-zero.
+    #[serde(default)]
+    pub violations: u64,
     /// Anthropic's write/read split, when the session exposes one (secondary to
     /// the binding hit rate). `None` for providers that report no write count.
     pub write_split: Option<WriteSplit>,
@@ -373,6 +378,7 @@ pub fn view(records: &[Record], live: bool, session_count: usize) -> DashboardSt
         // The disclosure renders only when netting actually applied: a
         // learned floor with no turn above 100% subtracted nothing, and
         // saying otherwise would describe a direct provider as routed.
+        violations: 0,
         router_netted: floor > 0
             && records.iter().any(|r| {
                 r.status == Status::Complete

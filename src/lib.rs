@@ -5,8 +5,10 @@
 
 pub mod adapters;
 pub mod breakpoints;
+pub mod canary;
 pub mod dashboard;
 pub mod export;
+pub mod invariants;
 pub mod ledger;
 pub mod matrix;
 pub mod proxy;

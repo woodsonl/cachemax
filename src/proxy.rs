@@ -97,6 +97,31 @@ pub fn plan_request(
     }
 }
 
+/// The finalize-time invariant checks: every claim the record makes is
+/// checked against what actually happened, on every turn. A violation is
+/// counted and logged — never blocks the response — because alignment is
+/// measured, not assumed.
+fn check_invariants(record: &Record, report: &DriftReport, rewrote: bool) {
+    // Tripwire: build_record coerces the figure to zero under NoCacheTruth
+    // upstream, so this can only fire if that coercion is removed without
+    // deciding what the label then means — the exact decision this check
+    // forces.
+    if record.cached_tokens > 0 && record.source == crate::record::SourceLabel::NoCacheTruth {
+        crate::invariants::note("cache_figure_without_truth");
+    }
+    if record.repaired && record.canonicalized_tokens == 0 {
+        crate::invariants::note("repaired_without_receipt");
+    }
+    if report.unrepairable.is_some() && rewrote {
+        crate::invariants::note("rewrote_an_unrepairable_turn");
+    }
+    if report.unrepairable == Some(crate::repair::Unrepairable::SystemPromptChanged)
+        && !report.system_examined
+    {
+        crate::invariants::note("system_hardstop_without_baseline");
+    }
+}
+
 /// Stamp a record with the drift claim computed on the request path, plus
 /// the rewrite outcome when one was applied (the actual canonicalized
 /// amount in place of the estimate). Every path that records an examined
@@ -490,6 +515,7 @@ impl<A: Adapter> Finalizer<A> {
             engine_cached,
         );
         apply_drift_claim(&mut record, &self.drift_report, self.rewrite.as_ref());
+        check_invariants(&record, &self.drift_report, self.rewrite.is_some());
         if let Some(managed) = self.breakpoints {
             record.breakpoint_count = Some(managed.total as u64);
         }
@@ -648,6 +674,15 @@ pub fn router<A: Adapter + 'static>(state: Arc<AppState<A>>) -> Router {
         .route("/", axum::routing::get(serve_dashboard))
         .route("/api/state", axum::routing::get(dashboard_state::<A>))
         .route("/api/export", axum::routing::get(export_session::<A>))
+        .route(
+            "/api/violations",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .header("content-type", "text/plain; version=0.0.4")
+                    .body(axum::body::Body::from(crate::invariants::render_prom()))
+                    .unwrap()
+            }),
+        )
         // Axum's default 2 MB body cap silently 413s a legitimately large
         // long-context prompt before the handler runs, so the turn is never
         // measured. Raise it well past real context sizes. A prompt larger than
@@ -683,7 +718,8 @@ async fn dashboard_state<A: Adapter + 'static>(State(state): State<Arc<AppState<
             .unwrap_or_default();
         (records, guard.len(), live)
     };
-    let view = crate::dashboard::view(&records, live, session_count);
+    let mut view = crate::dashboard::view(&records, live, session_count);
+    view.violations = crate::invariants::total();
     match serde_json::to_vec(&view) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
@@ -982,7 +1018,13 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // actually carries a system: that span went unexamined, so the
         // record must not claim a whole-span match.
         let system_examined = (chain.is_some() && !probed_rejected && !canonical_system.is_null())
-            || client_system.is_null();
+            || client_system.is_null()
+            // The messages ladder's leading-system hard stop is also a
+            // system comparison — a changed system MESSAGE was compared
+            // against the chain, so the record must not claim an
+            // unexamined system.
+            || classification.unrepairable
+                == Some(crate::repair::Unrepairable::SystemPromptChanged);
         let sys = if system_examined {
             repair::classify_system(&client_system, &canonical_system, &state.tokenizer)
         } else {
@@ -997,7 +1039,9 @@ pub async fn handle_chat<A: Adapter + 'static>(
         if sys.different {
             // A semantically different system prompt re-bases everything
             // downstream, exactly like a changed system message: the turn
-            // is never rewritten, on either side of the dialect.
+            // is never rewritten, on either side of the dialect. The hard
+            // stop requires a compared baseline by construction; the
+            // invariant check at finalize verifies it held.
             classification =
                 crate::repair::Classification::system_prompt_changed(sys.tokens_at_risk);
         } else {
@@ -1024,32 +1068,57 @@ pub async fn handle_chat<A: Adapter + 'static>(
         let mut tools_rewritable = false;
         let mut tools_tokens = 0u64;
         let mut tools_kind = None;
+        // A recorded baseline exists: the client's tools (present or
+        // dropped) are a change against it. The fold never runs on top of
+        // a hard stop — a changed system already owns the turn's story,
+        // and nothing on a hard-stopped turn is rewritten.
         if chain.is_some()
             && !probed_rejected
             && !canonical_tools.is_null()
-            && !client_tools.is_null()
+            && classification.unrepairable.is_none()
         {
-            match crate::repair::tools_relation(&client_tools, &canonical_tools) {
-                crate::repair::ToolsRel::Exact => {}
-                crate::repair::ToolsRel::Equivalent(kind) => {
-                    classification.report_matches = false;
-                    classification.drift_kind = Some(match classification.drift_kind {
-                        Some(existing) if existing != kind => DriftKind::Mixed,
-                        _ => kind,
-                    });
-                    classification.turns_affected += 1;
-                    tools_tokens = crate::repair::tools_tokens(&state.tokenizer, &canonical_tools);
-                    classification.tokens_at_risk += tools_tokens;
-                    tools_rewritable = true;
-                    tools_kind = Some(kind);
-                }
-                crate::repair::ToolsRel::Different => {
-                    tracing::info!(
-                        target: "cachemax_repair",
-                        session = plan.session_id,
-                        turn = plan.turn,
-                        "tools changed; prefix re-bases"
-                    );
+            if client_tools.is_null() {
+                classification.report_matches = false;
+                classification.turns_affected += 1;
+                classification.tokens_at_risk +=
+                    crate::repair::tools_tokens(&state.tokenizer, &canonical_tools);
+                tracing::info!(
+                    target: "cachemax_repair",
+                    session = plan.session_id,
+                    turn = plan.turn,
+                    "tools dropped; prefix re-bases"
+                );
+            } else {
+                match crate::repair::tools_relation(&client_tools, &canonical_tools) {
+                    crate::repair::ToolsRel::Exact => {}
+                    crate::repair::ToolsRel::Equivalent(kind) => {
+                        classification.report_matches = false;
+                        classification.drift_kind = Some(match classification.drift_kind {
+                            Some(existing) if existing != kind => DriftKind::Mixed,
+                            _ => kind,
+                        });
+                        classification.turns_affected += 1;
+                        tools_tokens =
+                            crate::repair::tools_tokens(&state.tokenizer, &canonical_tools);
+                        classification.tokens_at_risk += tools_tokens;
+                        tools_rewritable = true;
+                        tools_kind = Some(kind);
+                    }
+                    crate::repair::ToolsRel::Different => {
+                        // Different definitions: a root re-base the record
+                        // must not call a clean match. The span at risk is
+                        // the recorded tools; nothing is rewritten.
+                        classification.report_matches = false;
+                        classification.turns_affected += 1;
+                        classification.tokens_at_risk +=
+                            crate::repair::tools_tokens(&state.tokenizer, &canonical_tools);
+                        tracing::info!(
+                            target: "cachemax_repair",
+                            session = plan.session_id,
+                            turn = plan.turn,
+                            "tools changed; prefix re-bases"
+                        );
+                    }
                 }
             }
         }
@@ -1291,6 +1360,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             // before the send failed — exactly as a clean finalize would
             // (it stays excluded from aggregates as Incomplete).
             apply_drift_claim(&mut record, &drift_report, rewrite.as_ref());
+            check_invariants(&record, &drift_report, rewrite.is_some());
             if let Some(managed) = breakpoints {
                 record.breakpoint_count = Some(managed.total as u64);
             }
