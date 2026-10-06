@@ -25,19 +25,21 @@ form, 50 sends total, one upstream instance answering.
 
 ```
 drift-cost matrix · https://omniroute.home.arpa · n=5
-  class                    drifted m/m canonical m/m     delta  verdict
-  tool-arg-reorder             390/390     390/390         0  absorbed
-  whitespace                   393/393     390/390         0  absorbed
-  key-order                    390/390     390/390         0  absorbed
-  number-text                  392/392     390/390         0  absorbed
-  content-string-vs-array      390/390     390/390         0  absorbed
+  class                    drifted m/m canonical m/m   delta send  verdict
+  tool-arg-reorder             390/390     390/390       0  5/5  absorbed
+  whitespace                   393/393     390/390      +3  5/5  inverted: drifted cached more
+  key-order                    390/390     390/390       0  5/5  absorbed
+  number-text                  392/392     390/390      +2  5/5  inverted: drifted cached more
+  content-string-vs-array      390/390     390/390       0  5/5  absorbed
 ```
 
-Every class is absorbed: the router normalizes or re-tokenizes prompts
-before its cache keys them, so serialization drift costs nothing here.
-Notably, the whitespace-drifted form cached slightly MORE (393 vs 390) —
-the doubled-space text tokenized into three more cache-served tokens, an
-artifact of the router's own tokenizer, not a signal in either direction.
+No class costs cache here: the router normalizes or re-tokenizes prompts
+before its cache keys them, so serialization drift recovers nothing.
+Three classes read absorbed; two read inverted — the drifted form cached
+slightly MORE (393 vs 390, 392 vs 390), the router's tokenizer turning the
+altered text into a few more cache-served tokens. An inversion is a
+router artifact, not a signal in either direction, and the table says so
+rather than folding it into absorbed.
 
 The consequence for repair: on this endpoint, repair-on recovers nothing
 for these five classes, and the ladder work that matters elsewhere is not
