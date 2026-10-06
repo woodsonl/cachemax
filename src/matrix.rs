@@ -163,6 +163,47 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
                         d
                     },
                 },
+                // Tool definitions re-serialized (key order) — the
+                // cache-root class on providers that cache the prefix.
+                MatrixClass {
+                    name: "tools-reserialization",
+                    dialect: "openai",
+                    canonical: {
+                        let mut d = canonical.clone();
+                        d["tools"] = serde_json::json!([
+                            {"type": "function",
+                             "function": {"name": "get_weather",
+                                          "description": "Reads the rooftop station feed.",
+                                          "parameters": {"type": "object",
+                                                         "properties": {"city": {"type": "string"}}}}}
+                        ]);
+                        d
+                    },
+                    drifted: {
+                        let mut d = canonical.clone();
+                        d["tools"] = serde_json::json!([
+                            {"type": "function",
+                             "function": {"name": "get_weather",
+                                          "description": "Reads the rooftop station feed.",
+                                          "parameters": {"type": "object",
+                                                         "properties": {"city": {"type": "string"}}}}}
+                        ]);
+                        let tools = d["tools"].as_array_mut().unwrap();
+                        for t in tools.iter_mut() {
+                            let obj = t.as_object_mut().unwrap();
+                            let keys: Vec<String> = obj.keys().cloned().collect();
+                            let mut taken: Vec<(String, serde_json::Value)> = Vec::new();
+                            for k in keys {
+                                let v = obj.shift_remove(&k).unwrap();
+                                taken.push((k, v));
+                            }
+                            for (k, v) in taken.into_iter().rev() {
+                                obj.insert(k, v);
+                            }
+                        }
+                        d
+                    },
+                },
                 // Content shape: a plain string re-sent as a one-block array.
                 MatrixClass {
                     name: "content-string-vs-array",
@@ -219,6 +260,29 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
                             .remove("cache_control");
                         d["messages"][2]["content"][0]["cache_control"] =
                             serde_json::json!({"type": "ephemeral"});
+                        d
+                    },
+                },
+                // Tool definitions re-serialized (key order).
+                MatrixClass {
+                    name: "tools-reserialization",
+                    dialect: "anthropic",
+                    canonical: canonical.clone(),
+                    drifted: {
+                        let mut d = canonical.clone();
+                        let tools = d["tools"].as_array_mut().unwrap();
+                        for t in tools.iter_mut() {
+                            let obj = t.as_object_mut().unwrap();
+                            let keys: Vec<String> = obj.keys().cloned().collect();
+                            let mut taken: Vec<(String, serde_json::Value)> = Vec::new();
+                            for k in keys {
+                                let v = obj.shift_remove(&k).unwrap();
+                                taken.push((k, v));
+                            }
+                            for (k, v) in taken.into_iter().rev() {
+                                obj.insert(k, v);
+                            }
+                        }
                         d
                     },
                 },
@@ -300,6 +364,7 @@ pub async fn run(
         let r = execute_bodies(
             client,
             cfg,
+            &serde_json::Value::Null,
             &serde_json::Value::Null,
             &class.drifted,
             &class.canonical,

@@ -425,6 +425,118 @@ fn align_at(client: &[Value], canonical: &[Value], offset: usize) -> Aligned {
     }
 }
 
+/// How the request's `tools` array relates to the recorded one: the same
+/// equivalence ladder as messages, applied to the definitions. Tool
+/// definitions are prime cache-prefix material on Anthropic; identical
+/// tools with different serialization break the cache at the root.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolsRel {
+    Exact,
+    Equivalent(DriftKind),
+    /// Semantically different definitions: never rewritten — the client
+    /// changed capability.
+    Different,
+}
+
+/// Classify the request's `tools` against the recorded array. The
+/// certified prose positions in a tool definition are its `description`
+/// fields — the tool's own and the schema's property descriptions — so
+/// whitespace collapses there like any prose; schemas and names compare
+/// under the ordinary ladder, so key-order and number-text drift classify
+/// repairable and value differences stay Different.
+pub fn tools_relation(client: &Value, canonical: &Value) -> ToolsRel {
+    // Tool-level cache hints are placement policy in both dialect shapes:
+    // Anthropic's definitions carry no `type` sibling, so the message
+    // ladder's hint shape does not fire — strip a bare object-valued
+    // `cache_control` from each tool element directly.
+    let a = strip_cache_control(client);
+    let b = strip_cache_control(canonical);
+    let a = strip_tool_hints(&a);
+    let b = strip_tool_hints(&b);
+    let (a, b): (&Value, &Value) = (&a, &b);
+    if a == b {
+        if serde_json::to_vec(a).unwrap_or_default() != serde_json::to_vec(b).unwrap_or_default() {
+            return ToolsRel::Equivalent(DriftKind::SerializationOnly);
+        }
+        return ToolsRel::Exact;
+    }
+    if number_lenient(&tool_args_normalized(a)) == number_lenient(&tool_args_normalized(b)) {
+        return ToolsRel::Equivalent(DriftKind::ToolArgReserialization);
+    }
+    if description_normalized(a) == description_normalized(b) {
+        return ToolsRel::Equivalent(DriftKind::TextNormalization);
+    }
+    ToolsRel::Different
+}
+
+/// Collapse whitespace in the CERTIFIED prose positions of a tool
+/// definition: the tool's own `description` (an object carrying a `name`
+/// sibling) and a schema property's `description` (an object reached
+/// through a `properties` object). Every other string — names, types,
+/// enums, examples, defaults — is data, and data whitespace is semantic.
+fn description_normalized(v: &Value) -> Value {
+    description_walk(v, false)
+}
+
+fn description_walk(v: &Value, in_properties: bool) -> Value {
+    match v {
+        Value::Object(map) => {
+            let is_tool_def = map.contains_key("name");
+            let mut out = Map::new();
+            for (k, val) in map {
+                let normalized =
+                    if k == "description" && val.is_string() && (is_tool_def || in_properties) {
+                        collapse_ws(val)
+                    } else {
+                        description_walk(val, k == "properties")
+                    };
+                out.insert(k.clone(), normalized);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            // Inside an array the properties context ends: array elements
+            // are data (examples, enum values, tool-call lists).
+            Value::Array(items.iter().map(|i| description_walk(i, false)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// A copy of a tools array with each element's own object-valued
+/// `cache_control` removed — the Anthropic tool-def hint carries no
+/// `type` sibling, so only the key plus its shape can identify it.
+fn strip_tool_hints(v: &Value) -> std::borrow::Cow<'_, Value> {
+    let Value::Array(items) = v else {
+        return std::borrow::Cow::Borrowed(v);
+    };
+    if !items
+        .iter()
+        .any(|t| t.get("cache_control").is_some_and(|c| c.is_object()))
+    {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    let stripped: Vec<Value> = items
+        .iter()
+        .map(|t| {
+            let mut owned = t.clone();
+            if let Some(obj) = owned.as_object_mut() {
+                obj.remove("cache_control");
+            }
+            owned
+        })
+        .collect();
+    std::borrow::Cow::Owned(Value::Array(stripped))
+}
+
+/// The recorded tools' serialized token count — the at-risk estimate when
+/// drifted, the receipt when rewritten.
+pub fn tools_tokens(tokenizer: &Tokenizer, tools: &Value) -> u64 {
+    serde_json::to_string(tools)
+        .map(|s| tokenizer.count(&s) as u64)
+        .unwrap_or(0)
+}
+
 /// How the Anthropic-dialect top-level `system` relates to the canonical
 /// one. The same equivalence ladder as messages applies — the system prompt
 /// is prime cache material and drift there is total cache loss — with the
@@ -1608,5 +1720,142 @@ mod tests {
         );
         assert_eq!(r.kind, None, "hint placement only: no drift kind");
         assert!(!r.different);
+    }
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+
+    fn defs() -> serde_json::Value {
+        serde_json::json!([
+            {"name": "get_weather",
+             "description": "Reads the rooftop station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"},
+                                             "extended": {"type": "integer"}}}}
+        ])
+    }
+
+    #[test]
+    fn key_order_in_definitions_is_wire_drift() {
+        let mut drifted = defs();
+        let obj = drifted[0].as_object_mut().unwrap();
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        let mut taken: Vec<(String, Value)> = Vec::new();
+        for k in keys {
+            let v = obj.shift_remove(&k).unwrap();
+            taken.push((k, v));
+        }
+        for (k, v) in taken.into_iter().rev() {
+            obj.insert(k, v);
+        }
+        assert_eq!(
+            tools_relation(&drifted, &defs()),
+            ToolsRel::Equivalent(DriftKind::SerializationOnly)
+        );
+    }
+
+    #[test]
+    fn description_whitespace_is_prose() {
+        let drifted = serde_json::json!([
+            {"name": "get_weather",
+             "description": "Reads  the rooftop  station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"},
+                                             "extended": {"type": "integer"}}}}
+        ]);
+        assert_eq!(
+            tools_relation(&drifted, &defs()),
+            ToolsRel::Equivalent(DriftKind::TextNormalization)
+        );
+    }
+
+    #[test]
+    fn schema_number_text_is_tool_payload_drift() {
+        let drifted = serde_json::json!([
+            {"name": "get_weather",
+             "description": "Reads the rooftop station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"},
+                                             "extended": {"type": "integer", "default": 1.0}}}}
+        ]);
+        let canonical = serde_json::json!([
+            {"name": "get_weather",
+             "description": "Reads the rooftop station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"},
+                                             "extended": {"type": "integer", "default": 1}}}}
+        ]);
+        assert_eq!(
+            tools_relation(&drifted, &canonical),
+            ToolsRel::Equivalent(DriftKind::ToolArgReserialization)
+        );
+    }
+
+    #[test]
+    fn different_definitions_are_never_rewritten() {
+        let drifted = serde_json::json!([
+            {"name": "get_forecast",
+             "description": "Reads the rooftop station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"}}}}
+        ]);
+        assert_eq!(tools_relation(&drifted, &defs()), ToolsRel::Different);
+        // A different schema under the same name is a different tool.
+        let drifted = serde_json::json!([
+            {"name": "get_weather",
+             "description": "Reads the rooftop station feed for a city.",
+             "input_schema": {"type": "object",
+                              "properties": {"city": {"type": "string"},
+                                             "unit": {"type": "string"}}}}
+        ]);
+        assert_eq!(tools_relation(&drifted, &defs()), ToolsRel::Different);
+    }
+}
+
+#[cfg(test)]
+mod tools_hint_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_shaped_tool_hints_are_policy_not_content() {
+        // Anthropic's tool defs carry no `type` sibling, so the message
+        // ladder's hint shape does not fire. A hint-only difference between
+        // definitions is placement policy — equivalent, repairable — not a
+        // capability change.
+        let canonical = serde_json::json!([
+            {"name": "get_weather", "description": "Feed.",
+             "input_schema": {"type": "object"},
+             "cache_control": {"type": "ephemeral"}}
+        ]);
+        let hinted_elsewhere = serde_json::json!([
+            {"name": "get_weather", "description": "Feed.",
+             "input_schema": {"type": "object"}}
+        ]);
+        // Stripped of placement, the definitions are identical bytes: a
+        // hint-only difference is never drift — Exact, matching the
+        // message-ladder doctrine.
+        assert_eq!(
+            tools_relation(&hinted_elsewhere, &canonical),
+            ToolsRel::Exact
+        );
+    }
+
+    #[test]
+    fn description_whitespace_in_data_positions_is_semantic() {
+        // An example payload's `description` is data: collapsing its
+        // whitespace would rewrite content, so it must compare exactly.
+        let canonical = serde_json::json!([
+            {"name": "t", "description": "Tool.",
+             "input_schema": {"type": "object",
+                              "examples": [{"input": {"description": "line one  kept"}}]}}
+        ]);
+        let drifted = serde_json::json!([
+            {"name": "t", "description": "Tool.",
+             "input_schema": {"type": "object",
+                              "examples": [{"input": {"description": "line one kept"}}]}}
+        ]);
+        assert_eq!(tools_relation(&drifted, &canonical), ToolsRel::Different);
     }
 }
