@@ -242,6 +242,27 @@ client-chosen key forever would be unbounded memory.
 `--api-key-env <VAR>`, `--n <samples>`, `--limit <chains>`, and `--yes`.
 `canary` takes `--upstream-url` and `--api-key-env <VAR>`.
 
+### The production profile (always hit)
+
+The configuration for "every token that could hit, does":
+
+```
+cachemax serve --upstream-url <endpoint> --backend <name> --repair on
+```
+
+plus, on Anthropic: `--manage-breakpoints` (the proxy places and re-derives
+the cache anchor, so rewritten requests never orphan a breakpoint). Agents
+that truncate or re-base history each turn add `x-cachemax-session: <key>`
+per conversation — the client's word pins the chain when bytes can't.
+
+What repair recovers is endpoint-dependent: `cachemax drift-matrix` says
+which classes your endpoint punishes. On omniroute with auto/fast, no class
+costs cache (three absorbed, two inverted — the table refuses to call
+inversions absorbed), so repair recovers nothing there, and the matrix
+records exactly that.
+Schedule `cachemax canary` to keep the whole story verified: repair
+happened, cache hit, zero invariant violations, exit-red on any breach.
+
 ### Runtime invariants
 
 Every finalized turn checks its own claims: a cache figure implies a source
