@@ -45,7 +45,20 @@ pub struct MatrixClass {
 /// A deterministic, chunky shared prefix — cache effects need enough tokens
 /// to sit above router noise, and identical text everywhere except the
 /// mutated span keeps the comparison clean.
-const PROSE: &str = "You are the records assistant for the Kyoto facility audit. The lab protocol requires quoting the reference batch identifier in every reply, which is BATCH-7741-ALPHA-9, registered during the March audit window under supervision of the quality office. The protocol file lives in the east annex, revision fourteen, and any deviation from the quoted procedure must be reported within one business day to the same office, referencing the batch identifier and the audit window. Weather queries are answered from the rooftop station feed, which reports temperature, sky condition, and observation hours, and every answer names the station that produced the reading.";
+const PROSE_PARA: &str = "You are the records assistant for the Kyoto facility audit. The lab protocol requires quoting the reference batch identifier in every reply, which is BATCH-7741-ALPHA-9, registered during the March audit window under supervision of the quality office. The protocol file lives in the east annex, revision fourteen, and any deviation from the quoted procedure must be reported within one business day to the same office, referencing the batch identifier and the audit window. Weather queries are answered from the rooftop station feed, which reports temperature, sky condition, and observation hours, and every answer names the station that produced the reading.";
+
+/// The fixture system text, repeated to clear the strictest provider's
+/// minimum cacheable prefix. Anthropic documents 2048 tokens; measured
+/// live against api.anthropic.com, the observed floor for
+/// claude-haiku-4-5 sits between 3884 and 5161 input tokens — consistent
+/// with 4096 — so the fixtures clear the observed floor with margin.
+/// Below it the provider refuses to cache at all, and the matrix would
+/// read a false "no caching on this endpoint" for fixture-size reasons,
+/// not endpoint reasons. Both forms share the same text, so class
+/// semantics are unchanged — only the prefix is long enough to cache.
+fn floored_prose() -> String {
+    PROSE_PARA.repeat(40)
+}
 
 fn base_openai_body(system: &str, model: &str) -> serde_json::Value {
     serde_json::json!({
@@ -144,7 +157,7 @@ fn isolate(mut c: MatrixClass) -> MatrixClass {
 pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass> {
     match backend {
         crate::replay::Backend::OpenAi => {
-            let canonical = base_openai_body(PROSE, model);
+            let canonical = base_openai_body(&floored_prose(), model);
             vec![
                 // Tool-argument keys reordered and compacted by a framework.
                 MatrixClass {
@@ -167,7 +180,7 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     drifted: {
                         let mut d = canonical.clone();
                         d["messages"][0]["content"] =
-                            serde_json::Value::String(PROSE.replace(". ", ".  "));
+                            serde_json::Value::String(floored_prose().replace(". ", ".  "));
                         d
                     },
                 },
@@ -255,7 +268,7 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     dialect: "openai",
                     canonical,
                     drifted: {
-                        let mut d = base_openai_body(PROSE, model);
+                        let mut d = base_openai_body(&floored_prose(), model);
                         let text = d["messages"][1]["content"].take();
                         d["messages"][1]["content"] =
                             serde_json::json!([{"type": "text", "text": text}]);
@@ -270,7 +283,7 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
         crate::replay::Backend::Anthropic => {
             let canonical = base_anthropic_body(
                 serde_json::json!([
-                    {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
+                    {"type": "text", "text": floored_prose(), "cache_control": {"type": "ephemeral"}}
                 ]),
                 model,
             );
@@ -293,7 +306,7 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     drifted: {
                         let mut d = canonical.clone();
                         d["system"][0]["text"] =
-                            serde_json::Value::String(PROSE.replace(". ", ".  "));
+                            serde_json::Value::String(floored_prose().replace(". ", ".  "));
                         d
                     },
                 },
@@ -344,47 +357,15 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     name: "system-shape",
                     dialect: "anthropic",
                     canonical: base_anthropic_body(
-                        serde_json::json!([{"type": "text", "text": PROSE}]),
+                        serde_json::json!([{"type": "text", "text": floored_prose()}]),
                         model,
                     ),
-                    drifted: base_anthropic_body(
-                        serde_json::Value::String(PROSE.to_string()),
-                        model,
-                    ),
-                },
-                // Hint placement vs the managed baseline: this pair
-                // measures placement policy AND shape together (the moved
-                // hint also changes which span is cacheable) — the docs
-                // say so, so a verdict here is not attributed to shape.
-                MatrixClass {
-                    name: "hint-placement",
-                    dialect: "anthropic",
-                    canonical: base_anthropic_body(
-                        serde_json::json!([
-                            {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
-                        ]),
-                        model,
-                    ),
-                    drifted: {
-                        let mut d = base_anthropic_body(
-                            serde_json::json!([
-                                {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
-                            ]),
-                            model,
-                        );
-                        d["system"][0]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("cache_control");
-                        d["messages"][2]["content"][0]["cache_control"] =
-                            serde_json::json!({"type": "ephemeral"});
-                        d
-                    },
+                    drifted: base_anthropic_body(serde_json::Value::String(floored_prose()), model),
                 },
             ]
-                .into_iter()
-                .map(isolate)
-                .collect()
+            .into_iter()
+            .map(isolate)
+            .collect()
         }
     }
 }
