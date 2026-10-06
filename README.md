@@ -1,27 +1,47 @@
 # cachemax
 
-An OpenAI-compatible proxy that sits in front of an LLM endpoint, measures how
-much of each request's re-sent history was served from the provider's prompt
-cache, repairs drifted request history so the provider re-sees what it already
-cached, and reports the cost and speed consequence on a live dashboard.
+Agents re-send their history every turn, and every re-serialization —
+reordered tool arguments, re-wrapped text, re-keyed JSON — breaks the
+provider's cache key. The provider re-processes tokens it already saw, and
+you pay base input price for them. cachemax is an OpenAI-compatible proxy
+that rewrites drifted requests back to the exact serialization the
+provider already cached, so the cache hits again and the re-sent history
+bills at cached rates instead — roughly a tenth of base input on
+Anthropic cache reads, roughly half on OpenAI. Measured on a caching
+provider, tool-argument drift alone cost 56-204 cached tokens per send
+across runs; after repair the request IS the cached serialization, so
+that penalty has nothing left to miss.
 
-Measure → repair → prove, on one loopback port:
+Repair pays wherever the provider caches on token identity — and where it
+doesn't, you should know that before trusting any number. One command
+answers it for your endpoint:
 
-- **Measure (always on):** point an app or agent at the proxy instead of
-  directly at OpenAI, Anthropic, or OpenRouter, and see how much prompt-cache
-  reuse you get and what it costs. Local engines (llama.cpp, vLLM, mlx-lm) are
-  a first-class target too: watch TTFT collapse as the cache warms.
-- **Repair (dry-run by default):** agent frameworks re-serialize tool-call
-  arguments and re-wrap text on every turn, and each re-serialization breaks
-  the provider's cache key. cachemax classifies that drift per turn — in
-  `--repair on` it rewrites the drifted history back to the exact
-  serialization the provider already cached, so the cache hits again. It never
-  invents content: a rewrite replaces bytes with bytes the provider already
-  accepted, and anything semantically different passes through untouched and
+```
+cachemax drift-matrix --upstream-url <endpoint> --model <model> --n 3 --yes
+```
+
+Everything else exists to make that repair trustworthy:
+
+- **Repair (dry-run by default):** drift is classified per turn; in
+  `--repair on` the drifted history is rewritten to the bytes the provider
+  already accepted. Never invents content — a rewrite replaces bytes with
+  bytes, and anything semantically different passes through untouched and
   flagged.
-- **Prove:** every turn's record shows what happened — drift classified,
-  tokens repaired, cache-served tokens recovered — on the dashboard and in the
-  metrics-only JSONL export.
+- **Measure (always on):** every turn records what happened — drift
+  classified, tokens repaired, cache-served tokens recovered — on the
+  dashboard and in the metrics-only JSONL export. Unmeasured reads as `—`,
+  never as 0.
+- **Prove:** `cachemax replay --execute` drives the recorded A/B — drifted
+  vs canonical — against the real endpoint and reports what each form
+  measurably costs. `cachemax canary` keeps the whole story verified on a
+  schedule: repair happened, cache hit, zero invariant violations.
+- **Local engines too:** llama.cpp, vLLM, mlx-lm are first-class targets;
+  watch TTFT collapse as the cache warms.
+
+On the Anthropic subscription path surveyed, the cache fields come back
+but never nonzero — so cachemax claims speed there, not savings. The
+billed-savings story is the API-key path, and the drift matrix tells you
+which one you are on.
 
 ## Install
 
@@ -138,7 +158,8 @@ never message content.
 
 ### Prove it yourself: `cachemax replay`
 
-The A/B that produced the numbers above is reproducible on your own traffic:
+An A/B like the one behind those numbers is reproducible on your own
+recorded traffic:
 
 1. Run `cachemax serve` with `--repair dry-run` (the default) in front of
    your provider for a while — the ledger records the canonical chains.

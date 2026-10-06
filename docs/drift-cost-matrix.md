@@ -18,10 +18,23 @@ spend ladder work where the table says `costs`.
 Sends are billable on cloud endpoints. The planned total prints before the
 first send, and runs above 40 sends need `--yes`.
 
-## omniroute.home.arpa · auto/fast (2026-10-05)
+**Routed endpoints: a measurement belongs to the provider instance that
+served it.** OpenRouter (and omniroute) forward to inference providers,
+each with its own caching behavior; one run measures the provider(s) that
+answered those requests, not the router as a whole. Results below are
+attributed to the provider slug that ran them. Two caveats the tool
+itself cannot close on OpenRouter: the router exposes no routing headers,
+so the instance fingerprint is blind and cross-provider mixing within one
+run is invisible; and the same model slug can be served by different
+providers over time. A run is a sample of that provider's behavior that
+day, not a permanent property of the router.
 
-Local routed endpoint, Apple-silicon inference. Five classes, 5 samples per
-form, 50 sends total, one upstream instance answering.
+## omniroute.local (auto/fast) — local models (2026-10-05)
+
+Local router to Apple-silicon models. Five classes, 5 samples per form,
+50 sends total, one upstream instance answering. The normalization
+credited below cannot be pinned to router or model — the fingerprint
+cannot split them — so it is attributed to the serving stack as a whole.
 
 ```
 drift-cost matrix · https://omniroute.home.arpa · n=5
@@ -47,11 +60,14 @@ prioritized here. The same matrix against a byte-identity provider
 (OpenAI direct, Anthropic without normalization) is where `costs` verdicts
 are expected; those runs are user-gated.
 
-## openrouter.ai · free tier (2026-10-05)
+## NVIDIA provider + auto-router, via OpenRouter free tier (2026-10-05)
 
-Two free models, 3 samples per form, 36 sends each: nvidia/nemotron-3-ultra-
-550b-a55b:free and openrouter/free (auto-router). Auth via the OpenRouter
-key, `--model` selects the fixture model.
+One fixed provider and one auto-routed slug, 3 samples per form, 36 sends
+each: nvidia/nemotron-3-ultra-550b-a55b:free (NVIDIA's serving infra) and
+openrouter/free (OpenRouter's auto-router — not a provider: it mixes
+providers per request, so that run's readings may span more than one
+backend, invisible to the fingerprint). Auth via the OpenRouter key, `--model` selects the
+fixture model.
 
 ```
 nvidia/nemotron-3-ultra-550b-a55b:free
@@ -89,16 +105,19 @@ reordering cost cache on a provider that caches raw tokens?) needs a paid
 model; the free tier cannot answer it. A cents-scale run on a paid
 OpenRouter model or a direct provider key is the remaining measurement.
 
-## openrouter.ai · deepseek/deepseek-chat-v3.1, paid (2026-10-06)
+## DeepSeek provider (deepseek-chat-v3.1), via OpenRouter paid (2026-10-06)
 
-The byte-identity leg. DeepSeek V3.1 does automatic prefix caching with no
+The byte-identity leg — attributed to the DeepSeek provider that served
+it, not to OpenRouter. DeepSeek V3.1 does automatic prefix caching with no
 breakpoints and reports hit counts through the OpenAI-compatible surface —
 the mechanism that punishes byte-level drift. The protocol here is the
 corrected one: warm the canonical form (2 pairs), then send the drifted
 form — the FIRST drifted reading against the cache the canonical form
 demonstrably established (the warm's maximum; individual warm sends can
 read zero seconds after establishing it) is the drift cost. 60 sends,
-about 2 cents.
+about 2 cents. The fingerprint is blind on this path, so provider mixing
+within the run cannot be ruled out; repeat on a different day or a
+different provider serving the same class of cache before generalizing.
 
 ```
 drift-cost matrix · https://openrouter.ai/api/v1 · n=3
@@ -111,8 +130,8 @@ drift-cost matrix · https://openrouter.ai/api/v1 · n=3
   content-string-vs-array        0/205     205/205     205  3/2  costs 205 tk (first send)
 ```
 
-**Serialization drift costs real cache here, and the classes repair fixes
-are the classes this provider punishes.** Tool-argument reordering costs
+**Serialization drift costs real cache on this provider, and the classes
+repair fixes are the classes it punishes.** Tool-argument reordering costs
 the drifted tail (~56 tokens: the prefix up to the tool call survives,
 the rest misses). Prose whitespace in the system costs most of the prefix
 (115-197 across runs). Number text costs a partial-to-full miss (38-201
@@ -133,10 +152,10 @@ is why the baseline is the warm's maximum and the readings are published;
 and first-send costs vary run to run (56-204 for tool-arg reorder), which
 is why the verdict is the direction, not a single number.
 
-The omniroute table above predates the corrected protocol (it measured
-interleaved alternation, which lets each form warm its own entry); its
-absorbed verdicts stand as recorded but the deepseek table is the one to
-cite for what drift costs a caching provider. The Anthropic-dialect
+The omniroute and free-tier tables above predate the corrected protocol
+(they measured interleaved alternation, which lets each form warm its own
+entry); their verdicts stand as recorded but the DeepSeek-provider table
+is the one to cite for what drift costs a caching provider. The Anthropic-dialect
 classes could not be measured through OpenRouter: its `/v1/messages` path
 reports zero cache writes for `cache_control` payloads at any length
 (3216-token probe, three sends), and the OpenAI-compat path with a Claude
@@ -145,13 +164,16 @@ on either path. That leg needs a direct Anthropic key.
 
 ## api.anthropic.com · subscription OAuth (2026-10-06)
 
-The Anthropic-dialect leg, run with a Claude subscription token
+The Anthropic-dialect leg, run directly against Anthropic's API with a
+Claude subscription token
 (`sk-ant-oat…`) on the native `/v1/messages` endpoint, 48 sends, n=2: every
 reading on every class is a reported zero — the subscription auth path
 reports the cache fields but never a nonzero figure, so drift cost cannot
-be measured on it. This is the third auth path surveyed and the third
-answer: omniroute normalizes, OpenRouter free does not cache, and
-Anthropic subscription OAuth does not report caching to raw API callers.
+be measured on it. This is the third auth path surveyed and the third answer: the omniroute
+local models normalize, the free-tier providers surveyed do not cache, and
+Anthropic subscription OAuth does not report caching to raw API callers —
+each a statement about the providers that served the runs, not a permanent
+property of any router.
 The Anthropic-dialect classes (hint placement, system shape, the
 tools-bearing prefix with `cache_control`) remain unmeasured pending a
 console API key (`sk-ant-api…`), which is the one auth path documented to
@@ -168,7 +190,8 @@ bill and report prompt caching.
   nothing because caching costs nothing — a different mechanism than
   absorption, stated differently.
 - The drifted column shows first-send/max; the canonical column shows
-  median/max of the warm. The verdict compares the drifted FIRST send
+  median/max of the warm. (The omniroute and free-tier tables predate the
+  corrected protocol and show median/max on both sides.) The verdict compares the drifted FIRST send
   against the warm MAXIMUM (the established baseline) — one flaky zero in
   the warm cannot declare the cache absent.
 - `unmeasured` — every send failed or carried no cache figure; the cause is
