@@ -244,3 +244,110 @@ fn tool_result_reserialization_is_repaired() {
         "tool payload reserialization: args and results share the class"
     );
 }
+
+#[test]
+fn multi_block_text_merge_and_split_is_reshaped() {
+    // A client that splits one text into two blocks (or merges two into
+    // one) re-sends the same prose: value-equal after flattening, so the
+    // reshape class repairs it. Blocks carrying siblings never reshape.
+    use cachemax::repair::{classify_turn, DriftKind};
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    let canonical = vec![serde_json::json!({
+        "role": "user", "content": "Part one. Part two."
+    })];
+    let split = vec![serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Part one. "},
+            {"type": "text", "text": "Part two."}
+        ]
+    })];
+    let c = classify_turn(&split, Some(&canonical), false, &tok);
+    assert_eq!(c.semantic_break, None);
+    assert_eq!(c.drift_kind, Some(DriftKind::RoleContentReshaped));
+
+    // The merge direction: canonical split into blocks, client merged to a
+    // string — the same equivalence, pinned separately so a future
+    // asymmetric reshape regression cannot pass one direction and fail
+    // the other silently.
+    let canonical_split = vec![serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Part one. "},
+            {"type": "text", "text": "Part two."}
+        ]
+    })];
+    let merged = vec![serde_json::json!({
+        "role": "user", "content": "Part one. Part two."
+    })];
+    let c = classify_turn(&merged, Some(&canonical_split), false, &tok);
+    assert_eq!(c.semantic_break, None);
+    assert_eq!(c.drift_kind, Some(DriftKind::RoleContentReshaped));
+
+    // A sibling on any block blocks the reshape: annotations are semantic.
+    let annotated = vec![serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Part one. ",
+             "annotations": [{"type": "citation", "id": "x"}]},
+            {"type": "text", "text": "Part two."}
+        ]
+    })];
+    let c = classify_turn(&annotated, Some(&canonical), false, &tok);
+    assert_eq!(c.semantic_break, Some(0), "siblings block the reshape");
+}
+
+#[test]
+fn langchain_shaped_resend_is_repaired() {
+    // LangChain re-serializes tool calls with compact arguments and
+    // reordered keys, and re-sends string content verbatim: the classic
+    // agent-framework shape, end to end through the ladder.
+    use cachemax::repair::{classify_turn, DriftKind};
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    let canonical = vec![
+        serde_json::json!({"role": "system", "content": "You book tables."}),
+        serde_json::json!({
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "book",
+                             "arguments": "{\"restaurant\": \"L'Astrance\", \"guests\": 2}"}}]
+        }),
+        serde_json::json!({"role": "tool", "tool_call_id": "c1",
+                            "content": "{\"confirmed\": true, \"time\": \"20:00\"}"}),
+    ];
+    let langchain = vec![
+        serde_json::json!({"role": "system", "content": "You book tables."}),
+        serde_json::json!({
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "book",
+                             "arguments": "{\"guests\":2,\"restaurant\":\"L'Astrance\"}"}}]
+        }),
+        serde_json::json!({"role": "tool", "tool_call_id": "c1",
+                            "content": "{\"time\":\"20:00\",\"confirmed\":true}"}),
+    ];
+    let c = classify_turn(&langchain, Some(&canonical), false, &tok);
+    assert_eq!(c.semantic_break, None, "the whole LangChain shape repairs");
+    assert_eq!(c.drift_kind, Some(DriftKind::ToolArgReserialization));
+}
+
+#[test]
+fn vercel_ai_sdk_shaped_resend_is_repaired() {
+    // The Vercel AI SDK sends content as a parts array where a plain
+    // client sent a string: same text, different shape.
+    use cachemax::repair::{classify_turn, DriftKind};
+    use cachemax::tokenize::Tokenizer;
+    let tok = Tokenizer::default_encoder().unwrap();
+    let canonical = vec![serde_json::json!({
+        "role": "user", "content": "Book a table for two."
+    })];
+    let vercel = vec![serde_json::json!({
+        "role": "user",
+        "content": [{"type": "text", "text": "Book a table for two."}]
+    })];
+    let c = classify_turn(&vercel, Some(&canonical), false, &tok);
+    assert_eq!(c.semantic_break, None);
+    assert_eq!(c.drift_kind, Some(DriftKind::RoleContentReshaped));
+}

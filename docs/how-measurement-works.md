@@ -100,6 +100,22 @@ netted. Known limit: a wrapper that writes its own preamble carries a
 breakpoint, defeats the write gate, and is not learned as a floor — such a
 session is disclosed only through the >100% gate.
 
+## What repair covers
+
+The ladder treats as repairable (rewritten to the recorded bytes): tool
+argument and tool result re-serialization (key order, whitespace, number
+text below 2^53), text whitespace in certified prose positions, content
+shape (string ↔ parts, block merge/split), object key order (wire-drift),
+tool definition re-serialization (the cache root), corrupt arguments for a
+recorded call with matching id and name (restored; the request would
+otherwise fail), and serialization drift in the top-level system. Flagged,
+never rewritten: semantic changes — different content, different tools, a
+changed system, a model switch. The standing loop: every `drift_kind`
+observed in a dry-run export is pinned by a corpus fixture, and drift the
+ladder cannot classify surfaces as `matches_canonical` false with
+`drift_kind` null — triage those turns against the local ledger (the exact
+bytes are there) to decide whether a new rule is warranted.
+
 ## What `provider_reported` means
 On the cloud path, the cache figure is the provider's own number. cachemax never
 re-derives or second-guesses it. OpenAI and OpenRouter report
