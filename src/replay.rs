@@ -82,20 +82,24 @@ impl Backend {
         self,
         form_body: &serde_json::Value,
         system: &serde_json::Value,
+        tools: &serde_json::Value,
     ) -> serde_json::Value {
-        match self {
-            Backend::OpenAi => form_body.clone(),
-            Backend::Anthropic => {
-                let mut body = form_body.clone();
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("max_tokens".into(), ANTHROPIC_DEFAULT_MAX_TOKENS.into());
-                    if !system.is_null() {
-                        obj.insert("system".into(), system.clone());
-                    }
+        let mut body = form_body.clone();
+        if let Some(obj) = body.as_object_mut() {
+            // The recorded tools ride along in both dialects: they are part
+            // of the cached prefix, so a replay without them measures the
+            // wrong root.
+            if !tools.is_null() {
+                obj.insert("tools".into(), tools.clone());
+            }
+            if let Backend::Anthropic = self {
+                obj.insert("max_tokens".into(), ANTHROPIC_DEFAULT_MAX_TOKENS.into());
+                if !system.is_null() {
+                    obj.insert("system".into(), system.clone());
                 }
-                body
             }
         }
+        body
     }
 
     /// Read the cache signal out of one response body with this backend's
@@ -372,6 +376,7 @@ pub async fn execute_pair(
         client,
         cfg,
         &request.request_system,
+        &request.request_tools,
         &pair["a_drifted"],
         &pair["b_canonical"],
     )
@@ -387,11 +392,12 @@ pub async fn execute_bodies(
     client: &reqwest::Client,
     cfg: &ExecuteConfig,
     system: &serde_json::Value,
+    tools: &serde_json::Value,
     a_body: &serde_json::Value,
     b_body: &serde_json::Value,
 ) -> ChainReport {
-    let a_body = cfg.backend.prepare_body(a_body, system);
-    let b_body = cfg.backend.prepare_body(b_body, system);
+    let a_body = cfg.backend.prepare_body(a_body, system, tools);
+    let b_body = cfg.backend.prepare_body(b_body, system, tools);
     let mut a = SampleAcc::new("a_drifted");
     let mut b = SampleAcc::new("b_canonical");
     for _ in 0..cfg.samples {
@@ -573,18 +579,22 @@ mod tests {
         let form =
             serde_json::json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}]});
         let system = serde_json::json!("You call tools.");
-        let body = Backend::Anthropic.prepare_body(&form, &system);
+        let body = Backend::Anthropic.prepare_body(&form, &system, &serde_json::Value::Null);
         assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["system"], "You call tools.");
         assert_eq!(body["messages"][0]["content"], "hi");
 
         // A chain recorded with no system stays valid; no null "system" key.
-        let body = Backend::Anthropic.prepare_body(&form, &serde_json::Value::Null);
+        let body = Backend::Anthropic.prepare_body(
+            &form,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
         assert_eq!(body["max_tokens"], 1024);
         assert!(body.get("system").is_none());
 
         // OpenAI bodies go as recorded — no injected fields.
-        let body = Backend::OpenAi.prepare_body(&form, &system);
+        let body = Backend::OpenAi.prepare_body(&form, &system, &serde_json::Value::Null);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("system").is_none());
     }

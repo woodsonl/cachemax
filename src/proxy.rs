@@ -431,6 +431,10 @@ struct Finalizer<A: Adapter> {
     /// turn (Null when the dialect carries the system inside `messages`).
     /// Enters the ledger beside the messages it prefixes.
     as_sent_system: serde_json::Value,
+    /// The request's `tools` array exactly as forwarded (Null when absent).
+    /// Part of the cached prefix on Anthropic; canonicalized under the same
+    /// ladder as messages.
+    as_sent_tools: serde_json::Value,
     /// The drift report computed on the request path. Patched into the
     /// record at finalize; dry-run never lets it touch the request.
     drift_report: DriftReport,
@@ -501,6 +505,7 @@ impl<A: Adapter> Finalizer<A> {
                 // The Anthropic top-level system, as forwarded (Null when
                 // the dialect carries the system inside `messages`).
                 request_system: self.as_sent_system.clone(),
+                request_tools: self.as_sent_tools.clone(),
                 response_messages: self.observer.response_messages(),
                 prefix_hashes: self.plan.prefix_hashes.clone(),
                 // What WE placed (a declined pass touched nothing and must
@@ -885,7 +890,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         // per model by design. The Anthropic top-level `system` rides
         // along: it is classified under the same ladder and repaired the
         // same way, because system drift is total cache loss.
-        let (chain, canonical_system, model_switched, probed) = {
+        let (chain, canonical_system, canonical_tools, model_switched, probed) = {
             let ledger = state.ledger.lock();
             match ledger.canonical_messages(plan.session_id, &model) {
                 Some(c) => (
@@ -894,12 +899,20 @@ pub async fn handle_chat<A: Adapter + 'static>(
                         .canonical_system(plan.session_id, &model)
                         .cloned()
                         .unwrap_or(serde_json::Value::Null),
+                    ledger
+                        .canonical_tools(plan.session_id, &model)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                     false,
                     false,
                 ),
-                None if ledger.session_has_chains(plan.session_id) => {
-                    (None, serde_json::Value::Null, true, false)
-                }
+                None if ledger.session_has_chains(plan.session_id) => (
+                    None,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    true,
+                    false,
+                ),
                 // A keyed request whose session has no chain starts a NEW
                 // conversation — the client said so. The most-recent-chain
                 // probe below exists to reattach forked un-keyed traffic; a
@@ -907,13 +920,23 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 // foreign chain (shared framework prefixes make that look
                 // plausible, and repair-on would rewrite real history with
                 // another conversation's response).
-                None if affinity.is_some() => (None, serde_json::Value::Null, false, false),
+                None if affinity.is_some() => (
+                    None,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    false,
+                    false,
+                ),
                 None => {
                     let probed_session = ledger.most_recent_chain_session(&model);
                     (
                         probed_session.and_then(|s| ledger.canonical_messages(s, &model)),
                         probed_session
                             .and_then(|s| ledger.canonical_system(s, &model))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        probed_session
+                            .and_then(|s| ledger.canonical_tools(s, &model))
                             .cloned()
                             .unwrap_or(serde_json::Value::Null),
                         false,
@@ -991,6 +1014,46 @@ pub async fn handle_chat<A: Adapter + 'static>(
                 classification.tokens_at_risk += sys.tokens_at_risk;
             }
         }
+        // The tools array: on Anthropic it is part of the cached prefix, so
+        // identical tools with different serialization break the cache at
+        // the root. Classified under the same ladder; repaired by restoring
+        // the recorded serialization. Semantically different tools pass
+        // through untouched — the client changed capability, and the chain
+        // records what actually went out.
+        let client_tools = doc.get("tools").cloned().unwrap_or(serde_json::Value::Null);
+        let mut tools_rewritable = false;
+        let mut tools_tokens = 0u64;
+        let mut tools_kind = None;
+        if chain.is_some()
+            && !probed_rejected
+            && !canonical_tools.is_null()
+            && !client_tools.is_null()
+        {
+            match crate::repair::tools_relation(&client_tools, &canonical_tools) {
+                crate::repair::ToolsRel::Exact => {}
+                crate::repair::ToolsRel::Equivalent(kind) => {
+                    classification.report_matches = false;
+                    classification.drift_kind = Some(match classification.drift_kind {
+                        Some(existing) if existing != kind => DriftKind::Mixed,
+                        _ => kind,
+                    });
+                    classification.turns_affected += 1;
+                    tools_tokens = crate::repair::tools_tokens(&state.tokenizer, &canonical_tools);
+                    classification.tokens_at_risk += tools_tokens;
+                    tools_rewritable = true;
+                    tools_kind = Some(kind);
+                }
+                crate::repair::ToolsRel::Different => {
+                    tracing::info!(
+                        target: "cachemax_repair",
+                        session = plan.session_id,
+                        turn = plan.turn,
+                        "tools changed; prefix re-bases"
+                    );
+                }
+            }
+        }
+
         // The breakpoint survey captures the CLIENT's hint placement. It
         // must run before any mutation of `doc` — a system rewrite strips
         // hints, and a survey taken after that would read the proxy's own
@@ -1068,6 +1131,42 @@ pub async fn handle_chat<A: Adapter + 'static>(
                         },
                     });
                 }
+            }
+        }
+        // The tools rewrite rides the same mode gate and hint rule as the
+        // system: restore the recorded serialization only when placement is
+        // the proxy's to re-derive.
+        if tools_rewritable && effective_mode == RepairMode::On {
+            let placement_not_ours = crate::breakpoints::has_cache_control(&client_tools)
+                && (!state.manage_breakpoints || (survey.foreign && !state.force_breakpoints));
+            if placement_not_ours {
+                tracing::info!(
+                    target: "cachemax_repair",
+                    session = plan.session_id,
+                    turn = plan.turn,
+                    "tools drift passed through: client-managed breakpoints"
+                );
+            } else {
+                let mut recorded = canonical_tools.clone();
+                crate::breakpoints::strip_hints_in_place(&mut recorded);
+                tracing::info!(
+                    target: "cachemax_repair",
+                    session = plan.session_id,
+                    turn = plan.turn,
+                    kind = ?tools_kind,
+                    "rewrote drifted tools to canonical"
+                );
+                doc["tools"] = recorded;
+                rewrite = Some(match rewrite {
+                    Some(rw) => crate::repair::Rewrite {
+                        elements_replaced: rw.elements_replaced + 1,
+                        canonicalized_tokens: rw.canonicalized_tokens + tools_tokens,
+                    },
+                    None => crate::repair::Rewrite {
+                        elements_replaced: 1,
+                        canonicalized_tokens: tools_tokens,
+                    },
+                });
             }
         }
         (report, rewrite, survey)
@@ -1174,6 +1273,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
         .get("system")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let as_sent_tools = doc.get("tools").cloned().unwrap_or(serde_json::Value::Null);
     let sent_at = Instant::now();
     let upstream = match req.body(forwarded).send().await {
         Ok(r) => r,
@@ -1237,6 +1337,7 @@ pub async fn handle_chat<A: Adapter + 'static>(
             ledger,
             as_sent_messages,
             as_sent_system,
+            as_sent_tools,
             drift_report,
             rewrite,
             breakpoints,

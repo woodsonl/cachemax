@@ -72,6 +72,13 @@ pub struct CanonicalTurn {
     /// canonicalizes it under the same equivalence ladder as messages.
     #[serde(default)]
     pub request_system: serde_json::Value,
+    /// The request's `tools` array exactly as forwarded this turn (Null
+    /// when absent). On Anthropic the tool definitions are part of the
+    /// cached prefix: a client re-sending identical tools with different
+    /// serialization breaks the cache at the root. Repair canonicalizes
+    /// them under the same ladder as messages.
+    #[serde(default)]
+    pub request_tools: serde_json::Value,
     /// The assistant message(s) exactly as the provider returned them, in the
     /// client's dialect — the element a compliant client re-sends next turn.
     /// Empty when the response could not be reassembled (unknown dialect,
@@ -334,6 +341,7 @@ impl Ledger {
                         model: model.clone(),
                         messages: chain,
                         request_system: turn.request_system.clone(),
+                        request_tools: turn.request_tools.clone(),
                     })
                 })
             })
@@ -380,6 +388,15 @@ impl Ledger {
     pub fn canonical_system(&self, session_id: u64, model: &str) -> Option<&serde_json::Value> {
         Some(&self.last_turn(session_id, model)?.request_system)
     }
+
+    /// The recorded `tools` array for the session+model's canonical turn
+    /// (None when nothing recorded, `Some(Null)` when recorded absent).
+    pub fn canonical_tools(&self, session_id: u64, model: &str) -> Option<&serde_json::Value> {
+        self.sessions
+            .get(&session_id)
+            .and_then(|per| per.get(model))
+            .map(|t| &t.request_tools)
+    }
 }
 
 /// Thread-safe wrapper, mirroring [`crate::sessions::SharedSessions`]: the
@@ -404,6 +421,9 @@ pub struct ReplayRequest {
     /// OpenAI-dialect chains). Anthropic's Messages API reads the system
     /// prompt from the top level, so `replay --execute` restores it there.
     pub request_system: serde_json::Value,
+    /// The chain's `tools` array, exactly as forwarded (Null when absent).
+    /// Part of the cached prefix on Anthropic; restored on replay.
+    pub request_tools: serde_json::Value,
 }
 
 impl SharedLedger {
@@ -887,6 +907,7 @@ mod tests {
             model: "gpt-4o".into(),
             request_messages: json!([{"role": "user", "content": marker}]),
             request_system: serde_json::Value::Null,
+            request_tools: serde_json::Value::Null,
             response_messages: vec![json!({"role": "assistant", "content": marker})],
             prefix_hashes: vec![seq as u64],
             breakpoints: 0,
@@ -898,6 +919,35 @@ mod tests {
             std::env::temp_dir().join(format!("cachemax-ledger-{}-{}", std::process::id(), tag));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn request_tools_survive_the_on_disk_round_trip() {
+        // Tool definitions are cache-prefix material: after a restart the
+        // proxy must still hold the exact recorded array or tools drift
+        // would read against nothing.
+        let dir = temp_dir("toolsreload");
+        {
+            let mut ledger = Ledger::on_disk(dir.clone()).unwrap();
+            let mut t = turn(0, "a");
+            t.request_tools = serde_json::json!([
+                {"name": "get_weather", "description": "Reads the station feed.",
+                 "input_schema": {"type": "object",
+                                  "properties": {"city": {"type": "string"}}}}
+            ]);
+            ledger.append(7, t);
+        }
+        let ledger = Ledger::on_disk(dir.clone()).unwrap();
+        assert_eq!(
+            ledger.canonical_tools(7, "gpt-4o"),
+            Some(&serde_json::json!([
+                {"name": "get_weather", "description": "Reads the station feed.",
+                 "input_schema": {"type": "object",
+                                  "properties": {"city": {"type": "string"}}}}
+            ])),
+            "a restarted proxy still knows the recorded tools, byte-exactly"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

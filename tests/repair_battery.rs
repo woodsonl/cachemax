@@ -1179,3 +1179,134 @@ async fn corrupt_arguments_for_a_recorded_call_are_restored_and_logged_as_restor
         "the restore is visible in the record, not silent"
     );
 }
+
+#[tokio::test]
+async fn drifted_tools_are_rewritten_to_the_recorded_bytes() {
+    // Tool definitions are cache-prefix material: a client re-sending
+    // identical tools with different serialization breaks the cache at the
+    // root. Repair restores the recorded array; the record carries the
+    // drift kind.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(
+        seen.clone(),
+        usage_reply(serde_json::json!({"role": "assistant", "content": "ok"})),
+    )
+    .await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    let tools = serde_json::json!([
+        {"name": "get_weather",
+         "description": "Reads the rooftop station feed.",
+         "input_schema": {"type": "object",
+                          "properties": {"city": {"type": "string"}}}}
+    ]);
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "tools": tools,
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+
+    // Turn 1: same tools, keys rotated; messages continue cleanly.
+    let mut rotated = serde_json::json!([
+        {"name": "get_weather",
+         "description": "Reads the rooftop station feed.",
+         "input_schema": {"type": "object",
+                          "properties": {"city": {"type": "string"}}}}
+    ]);
+    {
+        let obj = rotated[0].as_object_mut().unwrap();
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        let mut taken: Vec<(String, serde_json::Value)> = Vec::new();
+        for k in keys {
+            let v = obj.shift_remove(&k).unwrap();
+            taken.push((k, v));
+        }
+        for (k, v) in taken.into_iter().rev() {
+            obj.insert(k, v);
+        }
+    }
+    let mut messages = rig.ledger.lock().canonical_messages(1, "gpt-4o").unwrap();
+    messages.push(serde_json::json!({"role": "user", "content": "Thanks"}));
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "tools": rotated,
+            "messages": messages,
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let raw = String::from_utf8(upstream_saw[1].clone()).unwrap();
+    assert!(
+        raw.contains(r#"{"name":"get_weather","description":"Reads the rooftop station feed.","input_schema""#),
+        "the recorded tool serialization was forwarded, got: {raw}"
+    );
+    assert!(record.repaired, "tools drift is repaired");
+    assert_eq!(record.drift_kind, Some(DriftKind::SerializationOnly));
+}
+
+#[tokio::test]
+async fn changed_tool_definitions_pass_through_untouched() {
+    // A genuinely different tool (new name) is a capability change: the
+    // client's bytes go out as sent, and the chain refreshes to what was
+    // actually forwarded.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = stub_upstream(
+        seen.clone(),
+        usage_reply(serde_json::json!({"role": "assistant", "content": "ok"})),
+    )
+    .await;
+    let rig = rig(upstream, RepairMode::On).await;
+
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "tools": [{"name": "get_weather", "description": "Feed.",
+                         "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "Weather?"}],
+        }),
+    )
+    .await;
+    last_record(&rig, 1).await;
+
+    let mut messages = rig.ledger.lock().canonical_messages(1, "gpt-4o").unwrap();
+    messages.push(serde_json::json!({"role": "user", "content": "Forecast?"}));
+    send(
+        &rig,
+        &serde_json::json!({
+            "model": "gpt-4o",
+            "tools": [{"name": "get_forecast", "description": "Feed.",
+                         "input_schema": {"type": "object"}}],
+            "messages": messages,
+        }),
+    )
+    .await;
+    let record = last_record(&rig, 2).await;
+
+    let upstream_saw = seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&upstream_saw[1]).unwrap();
+    assert_eq!(
+        sent["tools"][0]["name"], "get_forecast",
+        "the client's changed definitions pass through as sent"
+    );
+    assert!(!record.repaired);
+    // The chain now records what actually went out.
+    let tools = rig.ledger.lock().canonical_tools(1, "gpt-4o").cloned();
+    assert_eq!(
+        tools,
+        Some(
+            serde_json::json!([{"name": "get_forecast", "description": "Feed.",
+                                    "input_schema": {"type": "object"}}])
+        ),
+        "the chain refreshes to the forwarded tools"
+    );
+}

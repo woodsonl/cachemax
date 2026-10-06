@@ -116,6 +116,7 @@ fn chain_request() -> cachemax::ledger::ReplayRequest {
             ]},
         ]),
         request_system: serde_json::Value::Null,
+        request_tools: serde_json::Value::Null,
     }
 }
 
@@ -469,6 +470,7 @@ async fn the_recorded_system_reaches_the_anthropic_body() {
         model: "claude-3".into(),
         messages: serde_json::json!([{"role": "user", "content": "hi"}]),
         request_system: serde_json::json!([{"type": "text", "text": "Be terse."}]),
+        request_tools: serde_json::Value::Null,
     };
     let out = execute_pair(&client(), &cfg, &request).await;
     assert_eq!(out.b_canonical.sends, 1);
@@ -518,6 +520,7 @@ fn temp_ledger(tag: &str) -> std::path::PathBuf {
                 model: "gpt-4o".into(),
                 request_messages: serde_json::json!([{"role": "user", "content": "hi"}]),
                 request_system: serde_json::Value::Null,
+                request_tools: serde_json::Value::Null,
                 response_messages: vec![],
                 prefix_hashes: vec![1, 2],
                 breakpoints: 0,
