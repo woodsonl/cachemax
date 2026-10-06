@@ -376,6 +376,10 @@ enum Command {
         /// to `openai`.
         #[arg(long, default_value = "openai")]
         backend: String,
+        /// Model the fixtures request. Cloud endpoints reject the local
+        /// default (`auto/fast`); pick one the endpoint serves.
+        #[arg(long, default_value = "auto/fast")]
+        model: String,
         /// Environment variable holding the API key. Defaults per backend:
         /// `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`.
         #[arg(long)]
@@ -497,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Command::DriftMatrix {
         upstream_url,
         backend,
+        model,
         api_key_env,
         n,
         yes,
@@ -506,6 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_drift_matrix(
             upstream_url,
             &backend,
+            &model,
             api_key_env,
             n.max(1),
             yes,
@@ -824,6 +830,7 @@ async fn run_replay_execute(
 async fn run_drift_matrix(
     upstream_url: Option<String>,
     backend: &str,
+    model: &str,
     api_key_env: Option<String>,
     samples: usize,
     confirmed: bool,
@@ -838,7 +845,7 @@ async fn run_drift_matrix(
     let backend = cachemax::replay::Backend::parse(backend).ok_or_else(|| {
         Fault::replay_execute_requires("--backend", "expected `openai` or `anthropic`".to_string())
     })?;
-    let all = cachemax::matrix::classes(backend);
+    let all = cachemax::matrix::classes(backend, model);
     let selected: Vec<&cachemax::matrix::MatrixClass> = match class_filter {
         None => all.iter().collect(),
         Some(filter) => {
@@ -881,6 +888,20 @@ async fn run_drift_matrix(
     let refs: Vec<cachemax::matrix::MatrixClass> = selected.into_iter().cloned().collect();
     let results = cachemax::matrix::run(&client, &cfg, &refs).await;
     print!("{}", cachemax::matrix::render(&endpoint, samples, &results));
+    // A partially-unmeasured run exits 0 with honest gaps in the table; the
+    // causes of those gaps belong on stderr where the legend promises them.
+    for r in &results {
+        if r.verdict == "unmeasured" {
+            for cause in r
+                .a_drifted
+                .failures
+                .iter()
+                .chain(r.b_canonical.failures.iter())
+            {
+                eprintln!("drift-matrix: {}: {cause}", r.name);
+            }
+        }
+    }
     if results
         .iter()
         .all(|r| !r.a_drifted.measured() && !r.b_canonical.measured())

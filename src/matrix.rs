@@ -46,9 +46,9 @@ pub struct MatrixClass {
 /// mutated span keeps the comparison clean.
 const PROSE: &str = "You are the records assistant for the Kyoto facility audit. The lab protocol requires quoting the reference batch identifier in every reply, which is BATCH-7741-ALPHA-9, registered during the March audit window under supervision of the quality office. The protocol file lives in the east annex, revision fourteen, and any deviation from the quoted procedure must be reported within one business day to the same office, referencing the batch identifier and the audit window. Weather queries are answered from the rooftop station feed, which reports temperature, sky condition, and observation hours, and every answer names the station that produced the reading.";
 
-fn base_openai_body(system: &str) -> serde_json::Value {
+fn base_openai_body(system: &str, model: &str) -> serde_json::Value {
     serde_json::json!({
-        "model": "auto/fast",
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": "Weather report for Paris?"},
@@ -63,9 +63,9 @@ fn base_openai_body(system: &str) -> serde_json::Value {
     })
 }
 
-fn base_anthropic_body(system_blocks: serde_json::Value) -> serde_json::Value {
+fn base_anthropic_body(system_blocks: serde_json::Value, model: &str) -> serde_json::Value {
     serde_json::json!({
-        "model": "claude-sonnet-4-20250514",
+        "model": model,
         "max_tokens": 1024,
         "tools": [{
             "name": "get_weather",
@@ -96,10 +96,10 @@ fn base_anthropic_body(system_blocks: serde_json::Value) -> serde_json::Value {
 
 /// The class fixtures for one backend dialect. Adding a class is adding a
 /// fixture here; the runner and table pick it up automatically.
-pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
+pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass> {
     match backend {
         crate::replay::Backend::OpenAi => {
-            let canonical = base_openai_body(PROSE);
+            let canonical = base_openai_body(PROSE, model);
             vec![
                 // Tool-argument keys reordered and compacted by a framework.
                 MatrixClass {
@@ -210,7 +210,7 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
                     dialect: "openai",
                     canonical,
                     drifted: {
-                        let mut d = base_openai_body(PROSE);
+                        let mut d = base_openai_body(PROSE, model);
                         let text = d["messages"][1]["content"].take();
                         d["messages"][1]["content"] =
                             serde_json::json!([{"type": "text", "text": text}]);
@@ -220,9 +220,12 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
             ]
         }
         crate::replay::Backend::Anthropic => {
-            let canonical = base_anthropic_body(serde_json::json!([
-                {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
-            ]));
+            let canonical = base_anthropic_body(
+                serde_json::json!([
+                    {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
+                ]),
+                model,
+            );
             vec![
                 MatrixClass {
                     name: "tool-arg-reorder",
@@ -292,10 +295,14 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
                 MatrixClass {
                     name: "system-shape",
                     dialect: "anthropic",
-                    canonical: base_anthropic_body(serde_json::json!([
-                        {"type": "text", "text": PROSE}
-                    ])),
-                    drifted: base_anthropic_body(serde_json::Value::String(PROSE.to_string())),
+                    canonical: base_anthropic_body(
+                        serde_json::json!([{"type": "text", "text": PROSE}]),
+                        model,
+                    ),
+                    drifted: base_anthropic_body(
+                        serde_json::Value::String(PROSE.to_string()),
+                        model,
+                    ),
                 },
                 // Hint placement vs the managed baseline: this pair
                 // measures placement policy AND shape together (the moved
@@ -304,13 +311,19 @@ pub fn classes(backend: crate::replay::Backend) -> Vec<MatrixClass> {
                 MatrixClass {
                     name: "hint-placement",
                     dialect: "anthropic",
-                    canonical: base_anthropic_body(serde_json::json!([
-                        {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
-                    ])),
-                    drifted: {
-                        let mut d = base_anthropic_body(serde_json::json!([
+                    canonical: base_anthropic_body(
+                        serde_json::json!([
                             {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
-                        ]));
+                        ]),
+                        model,
+                    ),
+                    drifted: {
+                        let mut d = base_anthropic_body(
+                            serde_json::json!([
+                                {"type": "text", "text": PROSE, "cache_control": {"type": "ephemeral"}}
+                            ]),
+                            model,
+                        );
                         d["system"][0]
                             .as_object_mut()
                             .unwrap()
@@ -341,6 +354,13 @@ fn verdict_for(a: &FormSample, b: &FormSample) -> (&'static str, Option<u64>) {
                 // artifact, warm cache, tokenizer quirk). Report it as
                 // what it is — never fold it into "absorbed".
                 ("inverted", Some(ma - mb))
+            } else if ma == 0 && a.max_cached == Some(0) && b.max_cached == Some(0) {
+                // Every reading on both forms, median AND max, was a
+                // reported zero: the endpoint did not serve from cache at
+                // all during the run. That is not "absorbed drift" — the
+                // classes cost nothing because caching costs nothing — and
+                // saying so would misstate the mechanism.
+                ("no-caching", Some(0))
             } else {
                 ("absorbed", Some(0))
             }
@@ -419,6 +439,7 @@ pub fn render(cfg_endpoint: &str, samples: usize, results: &[ClassResult]) -> St
                 "costs" => format!("costs {} tk (median)", r.delta.unwrap_or(0)),
                 "inverted" => "inverted: drifted cached more".to_string(),
                 "cross-instance" => "cross-instance: no like-for-like delta".to_string(),
+                "no-caching" => "no caching on this endpoint".to_string(),
                 v => v.to_string(),
             }
         ));
@@ -476,7 +497,7 @@ mod tests {
             crate::replay::Backend::OpenAi,
             crate::replay::Backend::Anthropic,
         ] {
-            for class in classes(backend) {
+            for class in classes(backend, "auto/fast") {
                 let a = serde_json::to_string(&class.canonical).unwrap();
                 let b = serde_json::to_string(&class.drifted).unwrap();
                 assert_ne!(
@@ -525,7 +546,7 @@ mod tests {
         // key-order fixture must therefore reorder, not just restate. Its
         // wire bytes differ (checked above) AND its message objects carry
         // rotated keys.
-        let openai = classes(crate::replay::Backend::OpenAi);
+        let openai = classes(crate::replay::Backend::OpenAi, "auto/fast");
         let ko = openai
             .iter()
             .find(|c| c.name == "key-order")
@@ -571,6 +592,17 @@ mod tests {
         // No shared instance: no comparable delta, whatever the numbers.
         let (v, d) = verdict_for(&one, &mk(Some(149), Some(149), "other"));
         assert_eq!((v, d), ("cross-instance", None));
+        // All-zero readings on both forms is a non-caching endpoint, not
+        // absorbed drift.
+        let zeros = mk(Some(0), Some(0), "i");
+        let (v, _) = verdict_for(&zeros, &zeros);
+        assert_eq!(v, "no-caching");
+        // Both medians zero but one max nonzero (a single send landed on a
+        // caching instance amid zeros): a routing artifact, not evidence of
+        // normalization — reads absorbed only because the medians held.
+        let artifact = mk(Some(0), Some(384), "i");
+        let (v, _) = verdict_for(&artifact, &zeros);
+        assert_eq!(v, "absorbed", "median-level equality with a max artifact");
         let (v, d) = verdict_for(&mk(None, None, "i"), &mk(Some(5), Some(5), "i"));
         assert_eq!(v, "unmeasured");
         assert_eq!(d, None);

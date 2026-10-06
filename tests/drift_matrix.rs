@@ -80,7 +80,7 @@ fn cachemax() -> Command {
 async fn the_matrix_costs_the_class_the_stub_says_it_costs() {
     let (endpoint, hits) = byte_cache_stub().await;
     let cfg = config(endpoint.clone(), 3);
-    let classes: Vec<matrix::MatrixClass> = matrix::classes(Backend::OpenAi)
+    let classes: Vec<matrix::MatrixClass> = matrix::classes(Backend::OpenAi, "auto/fast")
         .into_iter()
         .filter(|c| c.name == "tool-arg-reorder")
         .collect();
@@ -125,7 +125,7 @@ async fn a_normalizing_endpoint_absorbs_every_class() {
     let a = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     let cfg = config(format!("http://{a}"), 2);
-    let classes = matrix::classes(Backend::OpenAi);
+    let classes = matrix::classes(Backend::OpenAi, "auto/fast");
 
     let results = run_matrix(&client(), &cfg, &classes).await;
     assert!(!results.is_empty());
