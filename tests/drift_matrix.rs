@@ -1,7 +1,8 @@
 //! `cachemax drift-matrix`: the per-class cost table. The runner measures
-//! every fixture pair the same way — interleaved, unpooled — and the verdict
-//! per class is plain: costs (canonical recovers cache), absorbed (the
-//! endpoint normalizes the class away), or unmeasured (a gap, never a zero).
+//! every fixture pair the same way — warm the canonical form, then send the
+//! drifted form — and the verdict per class is plain: costs (the first
+//! drifted send missed the established cache), absorbed (it hit), no
+//! caching (nothing ever cached), or unmeasured (a gap, never a zero).
 
 use cachemax::matrix::{self, run as run_matrix};
 use cachemax::replay::{Backend, ExecuteConfig};
@@ -88,8 +89,14 @@ async fn the_matrix_costs_the_class_the_stub_says_it_costs() {
 
     assert_eq!(results.len(), 1);
     let r = &results[0];
-    assert_eq!(r.a_drifted.sends, 3);
-    assert_eq!(r.b_canonical.sends, 3);
+    assert_eq!(
+        r.a_drifted.sends, 3,
+        "the drift phase sends n drifted bodies"
+    );
+    assert_eq!(
+        r.b_canonical.sends, 4,
+        "the canonical column carries both warm forms' evidence: four sends"
+    );
     assert_eq!(
         r.verdict, "costs",
         "byte-identity cache punishes the reorder"
@@ -99,8 +106,13 @@ async fn the_matrix_costs_the_class_the_stub_says_it_costs() {
     let table = matrix::render(&endpoint, 3, &results);
     assert!(table.contains("tool-arg-reorder"));
     assert!(table.contains("costs"), "table: {table}");
-    // 1 class × 2 forms × 3 samples: six sends, no more.
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 6);
+    // 1 class × (2 warm canonical pairs = 4 sends) + (3 drifted pairs = 6
+    // sends): ten sends total, no more.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 10);
+    // The stub's canonical marker reads 1400: the displayed canonical
+    // median/max reflect the combined warm evidence, not b's half alone.
+    assert_eq!(r.b_canonical.median_cached, Some(1400));
+    assert_eq!(r.b_canonical.max_cached, Some(1400));
 }
 
 #[tokio::test]
@@ -183,6 +195,7 @@ async fn a_total_failure_faults_with_the_causes() {
             &format!("http://{a}"),
             "--n",
             "2",
+            "--yes",
         ])
         .output()
         .await

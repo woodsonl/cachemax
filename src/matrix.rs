@@ -22,9 +22,10 @@ pub struct ClassResult {
     pub name: &'static str,
     pub a_drifted: FormSample,
     pub b_canonical: FormSample,
-    /// Plain verdict: "absorbed" when the medians are equal, "costs N tk"
-    /// when the canonical form recovers cache, "unmeasured" when a form had
-    /// no readable reading.
+    /// Plain verdict: "costs N tk" when the drifted form's first send after
+    /// the canonical warm missed cache the canonical form had established,
+    /// "absorbed" when it hit, "no caching" when nothing ever cached,
+    /// "unmeasured" when a form had no readable reading.
     pub verdict: &'static str,
     pub delta: Option<u64>,
 }
@@ -92,6 +93,50 @@ fn base_anthropic_body(system_blocks: serde_json::Value, model: &str) -> serde_j
             ]},
         ],
     })
+}
+
+/// Stamp the class's own tag into the system prompt of BOTH forms, so
+/// sequential classes cannot share a warmed prefix: without this, class N's
+/// first send hits class N-1's leftover cache and reads a warm number on a
+/// cold cache.
+fn isolate(mut c: MatrixClass) -> MatrixClass {
+    let tag = format!(" Class tag: {}.", c.name);
+    for body in [&mut c.canonical, &mut c.drifted] {
+        let mut tagged = false;
+        // OpenAI dialect: the system rides as messages[0].content.
+        if let Some(text) = body
+            .pointer("/messages/0/content")
+            .and_then(|v| v.as_str().map(str::to_string))
+        {
+            if let Some(v) = body.pointer_mut("/messages/0/content") {
+                *v = serde_json::Value::String(format!("{text}{tag}"));
+                tagged = true;
+            }
+        }
+        // Anthropic dialect: the system rides as system[0].text, or as a
+        // bare string (the system-shape class drifts between the two).
+        if let Some(text) = body
+            .pointer("/system/0/text")
+            .and_then(|v| v.as_str().map(str::to_string))
+        {
+            if let Some(v) = body.pointer_mut("/system/0/text") {
+                *v = serde_json::Value::String(format!("{text}{tag}"));
+                tagged = true;
+            }
+        } else if let Some(text) = body
+            .get("system")
+            .and_then(|v| v.as_str().map(str::to_string))
+        {
+            if let Some(v) = body.get_mut("system") {
+                *v = serde_json::Value::String(format!("{text}{tag}"));
+                tagged = true;
+            }
+        }
+        // A form the tagger cannot reach would silently break the pair's
+        // equivalence — fail the run instead.
+        assert!(tagged, "isolate: no system position found for {}", c.name);
+    }
+    c
 }
 
 /// The class fixtures for one backend dialect. Adding a class is adding a
@@ -218,6 +263,9 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     },
                 },
             ]
+                .into_iter()
+                .map(isolate)
+                .collect()
         }
         crate::replay::Backend::Anthropic => {
             let canonical = base_anthropic_body(
@@ -334,34 +382,38 @@ pub fn classes(backend: crate::replay::Backend, model: &str) -> Vec<MatrixClass>
                     },
                 },
             ]
+                .into_iter()
+                .map(isolate)
+                .collect()
         }
     }
 }
 
-fn verdict_for(a: &FormSample, b: &FormSample) -> (&'static str, Option<u64>) {
-    match (a.median_cached, b.median_cached) {
-        (Some(ma), Some(mb)) => {
-            // A delta is only comparable when one instance answered both
-            // forms — a cross-namespace difference is routing, not drift.
-            let shared =
-                !a.instances.is_empty() && a.instances.iter().any(|i| b.instances.contains(i));
-            if !shared {
-                ("cross-instance", None)
-            } else if mb > ma {
-                ("costs", Some(mb - ma))
-            } else if ma > mb {
-                // The drifted form cached MORE: an inversion (router
-                // artifact, warm cache, tokenizer quirk). Report it as
-                // what it is — never fold it into "absorbed".
-                ("inverted", Some(ma - mb))
-            } else if ma == 0 && a.max_cached == Some(0) && b.max_cached == Some(0) {
-                // Every reading on both forms, median AND max, was a
-                // reported zero: the endpoint did not serve from cache at
-                // all during the run. That is not "absorbed drift" — the
-                // classes cost nothing because caching costs nothing — and
-                // saying so would misstate the mechanism.
+/// The drift cost is the FIRST drifted send's reading against the cache
+/// the canonical warm established: that is the repair scenario — the
+/// provider holds the canonical form, the client arrives with drifted
+/// bytes. Later drifted sends re-warm the drifted form's own entry and
+/// hide the cost, which is why the first send is the judged number and the
+/// steady-state readings stay visible in the columns.
+fn verdict_for(
+    first_drifted: Option<u64>,
+    drift_max: Option<u64>,
+    warm_max: Option<u64>,
+) -> (&'static str, Option<u64>) {
+    match (first_drifted, warm_max) {
+        (Some(d), Some(c)) => {
+            if c > d {
+                ("costs", Some(c - d))
+            } else if c == 0 && d == 0 && drift_max == Some(0) {
+                // Nothing ever read above zero on either side: a different
+                // mechanism than absorption, stated differently. A nonzero
+                // drift max amid zero medians is a routing artifact —
+                // absorbed-with-artifact, never "no caching".
                 ("no-caching", Some(0))
             } else {
+                // The drifted bytes hit the cache the canonical form
+                // established: this endpoint keys on something the drift
+                // does not touch.
                 ("absorbed", Some(0))
             }
         }
@@ -369,11 +421,10 @@ fn verdict_for(a: &FormSample, b: &FormSample) -> (&'static str, Option<u64>) {
     }
 }
 
-/// Run every class for the backend against one endpoint, sequentially.
-/// Within a class the delta is like-for-like (both forms share everything
-/// outside the mutated span, so warming moves both medians together);
-/// absolute medians are order-dependent across classes, which is why only
-/// the delta is judged.
+/// Run every class for the backend against one endpoint, sequentially —
+/// per-class system tags keep classes from sharing a warmed prefix. The
+/// verdict compares the drifted form's FIRST send against the warm's
+/// maximum (see [`verdict_for`]).
 pub async fn run(
     client: &reqwest::Client,
     cfg: &ExecuteConfig,
@@ -381,20 +432,62 @@ pub async fn run(
 ) -> Vec<ClassResult> {
     let mut out = Vec::new();
     for class in classes {
-        let r = execute_bodies(
+        // Warm the canonical form: two sends establish its cache entry
+        // (one to write, one to confirm the read).
+        let warm_cfg = ExecuteConfig {
+            samples: 2,
+            ..cfg.clone()
+        };
+        let warm = execute_bodies(
+            client,
+            &warm_cfg,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+            &class.canonical,
+            &class.canonical,
+        )
+        .await;
+        // The drifted sends, from a cache that holds only the canonical
+        // form. The FIRST reading is the cost; the rest show the
+        // steady-state after the drifted form re-warms itself.
+        let drift = execute_bodies(
             client,
             cfg,
             &serde_json::Value::Null,
             &serde_json::Value::Null,
             &class.drifted,
-            &class.canonical,
+            &class.drifted,
         )
         .await;
-        let (verdict, delta) = verdict_for(&r.a_drifted, &r.b_canonical);
+        let first_drifted = drift.a_drifted.cached_readings.first().copied();
+        // The baseline is the maximum across ALL warm sends — both forms
+        // send the same canonical body, so every warm reading is evidence
+        // of the level the canonical form demonstrably established.
+        // Individual warm sends can read zero seconds after establishing
+        // it (observed on real providers: eviction or shard routing);
+        // judging against fewer readings would let flaky zeros declare
+        // the cache absent. Max is monotone: more evidence can only raise
+        // the baseline.
+        let warm_max = warm
+            .a_drifted
+            .max_cached
+            .into_iter()
+            .chain(warm.b_canonical.max_cached)
+            .max();
+        let (verdict, delta) = verdict_for(first_drifted, drift.a_drifted.max_cached, warm_max);
+        // The displayed canonical column carries the full warm evidence:
+        // both forms' readings, not just b's half.
+        let mut b_all = warm.b_canonical.clone();
+        b_all
+            .cached_readings
+            .extend(warm.a_drifted.cached_readings.iter().copied());
+        b_all.sends = b_all.cached_readings.len();
+        b_all.median_cached = crate::replay::median(&b_all.cached_readings);
+        b_all.max_cached = b_all.cached_readings.iter().copied().max();
         out.push(ClassResult {
             name: class.name,
-            a_drifted: r.a_drifted,
-            b_canonical: r.b_canonical,
+            a_drifted: drift.a_drifted,
+            b_canonical: b_all,
             verdict,
             delta,
         });
@@ -411,11 +504,17 @@ pub fn render(cfg_endpoint: &str, samples: usize, results: &[ClassResult]) -> St
         "drift-cost matrix · {cfg_endpoint} · n={samples}\n"
     ));
     out.push_str(&format!(
-        "  {:<24} {:>11} {:>11} {:>7} {:>4}  {}\n",
-        "class", "drifted m/m", "canonical m/m", "delta", "send", "verdict"
+        "  {:<24} {:>13} {:>13} {:>7} {:>4}  {}\n",
+        "class", "drifted 1st/m", "canonical m/m", "delta", "send", "verdict"
     ));
     for r in results {
         fn pair(f: &FormSample) -> String {
+            match (f.cached_readings.first().copied(), f.max_cached) {
+                (Some(first), Some(x)) => format!("{first}/{x}"),
+                _ => "—".to_string(),
+            }
+        }
+        fn canon(f: &FormSample) -> String {
             match (f.median_cached, f.max_cached) {
                 (Some(m), Some(x)) => format!("{m}/{x}"),
                 _ => "—".to_string(),
@@ -423,7 +522,6 @@ pub fn render(cfg_endpoint: &str, samples: usize, results: &[ClassResult]) -> St
         }
         let delta = match (r.verdict, r.delta) {
             ("costs", Some(d)) => d.to_string(),
-            ("inverted", Some(d)) => format!("+{d}"),
             (_, Some(_)) => "0".to_string(),
             (_, None) => "—".to_string(),
         };
@@ -432,13 +530,13 @@ pub fn render(cfg_endpoint: &str, samples: usize, results: &[ClassResult]) -> St
             "  {:<24} {:>11} {:>11} {:>7} {:>4}  {}\n",
             r.name,
             pair(&r.a_drifted),
-            pair(&r.b_canonical),
+            canon(&r.b_canonical),
             delta,
             sends,
             match r.verdict {
-                "costs" => format!("costs {} tk (median)", r.delta.unwrap_or(0)),
-                "inverted" => "inverted: drifted cached more".to_string(),
-                "cross-instance" => "cross-instance: no like-for-like delta".to_string(),
+                "costs" => {
+                    format!("costs {} tk (first send)", r.delta.unwrap_or(0))
+                }
                 "no-caching" => "no caching on this endpoint".to_string(),
                 v => v.to_string(),
             }
@@ -505,6 +603,12 @@ mod tests {
                     "{}: a drifted fixture that is byte-identical measures nothing",
                     class.name
                 );
+                let tag = format!("Class tag: {}.", class.name);
+                assert!(
+                    a.contains(&tag) && b.contains(&tag),
+                    "{}: both forms carry the class tag (isolation)",
+                    class.name
+                );
                 match class.name {
                     "key-order" => {
                         // Object key order is not meaning: sorted form equal.
@@ -567,44 +671,43 @@ mod tests {
 
     #[test]
     fn verdicts_are_plain_and_total() {
-        let mk = |a: Option<u64>, b: Option<u64>, instance: &str| FormSample {
-            form: "x",
-            sends: 2,
-            cached_readings: vec![],
-            prompt_readings: vec![],
-            median_cached: a,
-            max_cached: b,
-            instances: vec![instance.to_string()],
-            failures: vec![],
-        };
-        let one = mk(Some(148), Some(148), "i");
-        // Costs, absorbed, inverted: one instance answering both forms.
-        let (v, d) = verdict_for(&one, &mk(Some(149), Some(149), "i"));
-        assert_eq!((v, d), ("costs", Some(1)));
-        let (v, d) = verdict_for(&one, &mk(Some(148), Some(148), "i"));
-        assert_eq!((v, d), ("absorbed", Some(0)));
-        let (v, d) = verdict_for(&mk(Some(150), Some(150), "i"), &one);
+        // Costs: the first drifted send missed what the canonical warm had.
         assert_eq!(
-            (v, d),
-            ("inverted", Some(2)),
-            "drifted cached more: said, never folded into absorbed"
+            verdict_for(Some(30), Some(199), Some(1400)),
+            ("costs", Some(1370))
         );
-        // No shared instance: no comparable delta, whatever the numbers.
-        let (v, d) = verdict_for(&one, &mk(Some(149), Some(149), "other"));
-        assert_eq!((v, d), ("cross-instance", None));
-        // All-zero readings on both forms is a non-caching endpoint, not
-        // absorbed drift.
-        let zeros = mk(Some(0), Some(0), "i");
-        let (v, _) = verdict_for(&zeros, &zeros);
-        assert_eq!(v, "no-caching");
-        // Both medians zero but one max nonzero (a single send landed on a
-        // caching instance amid zeros): a routing artifact, not evidence of
-        // normalization — reads absorbed only because the medians held.
-        let artifact = mk(Some(0), Some(384), "i");
-        let (v, _) = verdict_for(&artifact, &zeros);
-        assert_eq!(v, "absorbed", "median-level equality with a max artifact");
-        let (v, d) = verdict_for(&mk(None, None, "i"), &mk(Some(5), Some(5), "i"));
-        assert_eq!(v, "unmeasured");
-        assert_eq!(d, None);
+        // Absorbed: the drifted bytes hit the canonical-established cache;
+        // reading slightly MORE than the warm (tokenizer drift) is still
+        // absorbed.
+        assert_eq!(
+            verdict_for(Some(1400), Some(1400), Some(1400)),
+            ("absorbed", Some(0))
+        );
+        assert_eq!(
+            verdict_for(Some(1410), Some(1410), Some(1400)),
+            ("absorbed", Some(0))
+        );
+        // Flaky-zero robustness: the warm ENDED in zero but its max proves
+        // the cache was established — the verdict still judges against the
+        // established level.
+        assert_eq!(
+            verdict_for(Some(30), Some(199), Some(1400)),
+            ("costs", Some(1370))
+        );
+        // A nonzero drift max amid zero first/warm is a routing artifact:
+        // absorbed, never "no caching" — the row's own max would contradict
+        // the mechanism claim.
+        assert_eq!(
+            verdict_for(Some(0), Some(384), Some(0)),
+            ("absorbed", Some(0))
+        );
+        // Nothing ever read above zero on either side: no caching.
+        assert_eq!(
+            verdict_for(Some(0), Some(0), Some(0)),
+            ("no-caching", Some(0))
+        );
+        // Either side unreadable: unmeasured.
+        assert_eq!(verdict_for(None, Some(5), Some(5)), ("unmeasured", None));
+        assert_eq!(verdict_for(Some(5), Some(5), None), ("unmeasured", None));
     }
 }

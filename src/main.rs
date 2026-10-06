@@ -862,9 +862,11 @@ async fn run_drift_matrix(
             all.iter().filter(|c| wanted.contains(&c.name)).collect()
         }
     };
-    let total_sends = selected.len() * 2 * samples;
+    // Per class: two warm canonical pairs (4 sends) establish the cache,
+    // then n drifted pairs (2n sends) measure what drift costs against it.
+    let total_sends = selected.len() * (4 + 2 * samples);
     println!(
-        "drift-matrix: {} class(es) × 2 forms × {samples} sample(s) = {total_sends} send(s) to {endpoint}",
+        "drift-matrix: {} class(es) × (2 warm pairs + {samples} drift pair(s)) = {total_sends} send(s) to {endpoint}",
         selected.len()
     );
     if total_sends > REPLAY_CONFIRM_SENDS && !confirmed {
